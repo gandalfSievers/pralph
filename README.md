@@ -60,6 +60,8 @@ This creates a virtualenv, installs dependencies, and adds `pralph` to your PATH
 
 Run commands from inside any project directory. pralph stores its state in `.pralph/` within that directory.
 
+### Standard workflow
+
 ```bash
 # 1. Create a design document
 pralph plan --user-prompt "Build a task management app with auth and real-time updates"
@@ -70,30 +72,33 @@ pralph stories
 # 3. Discover missing requirements via web research
 pralph webgen
 
-# 4a. Add a single idea as a story (--next = implement it first)
+# Browse and edit stories in the web viewer
+pralph viewer
+
+# 4. Implement the backlog (review is on by default)
+pralph implement --compound --max-iterations 30
+```
+
+### Adding stories later
+
+After the initial backlog is built, you can add more stories at any time — then run `implement` again to pick them up.
+
+```bash
+# Add a single idea as a story (--next = implement it first)
 pralph add --idea "add dark mode support" --next
 
-# 4b. Describe a broad idea — Claude splits it into stories
+# Describe a broad idea — Claude splits it into stories
 pralph ideate "add internationalization support with locale detection, translated UI strings, RTL layout, and date/currency formatting"
 
 # Or point at a file with a longer description
 pralph ideate --ideas-file ideas.txt
 
-# 5. Refine existing stories
+# Refine existing stories — split, merge, or rewrite
 pralph refine -s AUTH-001 "split into login and registration"
 
-# 6. Implement the backlog
-pralph implement --review
-
-# 6b. Implement with compound learning (captures solutions after each story)
-pralph implement --review --compound
-
-# 7. Ad-hoc capture of learnings
+# Ad-hoc capture of learnings
 pralph compound -d "Fixed CORS issue by adding middleware"
 pralph compound --story-id AUTH-001
-
-# 8. Browse and edit stories in the web viewer
-pralph viewer
 ```
 
 ### Global options
