@@ -64,7 +64,7 @@ Run commands from inside any project directory. pralph stores its state in `.pra
 
 ```bash
 # 1. Create a design document
-pralph plan --user-prompt "Build a task management app with auth and real-time updates"
+pralph plan --prompt "Build a task management app with auth and real-time updates"
 
 # 2. Extract stories from the design
 pralph stories
@@ -85,7 +85,7 @@ After the initial backlog is built, you can add more stories at any time — the
 
 ```bash
 # Add a single idea as a story (--next = implement it first)
-pralph add --idea "add dark mode support" --next
+pralph add --prompt "add dark mode support" --next
 
 # Describe a broad idea — Claude splits it into stories
 pralph ideate "add internationalization support with locale detection, translated UI strings, RTL layout, and date/currency formatting"
@@ -97,9 +97,28 @@ pralph ideate --ideas-file ideas.txt
 pralph refine -s AUTH-001 "split into login and registration"
 
 # Ad-hoc capture of learnings
-pralph compound -d "Fixed CORS issue by adding middleware"
+pralph compound --prompt "Fixed CORS issue by adding middleware"
 pralph compound --story-id AUTH-001
 ```
+
+### Piping from stdin
+
+All commands that accept `--prompt` also read from stdin when piped, making it easy to compose with other tools:
+
+```bash
+echo "Build a calculator app" | pralph plan
+echo "add dark mode" | pralph add
+echo "internationalization support" | pralph ideate
+echo "split into login and registration" | pralph refine -s AUTH-001
+echo "use vanilla JS" | pralph implement
+echo "Fixed CORS issue by adding middleware" | pralph compound
+
+# Compose with other tools
+cat requirements.txt | pralph plan
+gh issue view 42 --json body -q .body | pralph add --next
+```
+
+Input is resolved in order: `--prompt` flag > stdin pipe > interactive prompt.
 
 ### Global options
 
@@ -120,7 +139,7 @@ pralph compound --story-id AUTH-001
 
 | Option | Default | Description |
 |---|---|---|
-| `--user-prompt` | — | Guidance for design doc creation |
+| `--prompt` | — | Guidance for design doc creation |
 | `--reset` | off | Reset phase state and start fresh |
 
 #### `stories`
@@ -140,7 +159,7 @@ pralph compound --story-id AUTH-001
 
 | Option | Default | Description |
 |---|---|---|
-| `--idea` | — | Brief idea to turn into a story (prompted if omitted) |
+| `--prompt` | — | Brief idea to turn into a story (prompted if omitted) |
 | `--next` | off | Priority 1 — implement next |
 | `--anytime` | off | Let Claude pick priority |
 
@@ -151,7 +170,7 @@ Accepts ideas as positional arguments (e.g. `pralph ideate "idea one" "idea two"
 | Option | Default | Description |
 |---|---|---|
 | `--ideas-file` | — | Path to ideas file (default: `.pralph/ideas.md`) |
-| `--ideas` | — | Ideas as inline text |
+| `--prompt` | — | Ideas as inline text |
 | `--reset` | off | Reset phase state and start fresh |
 
 #### `refine`
@@ -160,6 +179,7 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 
 | Option | Default | Description |
 |---|---|---|
+| `--prompt` | — | Refinement instruction (alternative to positional arg) |
 | `-s`, `--story` | — | Story ID(s) to refine (repeatable) |
 | `-p`, `--pattern` | — | Glob pattern to match story IDs (e.g. `I18N-*`) |
 
@@ -171,7 +191,7 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `--phase1` / `--no-phase1` | on | Architecture-first grouping |
 | `--review` / `--no-review` | on | Run reviewer after each implementation |
 | `--compound` / `--no-compound` | off | Capture learnings after each story |
-| `--user-prompt` | — | Guidance for implementation (e.g. "use FastAPI") |
+| `--prompt` | — | Guidance for implementation (e.g. "use FastAPI") |
 | `--reset` | off | Reset phase state and start fresh |
 
 #### `compound`
@@ -179,7 +199,7 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | Option | Default | Description |
 |---|---|---|
 | `--story-id` | — | Story ID to capture learnings from |
-| `-d`, `--description` | — | Description of what was done |
+| `--prompt` | — | Description of what was done |
 
 #### `viewer`
 

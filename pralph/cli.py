@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import click
 
@@ -9,6 +10,23 @@ from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_lo
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
 from pralph.state import StateManager
+
+
+def _read_stdin() -> str | None:
+    """Read from stdin if it's piped (not a TTY). Returns None if interactive."""
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip() or None
+    return None
+
+
+def _resolve_prompt(flag_value: str | None, interactive_label: str) -> str:
+    """Resolve prompt: flag > stdin > interactive prompt."""
+    if flag_value:
+        return flag_value
+    stdin = _read_stdin()
+    if stdin:
+        return stdin
+    return click.prompt(interactive_label)
 
 
 def _reset_phase(state: StateManager, phase: str) -> None:
@@ -79,14 +97,15 @@ def main(ctx, model, max_iterations, max_budget_usd, cooldown, verbose, project_
 
 
 @main.command()
-@click.option("--user-prompt", default="", help="Guidance for design doc creation")
+@click.option("--prompt", default=None, help="Guidance for design doc creation")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def plan(ctx, user_prompt, reset):
+def plan(ctx, prompt, reset):
     """Phase 1: Create/refine a design document."""
     state = StateManager(ctx.obj["project_dir"])
     if reset:
         _reset_phase(state, "plan")
+    prompt = _resolve_prompt(prompt, "Design prompt")
     click.echo(f"pralph plan — max {ctx.obj['max_iterations']} iterations")
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  model: {ctx.obj['model']}")
@@ -96,7 +115,7 @@ def plan(ctx, user_prompt, reset):
         model=ctx.obj["model"],
         max_iterations=ctx.obj["max_iterations"],
         cooldown=ctx.obj["cooldown"],
-        user_prompt=user_prompt,
+        user_prompt=prompt,
         verbose=ctx.obj["verbose"],
         dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
         max_budget_usd=ctx.obj["max_budget_usd"],
@@ -153,24 +172,23 @@ def webgen(ctx, reset):
 
 
 @main.command()
-@click.option("--idea", default=None, help="Brief idea to turn into a story (prompted if omitted)")
+@click.option("--prompt", default=None, help="Brief idea to turn into a story (prompted if omitted)")
 @click.option("--next", "is_next", is_flag=True, help="Priority 1 — implement next")
 @click.option("--anytime", is_flag=True, default=False, help="Claude picks priority (default)")
 @click.pass_context
-def add(ctx, idea, is_next, anytime):
+def add(ctx, prompt, is_next, anytime):
     """Add a single story from an idea."""
-    if idea is None:
-        idea = click.prompt("Idea")
+    prompt = _resolve_prompt(prompt, "Idea")
     state = StateManager(ctx.obj["project_dir"])
     click.echo(f"pralph add")
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  priority: {'next (1)' if is_next else 'claude picks'}")
-    click.echo(f"  idea: {idea}")
+    click.echo(f"  idea: {prompt}")
 
     story = run_add(
         state,
-        idea=idea,
+        idea=prompt,
         is_next=is_next,
         model=ctx.obj["model"],
         verbose=ctx.obj["verbose"],
@@ -197,10 +215,10 @@ def add(ctx, idea, is_next, anytime):
 @main.command()
 @click.argument("ideas_args", nargs=-1)
 @click.option("--ideas-file", default=None, type=click.Path(), help="Path to ideas file [default: .pralph/ideas.md]")
-@click.option("--ideas", default=None, help="Ideas as inline text")
+@click.option("--prompt", default=None, help="Ideas as inline text")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def ideate(ctx, ideas_args, ideas_file, ideas, reset):
+def ideate(ctx, ideas_args, ideas_file, prompt, reset):
     """Process a batch of ideas into stories.
 
     Ideas can be passed as arguments: pralph ideate "add dark mode" "CSV export"
@@ -209,11 +227,11 @@ def ideate(ctx, ideas_args, ideas_file, ideas, reset):
     if reset:
         _reset_phase(state, "ideate")
 
-    # Resolve ideas: args > --ideas > --ideas-file > default ideas.md > interactive
+    # Resolve ideas: args > --prompt > --ideas-file > default ideas.md > stdin > interactive
     if ideas_args:
         ideas_text = "\n".join(f"- {a}" for a in ideas_args)
-    elif ideas:
-        ideas_text = ideas
+    elif prompt:
+        ideas_text = prompt
     elif ideas_file:
         from pathlib import Path
         p = Path(ideas_file)
@@ -224,17 +242,21 @@ def ideate(ctx, ideas_args, ideas_file, ideas, reset):
     elif state.ideas_path.exists():
         ideas_text = state.ideas_path.read_text()
     else:
-        click.echo("Enter ideas (one per line, blank line to finish):")
-        lines = []
-        while True:
-            line = click.prompt("", default="", prompt_suffix="  ", show_default=False)
-            if not line:
-                break
-            lines.append(line)
-        if not lines:
-            click.echo("Error: No ideas provided")
-            return
-        ideas_text = "\n".join(lines)
+        stdin = _read_stdin()
+        if stdin:
+            ideas_text = stdin
+        else:
+            click.echo("Enter ideas (one per line, blank line to finish):")
+            lines = []
+            while True:
+                line = click.prompt("", default="", prompt_suffix="  ", show_default=False)
+                if not line:
+                    break
+                lines.append(line)
+            if not lines:
+                click.echo("Error: No ideas provided")
+                return
+            ideas_text = "\n".join(lines)
 
     ideas_text = ideas_text.strip()
     if not ideas_text:
@@ -260,10 +282,11 @@ def ideate(ctx, ideas_args, ideas_file, ideas, reset):
 
 @main.command()
 @click.argument("instruction", required=False)
+@click.option("--prompt", default=None, help="Refinement instruction")
 @click.option("--story", "-s", "story_ids", multiple=True, help="Story ID(s) to refine")
 @click.option("--pattern", "-p", "id_pattern", default=None, help="Glob pattern to match story IDs (e.g. 'I18N-*')")
 @click.pass_context
-def refine(ctx, instruction, story_ids, id_pattern):
+def refine(ctx, instruction, prompt, story_ids, id_pattern):
     """Refine existing stories: split, merge, or rewrite."""
     import fnmatch
 
@@ -298,9 +321,12 @@ def refine(ctx, instruction, story_ids, id_pattern):
         if s.status not in (StoryStatus.pending, StoryStatus.rework, StoryStatus.error):
             click.echo(click.style(f"  Warning: {s.id} has status '{s.status.value}'", fg='yellow'))
 
-    # Prompt for instruction if not provided
+    # Resolve instruction: positional arg > --prompt > stdin > interactive
     if not instruction:
-        instruction = click.prompt("Refinement instruction")
+        if prompt:
+            instruction = prompt
+        else:
+            instruction = _read_stdin() or click.prompt("Refinement instruction")
     if not instruction.strip():
         click.echo(click.style("Error: instruction is empty", fg='red'))
         return
@@ -339,14 +365,15 @@ def refine(ctx, instruction, story_ids, id_pattern):
 @click.option("--phase1/--no-phase1", default=True, help="Architecture-first grouping")
 @click.option("--review/--no-review", default=True, help="Run reviewer after each implementation")
 @click.option("--compound/--no-compound", default=False, help="Capture learnings after each story (compound learning)")
-@click.option("--user-prompt", default="", help="Guidance for implementation (e.g. 'use FastAPI', 'use MCP for DB access')")
+@click.option("--prompt", default=None, help="Guidance for implementation (e.g. 'use FastAPI', 'use MCP for DB access')")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def implement(ctx, story_id, phase1, review, compound, user_prompt, reset):
+def implement(ctx, story_id, phase1, review, compound, prompt, reset):
     """Phase 3: Implement stories from backlog."""
     state = StateManager(ctx.obj["project_dir"])
     if reset:
         _reset_phase(state, "implement")
+    prompt = _resolve_prompt(prompt, "Implementation guidance")
     click.echo(f"pralph implement — max {ctx.obj['max_iterations']} iterations")
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  model: {ctx.obj['model']}")
@@ -364,7 +391,7 @@ def implement(ctx, story_id, phase1, review, compound, user_prompt, reset):
         phase1=phase1,
         review=review,
         compound=compound,
-        user_prompt=user_prompt,
+        user_prompt=prompt,
         extra_tools=_get_extra_tools(ctx, state),
         verbose=ctx.obj["verbose"],
         dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
@@ -374,23 +401,24 @@ def implement(ctx, story_id, phase1, review, compound, user_prompt, reset):
 
 @main.command()
 @click.option("--story-id", default=None, help="Story ID to capture learnings from")
-@click.option("-d", "--description", default="", help="Description of what was done")
+@click.option("--prompt", default=None, help="Description of what was done")
 @click.pass_context
-def compound(ctx, story_id, description):
+def compound(ctx, story_id, prompt):
     """Capture learnings from recent work (compound learning)."""
+    prompt = _resolve_prompt(prompt, "Description of work done")
     state = StateManager(ctx.obj["project_dir"])
     click.echo(f"pralph compound")
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  model: {ctx.obj['model']}")
     if story_id:
         click.echo(f"  story: {story_id}")
-    if description:
-        click.echo(f"  description: {description[:80]}")
+    if prompt:
+        click.echo(f"  description: {prompt[:80]}")
 
     cost = run_compound(
         state,
         story_id=story_id,
-        description=description,
+        description=prompt,
         model=ctx.obj["model"],
         verbose=ctx.obj["verbose"],
         dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
