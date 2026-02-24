@@ -149,6 +149,9 @@ A dark-themed web UI for browsing and managing your story backlog. Features:
 - **In-place editing** — edit story fields (title, content, priority, status, etc.) directly in the browser and save back to disk.
 - **Timeline view** — a Gantt-style visualization that lays out stories by dependency depth, with arrows showing dependency relationships.
 
+<img src="docs/viewer-stories.png" alt="Story viewer — card view with detail panel" width="800">
+<img src="docs/viewer-timeline.png" alt="Story viewer — timeline view with dependency arrows" width="800">
+
 ## Customization
 
 ### Additional prompt files
