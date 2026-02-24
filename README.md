@@ -114,6 +114,80 @@ pralph compound --story-id AUTH-001
 | `--dangerously-skip-permissions` | off | Bypass Claude Code permission checks |
 | `--extra-tools` | — | Additional MCP tools (comma-separated) |
 
+### Command options
+
+#### `plan`
+
+| Option | Default | Description |
+|---|---|---|
+| `--user-prompt` | — | Guidance for design doc creation |
+| `--reset` | off | Reset phase state and start fresh |
+
+#### `stories`
+
+| Option | Default | Description |
+|---|---|---|
+| `--extract-weight` | `80` | Extract vs research weight (0–100) |
+| `--reset` | off | Reset phase state and start fresh |
+
+#### `webgen`
+
+| Option | Default | Description |
+|---|---|---|
+| `--reset` | off | Reset phase state and start fresh |
+
+#### `add`
+
+| Option | Default | Description |
+|---|---|---|
+| `--idea` | — | Brief idea to turn into a story (prompted if omitted) |
+| `--next` | off | Priority 1 — implement next |
+| `--anytime` | off | Let Claude pick priority |
+
+#### `ideate`
+
+Accepts ideas as positional arguments (e.g. `pralph ideate "idea one" "idea two"`).
+
+| Option | Default | Description |
+|---|---|---|
+| `--ideas-file` | — | Path to ideas file (default: `.pralph/ideas.md`) |
+| `--ideas` | — | Ideas as inline text |
+| `--reset` | off | Reset phase state and start fresh |
+
+#### `refine`
+
+Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "split into login and registration"`).
+
+| Option | Default | Description |
+|---|---|---|
+| `-s`, `--story` | — | Story ID(s) to refine (repeatable) |
+| `-p`, `--pattern` | — | Glob pattern to match story IDs (e.g. `I18N-*`) |
+
+#### `implement`
+
+| Option | Default | Description |
+|---|---|---|
+| `--story-id` | — | Implement a specific story |
+| `--phase1` / `--no-phase1` | on | Architecture-first grouping |
+| `--review` / `--no-review` | on | Run reviewer after each implementation |
+| `--compound` / `--no-compound` | off | Capture learnings after each story |
+| `--user-prompt` | — | Guidance for implementation (e.g. "use FastAPI") |
+| `--reset` | off | Reset phase state and start fresh |
+
+#### `compound`
+
+| Option | Default | Description |
+|---|---|---|
+| `--story-id` | — | Story ID to capture learnings from |
+| `-d`, `--description` | — | Description of what was done |
+
+#### `viewer`
+
+| Option | Default | Description |
+|---|---|---|
+| `--port` | `8411` | Port to serve on |
+| `--no-open` | off | Don't auto-open browser |
+
 ### Project state
 
 All state lives in `.pralph/` within your project:
