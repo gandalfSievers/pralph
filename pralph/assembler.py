@@ -485,7 +485,7 @@ def assemble_compound_prompt(
     story: "Story",
 ) -> str:
     """Build the prompt for compound learning capture after implementation."""
-    impl_summary = state.get_implemented_summary(max_chars=2000)
+    impl_summary = state.get_implemented_summary()
 
     prompt = state.resolve_prompt_template("compound", COMPOUND_CAPTURE_PROMPT)
     prompt = _safe_sub(prompt, "story_id", _escape_template_vars(story.id))

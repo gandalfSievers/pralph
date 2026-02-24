@@ -264,34 +264,22 @@ class StateManager:
             for s in stories:
                 f.write(json.dumps(s.to_dict()) + "\n")
 
-    def get_implemented_summary(self, max_chars: int = 8000) -> str:
+    def get_implemented_summary(self) -> str:
         if not self.status_path.exists():
             return ""
-        lines: list[str] = ["## Previously Implemented Stories\n"]
-        total_len = len(lines[0])
-        truncated = 0
+        count = 0
         for raw in self.status_path.read_text().splitlines():
             raw = raw.strip()
             if not raw:
                 continue
             try:
-                entry = json.loads(raw)
-                sid = entry.get("story_id", "?")
-                st = entry.get("status", "?")
-                sm = entry.get("summary", "")
-                line = f"- {sid}: {st} — {sm}"
-                if total_len + len(line) + 1 > max_chars:
-                    truncated += 1
-                    continue
-                lines.append(line)
-                total_len += len(line) + 1
+                json.loads(raw)
+                count += 1
             except json.JSONDecodeError:
                 continue
-        if len(lines) == 1:
+        if count == 0:
             return ""
-        if truncated:
-            lines.append(f"\n(... and {truncated} more — see {self.status_path} for full list)")
-        return "\n".join(lines)
+        return f"## Previously Implemented Stories\n\n{count} stories tracked in {self.status_path}"
 
     # -- phase state --
 
