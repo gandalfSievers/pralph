@@ -115,8 +115,8 @@ def run_claude(
 ) -> ClaudeResult:
     """Invoke claude -p as a subprocess with streaming output.
 
-    Monitors stdin for ESC key — on press, kills the subprocess and presents
-    an interrupt menu (take over interactively / skip / abort).
+    Monitors stdin for ESC key — on press, stops the subprocess (SIGSTOP) and
+    presents an interrupt menu (continue / take over / skip / abort).
     """
     if resume_session_id:
         session_id = resume_session_id
@@ -175,6 +175,8 @@ def run_claude(
     assert proc.stdout is not None
     assert proc.stderr is not None
 
+    stdout_fd = proc.stdout.fileno()
+
     # Start ESC key monitor
     monitor_state = _start_esc_monitor(proc)
 
@@ -185,9 +187,76 @@ def run_claude(
     final_result: dict | None = None
     deadline = time.monotonic() + timeout
     error_result: ClaudeResult | None = None
+    buf = ""
 
     try:
-        for line in proc.stdout:
+        while True:
+            # Check if interrupted by ESC (process is SIGSTOP'd)
+            if monitor_state and monitor_state[0].is_set():
+                _stop_elapsed_timer(timer_stop)
+                _stop_esc_monitor(monitor_state)
+
+                choice = _handle_interrupt(session_id, cwd)
+
+                if choice == "continue":
+                    try:
+                        proc.send_signal(signal.SIGCONT)
+                    except OSError:
+                        pass
+                    timer_stop = _start_elapsed_timer(time.monotonic())
+                    monitor_state = _start_esc_monitor(proc)
+                    continue
+                elif choice == "takeover":
+                    import click as _click
+                    proc.kill()
+                    proc.wait()
+                    _click.echo(_click.style("\n  Entering interactive mode...\n", fg="cyan", bold=True))
+                    resume_interactive(session_id, cwd)
+                    post = _post_takeover_menu(session_id)
+                    if post == "resume":
+                        return run_claude(
+                            prompt,
+                            resume_session_id=session_id,
+                            dangerously_skip_permissions=dangerously_skip_permissions,
+                            timeout=timeout,
+                            verbose=verbose,
+                            project_dir=project_dir,
+                        )
+                    elif post == "implemented":
+                        return ClaudeResult(
+                            success=True,
+                            result=json.dumps({
+                                "status": "implemented",
+                                "summary": "Completed via interactive takeover",
+                            }),
+                            session_id=session_id,
+                            interrupted=True,
+                        )
+                    elif post == "continue":
+                        return ClaudeResult(
+                            success=False, error="interrupted",
+                            session_id=session_id, interrupted=True,
+                        )
+                    else:  # abort
+                        return ClaudeResult(
+                            success=False, error="aborted",
+                            session_id=session_id, interrupted=True,
+                        )
+                elif choice == "skip":
+                    proc.kill()
+                    proc.wait()
+                    return ClaudeResult(
+                        success=False, error="interrupted",
+                        session_id=session_id, interrupted=True,
+                    )
+                else:  # abort
+                    proc.kill()
+                    proc.wait()
+                    return ClaudeResult(
+                        success=False, error="aborted",
+                        session_id=session_id, interrupted=True,
+                    )
+
             if time.monotonic() > deadline:
                 proc.kill()
                 proc.wait()
@@ -198,39 +267,52 @@ def run_claude(
                 )
                 break
 
-            line = line.strip()
-            if not line:
+            # Wait for data with timeout so we can check the interrupt flag
+            ready, _, _ = select.select([stdout_fd], [], [], 0.3)
+
+            if not ready:
+                if proc.poll() is not None:
+                    break  # process ended
                 continue
 
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                if verbose:
-                    with _timer_lock:
-                        _clear_timer_line()
-                        print(f"  [stream] unparseable: {line[:120]}", file=sys.stderr)
-                        _reset_timer()
-                continue
+            chunk = os.read(stdout_fd, 8192)
+            if not chunk:
+                break  # EOF
 
-            etype = event.get("type", "")
+            buf += chunk.decode("utf-8", errors="replace")
 
-            # The final result event has the envelope we need
-            if etype == "result":
-                final_result = event
-                # Print the final result text
-                result_text = event.get("result", "")
-                if result_text:
-                    with _timer_lock:
-                        _clear_timer_line()
-                        print(f"\n{result_text}", file=sys.stderr)
-                        _reset_timer()
-                continue
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
 
-            # Print progress for the user
-            with _timer_lock:
-                _clear_timer_line()
-                _print_event(event, verbose)
-                _reset_timer()
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    if verbose:
+                        with _timer_lock:
+                            _clear_timer_line()
+                            print(f"  [stream] unparseable: {line[:120]}", file=sys.stderr)
+                            _reset_timer()
+                    continue
+
+                etype = event.get("type", "")
+
+                if etype == "result":
+                    final_result = event
+                    result_text = event.get("result", "")
+                    if result_text:
+                        with _timer_lock:
+                            _clear_timer_line()
+                            print(f"\n{result_text}", file=sys.stderr)
+                            _reset_timer()
+                    continue
+
+                with _timer_lock:
+                    _clear_timer_line()
+                    _print_event(event, verbose)
+                    _reset_timer()
 
     except Exception as e:
         proc.kill()
@@ -247,20 +329,6 @@ def run_claude(
         return error_result
 
     proc.wait()
-
-    # Check if interrupted by ESC
-    if monitor_state and monitor_state[0].is_set():
-        result = _handle_interrupt(session_id, cwd)
-        if result.error == "continue":
-            return run_claude(
-                prompt,
-                resume_session_id=result.session_id,
-                dangerously_skip_permissions=dangerously_skip_permissions,
-                timeout=timeout,
-                verbose=verbose,
-                project_dir=project_dir,
-            )
-        return result
 
     # Check stderr for errors
     stderr = proc.stderr.read().strip()
@@ -317,7 +385,7 @@ def _start_esc_monitor(
                     if ch == b"\x1b":
                         interrupted.set()
                         try:
-                            proc.send_signal(signal.SIGINT)
+                            proc.send_signal(signal.SIGSTOP)
                         except OSError:
                             pass
                         return
@@ -343,8 +411,8 @@ def _stop_esc_monitor(
         pass
 
 
-def _handle_interrupt(session_id: str, project_dir: str | None) -> ClaudeResult:
-    """Show interrupt menu and handle user choice."""
+def _handle_interrupt(session_id: str, project_dir: str | None) -> str:
+    """Show interrupt menu and return choice: 'continue', 'takeover', 'skip', or 'abort'."""
     import click
 
     # Flush any stale input from the ESC detection
@@ -366,61 +434,42 @@ def _handle_interrupt(session_id: str, project_dir: str | None) -> ClaudeResult:
     )
 
     if choice == "1":
-        return ClaudeResult(
-            success=False, error="continue",
-            session_id=session_id, interrupted=True,
-        )
+        return "continue"
     elif choice == "2":
-        click.echo(click.style("\n  Entering interactive mode...\n", fg="cyan", bold=True))
-        resume_interactive(session_id, project_dir)
-        return _post_takeover_menu(session_id)
+        return "takeover"
     elif choice == "3":
-        return ClaudeResult(
-            success=False, error="interrupted",
-            session_id=session_id, interrupted=True,
-        )
+        return "skip"
     else:
-        return ClaudeResult(
-            success=False, error="aborted",
-            session_id=session_id, interrupted=True,
-        )
+        return "abort"
 
 
-def _post_takeover_menu(session_id: str) -> ClaudeResult:
-    """Ask user about story status after interactive takeover."""
+def _post_takeover_menu(session_id: str) -> str:
+    """Ask user about story status after interactive takeover.
+
+    Returns: 'implemented', 'resume', 'continue', or 'abort'.
+    """
     import click
 
     click.echo()
     click.echo(click.style("  Interactive session ended", fg="cyan", bold=True))
     click.echo()
-    click.echo("  [1] Mark as implemented — story complete")
-    click.echo("  [2] Continue loop — story resets to pending")
-    click.echo("  [3] Abort loop")
+    click.echo("  [1] Resume              — continue automated session")
+    click.echo("  [2] Mark as implemented — story complete")
+    click.echo("  [3] Continue loop       — story resets to pending")
+    click.echo("  [4] Abort loop")
     click.echo()
     choice = click.prompt(
-        "  Choice", type=click.Choice(["1", "2", "3"]), default="2",
+        "  Choice", type=click.Choice(["1", "2", "3", "4"]), default="1",
     )
 
     if choice == "1":
-        return ClaudeResult(
-            success=True,
-            result=json.dumps({
-                "status": "implemented",
-                "summary": "Completed via interactive takeover",
-            }),
-            session_id=session_id,
-            interrupted=True,
-        )
+        return "resume"
     elif choice == "2":
-        return ClaudeResult(
-            success=False, error="interrupted",
-            session_id=session_id, interrupted=True,
-        )
+        return "implemented"
+    elif choice == "3":
+        return "continue"
     else:
-        return ClaudeResult(
-            success=False, error="aborted",
-            session_id=session_id, interrupted=True,
-        )
+        return "abort"
 
 
 def resume_interactive(
