@@ -84,7 +84,12 @@ def _run_loop(
     DONE_REASONS = {"generation_complete", "planning_complete", "all_stories_done", "single_story_done"}
 
     if ps.completed:
-        if ps.completion_reason in DONE_REASONS:
+        if ps.completion_reason == "all_stories_done" and state.get_actionable_stories():
+            # Stories were reset back to pending/rework — resume
+            click.echo(f"  Phase '{phase}' resuming (stories reset to actionable)...")
+            ps.completed = False
+            ps.completion_reason = ""
+        elif ps.completion_reason in DONE_REASONS:
             click.echo(f"  Phase '{phase}' already completed: {ps.completion_reason}")
             return ps
         else:
