@@ -580,6 +580,7 @@ def run_with_retry(
         if result.error == "timeout" and attempt == 0:
             original_timeout = kwargs.get("timeout", 600)
             kwargs["timeout"] = original_timeout * 2
+            kwargs.pop("session_id", None)  # avoid "already in use" on retry
             print(f"  [retry] timeout — retrying with {kwargs['timeout']}s", file=sys.stderr)
             continue
 
@@ -587,6 +588,7 @@ def run_with_retry(
             delay = delays[min(attempt, len(delays) - 1)]
             jitter = random.uniform(0, delay * 0.2)
             wait = delay + jitter
+            kwargs.pop("session_id", None)  # avoid "already in use" on retry
             print(f"  [retry] rate limited — waiting {wait:.0f}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
             time.sleep(wait)
             continue
