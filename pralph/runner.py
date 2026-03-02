@@ -186,6 +186,7 @@ def run_claude(
     timer_stop = _start_elapsed_timer(start_time)
 
     final_result: dict | None = None
+    all_assistant_text: list[str] = []  # accumulate all assistant text blocks
     deadline = time.monotonic() + timeout
     error_result: ClaudeResult | None = None
     buf = ""
@@ -310,6 +311,16 @@ def run_claude(
                             _reset_timer()
                     continue
 
+                # Accumulate all assistant text for fallback parsing
+                if etype == "assistant":
+                    msg = event.get("message", {})
+                    if isinstance(msg, dict):
+                        for block in msg.get("content", []):
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                t = block.get("text", "")
+                                if t:
+                                    all_assistant_text.append(t)
+
                 with _timer_lock:
                     _clear_timer_line()
                     _print_event(event, verbose)
@@ -351,6 +362,11 @@ def run_claude(
     result = _parse_result_event(final_result)
     if not result.session_id:
         result.session_id = session_id
+    # If the result event had no text but we captured assistant text during
+    # streaming, use the accumulated text so parsers can find structured output
+    # that appeared in earlier assistant turns (e.g. before a tool call).
+    if not result.result and all_assistant_text:
+        result.result = "\n\n".join(all_assistant_text)
     return result
 
 

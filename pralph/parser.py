@@ -220,9 +220,9 @@ def parse_review_output(text: str) -> dict[str, Any]:
             "issues": [],
         }
 
-    # Could not parse — default to approved to avoid blocking on parse failures
+    # Could not parse — reject to avoid silently passing unreviewed code
     return {
-        "approved": True,
-        "feedback": "Review output could not be parsed — auto-approving",
+        "approved": False,
+        "feedback": "Review output could not be parsed — rejecting for re-review",
         "issues": [],
     }
