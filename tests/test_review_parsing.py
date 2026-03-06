@@ -153,16 +153,16 @@ class TestParseReviewOutput:
         parsed = parse_review_output(text)
         assert parsed["approved"] is True
 
-    # ── Strategy 3: unparseable → auto-approve (the dangerous fallback) ──
+    # ── Strategy 3: unparseable → reject (safe default after 6d25c32 fix) ──
 
-    def test_unparseable_auto_approves(self):
+    def test_unparseable_rejects(self):
         parsed = parse_review_output("I looked at the code and it seems fine.")
-        assert parsed["approved"] is True
+        assert parsed["approved"] is False
         assert "could not be parsed" in parsed["feedback"]
 
-    def test_empty_string_auto_approves(self):
+    def test_empty_string_rejects(self):
         parsed = parse_review_output("")
-        assert parsed["approved"] is True
+        assert parsed["approved"] is False
         assert "could not be parsed" in parsed["feedback"]
 
 
@@ -402,9 +402,9 @@ class TestAssistantTextFallback:
 
         r = self._simulate_stream(events)
         assert r.result == ""
-        # Parser falls through to auto-approve
+        # Parser falls through to reject (safe default after 6d25c32 fix)
         parsed = parse_review_output(r.result)
-        assert parsed["approved"] is True
+        assert parsed["approved"] is False
         assert "could not be parsed" in parsed["feedback"]
 
     def test_result_has_text_fallback_not_used(self):

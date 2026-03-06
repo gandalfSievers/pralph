@@ -1131,7 +1131,8 @@ def run_implement_loop(
 
         return IterationResult(
             iteration=i, phase="implement", mode="implement",
-            success=True, impl_status=new_status.value,
+            success=new_status != StoryStatus.error, impl_status=new_status.value,
+            error=parsed.get("reason", "") if new_status == StoryStatus.error else "",
             cost_usd=total_cost, story_id=story.id,
             input_tokens=total_input,
             output_tokens=total_output,
@@ -1206,7 +1207,8 @@ def run_implement_loop(
 
         return IterationResult(
             iteration=ps.current_iteration, phase="implement", mode="resume",
-            success=True, impl_status=new_status.value,
+            success=new_status != StoryStatus.error, impl_status=new_status.value,
+            error=parsed.get("reason", "") if new_status == StoryStatus.error else "",
             cost_usd=total_cost, story_id=story.id,
             input_tokens=total_input,
             output_tokens=total_output,
