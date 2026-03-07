@@ -174,6 +174,29 @@ class StateManager:
         pending = [s for s in stories if s.status == StoryStatus.pending]
         return rework + pending
 
+    def reset_error_stories(self) -> list[Story]:
+        """Find stories with error status and reset them to pending."""
+        stories = self.load_stories()
+        reset: list[Story] = []
+
+        for s in stories:
+            if s.status == StoryStatus.error:
+                s.status = StoryStatus.pending
+                reset.append(s)
+
+        if reset:
+            self._rewrite_stories(stories)
+            with open(self.status_path, "a") as f:
+                for s in reset:
+                    entry = {
+                        "story_id": s.id,
+                        "status": "pending",
+                        "summary": "Reset from error status",
+                    }
+                    f.write(json.dumps(entry) + "\n")
+
+        return reset
+
     def recover_orphaned_stories(self) -> list[Story]:
         """Find in_progress stories (orphans from crashes) and reset to pending."""
         stories = self.load_stories()

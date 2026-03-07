@@ -49,7 +49,7 @@ class OrderedGroup(click.Group):
     SECTIONS = [
         ("Workflow", ["plan", "stories", "webgen", "implement"]),
         ("Replan", ["add", "ideate", "refine"]),
-        ("Tools", ["compound", "viewer"]),
+        ("Tools", ["compound", "reset-errors", "viewer"]),
     ]
 
     def list_commands(self, ctx):
@@ -426,6 +426,41 @@ def compound(ctx, story_id, prompt):
     )
 
     click.echo(f"\n  Cost: ${cost:.4f}")
+
+
+@main.command("reset-errors")
+@click.pass_context
+def reset_errors(ctx):
+    """Reset error stories to pending and clear error state."""
+    state = StateManager(ctx.obj["project_dir"])
+
+    # Reset error stories back to pending
+    reset_stories = state.reset_error_stories()
+
+    # Clear error fields in whichever phase is currently stored
+    if state.phase_state_path.exists():
+        try:
+            import json
+            data = json.loads(state.phase_state_path.read_text())
+            phase = data.get("phase", "implement")
+        except (json.JSONDecodeError, KeyError):
+            phase = "implement"
+        ps = state.load_phase_state(phase)
+        if ps.consecutive_errors > 0 or ps.last_error or ps.completion_reason in ("consecutive_errors", "error"):
+            ps.consecutive_errors = 0
+            ps.last_error = ""
+            if ps.completion_reason in ("consecutive_errors", "error"):
+                ps.completed = False
+                ps.completion_reason = ""
+            state.save_phase_state(ps)
+            click.echo(f"  Cleared '{phase}' phase error state")
+
+    if reset_stories:
+        click.echo(click.style(f"  Reset {len(reset_stories)} stories from error to pending:", fg='green'))
+        for s in reset_stories:
+            click.echo(f"    {click.style(s.id, fg='blue')}: {s.title}")
+    else:
+        click.echo("  No error stories found")
 
 
 @main.command()
