@@ -112,6 +112,7 @@ def run_claude(
     verbose: bool = False,
     project_dir: str | None = None,
     resume_session_id: str | None = None,
+    session_id: str | None = None,
 ) -> ClaudeResult:
     """Invoke claude -p as a subprocess with streaming output.
 
@@ -121,13 +122,13 @@ def run_claude(
     if resume_session_id:
         session_id = resume_session_id
         cmd = [
-            "claude", "--resume", resume_session_id,
+            "claude", "-p", "--resume", resume_session_id,
             "--verbose", "--output-format", "stream-json",
         ]
         if dangerously_skip_permissions:
             cmd.append("--dangerously-skip-permissions")
     else:
-        session_id = str(uuid.uuid4())
+        session_id = session_id or str(uuid.uuid4())
         cmd = [
             "claude", "-p", "--verbose", "--model", model,
             "--output-format", "stream-json", "--session-id", session_id,
@@ -167,7 +168,7 @@ def run_claude(
 
     # Send prompt on stdin, then close
     assert proc.stdin is not None
-    if not resume_session_id:
+    if prompt:
         proc.stdin.write(prompt)
     proc.stdin.close()
 
@@ -185,6 +186,7 @@ def run_claude(
     timer_stop = _start_elapsed_timer(start_time)
 
     final_result: dict | None = None
+    all_assistant_text: list[str] = []  # accumulate all assistant text blocks
     deadline = time.monotonic() + timeout
     error_result: ClaudeResult | None = None
     buf = ""
@@ -211,11 +213,11 @@ def run_claude(
                     proc.kill()
                     proc.wait()
                     _click.echo(_click.style("\n  Entering interactive mode...\n", fg="cyan", bold=True))
-                    resume_interactive(session_id, cwd)
+                    resume_interactive(session_id, cwd, dangerously_skip_permissions)
                     post = _post_takeover_menu(session_id)
                     if post == "resume":
                         return run_claude(
-                            prompt,
+                            "Continue where you left off.",
                             resume_session_id=session_id,
                             dangerously_skip_permissions=dangerously_skip_permissions,
                             timeout=timeout,
@@ -309,6 +311,16 @@ def run_claude(
                             _reset_timer()
                     continue
 
+                # Accumulate all assistant text for fallback parsing
+                if etype == "assistant":
+                    msg = event.get("message", {})
+                    if isinstance(msg, dict):
+                        for block in msg.get("content", []):
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                t = block.get("text", "")
+                                if t:
+                                    all_assistant_text.append(t)
+
                 with _timer_lock:
                     _clear_timer_line()
                     _print_event(event, verbose)
@@ -350,6 +362,11 @@ def run_claude(
     result = _parse_result_event(final_result)
     if not result.session_id:
         result.session_id = session_id
+    # If the result event had no text but we captured assistant text during
+    # streaming, use the accumulated text so parsers can find structured output
+    # that appeared in earlier assistant turns (e.g. before a tool call).
+    if not result.result and all_assistant_text:
+        result.result = "\n\n".join(all_assistant_text)
     return result
 
 
@@ -475,9 +492,12 @@ def _post_takeover_menu(session_id: str) -> str:
 def resume_interactive(
     session_id: str,
     project_dir: str | None = None,
+    dangerously_skip_permissions: bool = False,
 ) -> int:
     """Resume a claude session interactively, inheriting the terminal."""
     cmd = ["claude", "--resume", session_id]
+    if dangerously_skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
     return subprocess.call(cmd, cwd=project_dir)
 
 
@@ -579,6 +599,7 @@ def run_with_retry(
         if result.error == "timeout" and attempt == 0:
             original_timeout = kwargs.get("timeout", 600)
             kwargs["timeout"] = original_timeout * 2
+            kwargs.pop("session_id", None)  # avoid "already in use" on retry
             print(f"  [retry] timeout — retrying with {kwargs['timeout']}s", file=sys.stderr)
             continue
 
@@ -586,6 +607,7 @@ def run_with_retry(
             delay = delays[min(attempt, len(delays) - 1)]
             jitter = random.uniform(0, delay * 0.2)
             wait = delay + jitter
+            kwargs.pop("session_id", None)  # avoid "already in use" on retry
             print(f"  [retry] rate limited — waiting {wait:.0f}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
             time.sleep(wait)
             continue

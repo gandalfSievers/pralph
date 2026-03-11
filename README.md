@@ -2,9 +2,29 @@
 
 **Planned Ralph** — a multi-phase AI development workflow that orchestrates [Claude Code](https://docs.anthropic.com/en/docs/claude-code) externally to automate the full software development lifecycle — from design to implementation.
 
+## Table of contents
+
+- [Background](#background)
+- [How it works](#how-it-works)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Standard workflow](#standard-workflow)
+  - [Adding stories later](#adding-stories-later)
+  - [Compound learning](#compound-learning)
+  - [Piping from stdin](#piping-from-stdin)
+  - [Global options](#global-options)
+  - [Command options](#command-options)
+  - [Project state](#project-state)
+- [Story viewer](#story-viewer)
+- [Customization](#customization)
+  - [Additional prompt files](#additional-prompt-files)
+  - [Prompt template overrides](#prompt-template-overrides)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+
 ## Background
 
-pralph is inspired by the official [Ralph](https://github.com/anthropics/ralph) plugin and [RalphX](https://github.com/anthropics/ralphx), which provide AI-driven product development workflows inside Claude Code. Unlike those tools, **pralph runs outside of Claude Code**, driving it as a subprocess. This means:
+pralph is inspired by the official [Ralph](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum) plugin and [RalphX](https://github.com/jackneil/ralphx), which provide AI-driven product development workflows inside Claude Code. Unlike those tools, **pralph runs outside of Claude Code**, driving it as a subprocess. This means:
 
 - **External orchestration** — pralph launches Claude Code invocations as child processes, managing sessions, streaming output, and coordinating multi-phase workflows from the outside.
 - **Phase state persistence** — All state (design docs, stories, run logs) is tracked in a `.pralph/` directory, surviving across sessions and crashes.
@@ -97,6 +117,23 @@ pralph ideate --ideas-file ideas.txt
 pralph refine -s AUTH-001 "split into login and registration"
 
 # Ad-hoc capture of learnings
+pralph compound --prompt "Fixed CORS issue by adding middleware"
+pralph compound --story-id AUTH-001
+```
+
+### Compound learning
+
+Inspired by the [compound-engineering-plugin](https://github.com/EveryInc/compound-engineering-plugin), compound learning captures non-trivial solutions as structured documentation after each implementation.
+
+The value compounds over time. The first time Claude hits a tricky CORS config, it burns tokens researching. Document that solution, and the next project that needs CORS gets it right on the first iteration. Build errors, deployment quirks, library gotchas, auth patterns — every solution captured makes subsequent implementations faster, cheaper, and more reliable. Early runs are slow; later runs benefit from everything that came before.
+
+Solutions are stored in `.pralph/solutions/` and automatically recalled during future plan and implement phases via keyword search — no manual lookup needed.
+
+```bash
+# Auto-capture learnings after each successful story
+pralph implement --compound
+
+# Ad-hoc capture from recent work
 pralph compound --prompt "Fixed CORS issue by adding middleware"
 pralph compound --story-id AUTH-001
 ```
@@ -308,8 +345,8 @@ Templates use `{{variable}}` placeholders that are substituted at runtime (e.g. 
 
 pralph is heavily inspired by:
 
-- **[Ralph](https://github.com/anthropics/ralph)** — Anthropic's official Claude Code plugin for AI-driven product development workflows.
-- **[RalphX](https://github.com/anthropics/ralphx)** — The extended version of Ralph with multi-phase planning, story extraction, and implementation loops.
+- **[Ralph](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum)** — Anthropic's official Claude Code plugin for AI-driven product development workflows.
+- **[RalphX](https://github.com/jackneil/ralphx)** — The extended version of Ralph with multi-phase planning, story extraction, and implementation loops.
 
 - **[compound-engineering-plugin](https://github.com/EveryInc/compound-engineering-plugin)** — Every Inc's compound learning plugin whose philosophy of documenting solutions to build institutional knowledge inspired pralph's compound learning feature.
 
