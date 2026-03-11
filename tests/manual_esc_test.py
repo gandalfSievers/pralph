@@ -59,7 +59,7 @@ def main() -> None:
         while proc.poll() is None:
             if interrupted.is_set():
                 _stop_esc_monitor(monitor_state)
-                choice = _handle_interrupt("test-session", None, tty_file=tty_file)
+                choice, _ = _handle_interrupt("test-session", None, tty_file=tty_file)
                 if tty_file is not None:
                     try:
                         tty_file.close()

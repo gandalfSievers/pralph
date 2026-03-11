@@ -199,7 +199,7 @@ def run_claude(
                 tty_file = monitor_state[3]
                 _stop_esc_monitor(monitor_state)
 
-                choice = _handle_interrupt(session_id, cwd, tty_file=tty_file)
+                choice, verbose = _handle_interrupt(session_id, cwd, tty_file=tty_file, verbose=verbose)
 
                 # Close /dev/tty if we opened it; a new one is opened if we continue
                 if tty_file is not None:
@@ -457,8 +457,17 @@ def _stop_esc_monitor(
         pass
 
 
-def _handle_interrupt(session_id: str, project_dir: str | None, tty_file: "io.BufferedReader | None" = None) -> str:
-    """Show interrupt menu and return choice: 'continue', 'takeover', 'skip', or 'abort'."""
+def _handle_interrupt(
+    session_id: str,
+    project_dir: str | None,
+    tty_file: "io.BufferedReader | None" = None,
+    verbose: bool = False,
+) -> tuple[str, bool]:
+    """Show interrupt menu and return (choice, verbose).
+
+    Choice is one of: 'continue', 'takeover', 'skip', or 'abort'.
+    verbose is the (possibly toggled) verbose state.
+    """
     import click
 
     # Flush any stale input from the ESC detection
@@ -479,6 +488,8 @@ def _handle_interrupt(session_id: str, project_dir: str | None, tty_file: "io.Bu
             sys.stdin = restore_stdin
             restore_stdin = None
 
+    verbose_label = "Off" if verbose else "On"
+
     click.echo()
     click.echo(click.style("  ⏸  Interrupted", fg="yellow", bold=True))
     click.echo()
@@ -487,23 +498,30 @@ def _handle_interrupt(session_id: str, project_dir: str | None, tty_file: "io.Bu
     click.echo("  [3] Skip      — continue to next iteration")
     click.echo("  [4] Abort     — stop the loop")
     click.echo()
+    click.echo(f"  [5] Toggle verbose ({verbose_label})")
+    click.echo()
     try:
         choice = click.prompt(
-            "  Choice", type=click.Choice(["1", "2", "3", "4"]), default="1",
+            "  Choice", type=click.Choice(["1", "2", "3", "4", "5"]), default="1",
         )
     finally:
         if restore_stdin is not None:
             sys.stdin.close()
             sys.stdin = restore_stdin
 
-    if choice == "1":
-        return "continue"
+    if choice == "5":
+        verbose = not verbose
+        state = "on" if verbose else "off"
+        click.echo(click.style(f"  Verbose {state}", fg="cyan"))
+        return "continue", verbose
+    elif choice == "1":
+        return "continue", verbose
     elif choice == "2":
-        return "takeover"
+        return "takeover", verbose
     elif choice == "3":
-        return "skip"
+        return "skip", verbose
     else:
-        return "abort"
+        return "abort", verbose
 
 
 def _post_takeover_menu(session_id: str) -> str:
