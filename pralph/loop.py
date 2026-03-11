@@ -892,7 +892,7 @@ def run_implement_loop(
     max_budget_usd: float | None = None,
 ) -> PhaseState:
     """Run the implementation loop."""
-    if not state.stories_path.exists():
+    if not state.has_stories():
         click.echo("Error: No stories found. Run 'pralph stories' first.")
         return PhaseState(phase="implement", completed=True, completion_reason="no_stories")
 
@@ -921,7 +921,7 @@ def run_implement_loop(
     # State-based mode selection (evaluated each iteration)
     def _pick_implement_mode() -> str:
         if phase1:
-            has_analysis = state.phase1_analysis_path.exists()
+            has_analysis = state.has_phase1_analysis()
             has_foundation = any(
                 s.category.upper() in FOUNDATION_CATEGORIES
                 for s in state.get_pending_stories()
@@ -938,10 +938,9 @@ def run_implement_loop(
         rework = [s for s in actionable if s.status == StoryStatus.rework]
         pending = [s for s in actionable if s.status == StoryStatus.pending]
 
-        analysis_path = state.phase1_analysis_path
-        if analysis_path.exists():
-            data = json.loads(analysis_path.read_text())
-            impl_order = data.get("implementation_order", data.get("phase_1_group", []))
+        analysis_data = state.load_phase1_analysis()
+        if analysis_data is not None:
+            impl_order = analysis_data.get("implementation_order", analysis_data.get("phase_1_group", []))
             pending_ids = {s.id for s in pending}
             ordered_ids = [sid for sid in impl_order if sid in pending_ids]
             ordered = [s for sid in ordered_ids for s in pending if s.id == sid]
@@ -985,8 +984,8 @@ def run_implement_loop(
                     **_token_kwargs(result),
                 )
 
-            # Save analysis to file for the implement step
-            state.phase1_analysis_path.write_text(json.dumps(data, indent=2) + "\n")
+            # Save analysis to DuckDB for the implement step
+            state.save_phase1_analysis(data)
 
             group = data["phase_1_group"]
             reasoning = data.get("reasoning", {})
@@ -1119,13 +1118,13 @@ def run_implement_loop(
             total_cache_read += compound_result.cache_read_input_tokens
             total_cache_create += compound_result.cache_creation_input_tokens
 
-        # Clean up analysis file when all its stories are done
-        if new_status == StoryStatus.implemented and state.phase1_analysis_path.exists():
-            data = json.loads(state.phase1_analysis_path.read_text())
-            group_ids = set(data.get("implementation_order", data.get("phase_1_group", [])))
+        # Clean up analysis when all its stories are done
+        if new_status == StoryStatus.implemented and state.has_phase1_analysis():
+            p1_data = state.load_phase1_analysis()
+            group_ids = set(p1_data.get("implementation_order", p1_data.get("phase_1_group", [])))
             pending_ids = {s.id for s in state.get_pending_stories()}
             if not group_ids & pending_ids:
-                state.phase1_analysis_path.unlink(missing_ok=True)
+                state.delete_phase1_analysis()
                 story_queue.clear()
                 click.echo(click.style("  Phase 1 analysis complete — switching to normal ordering", fg='green'))
 

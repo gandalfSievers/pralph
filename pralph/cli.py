@@ -10,6 +10,7 @@ from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_lo
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
 from pralph.state import StateManager
+from pralph import db
 
 
 def _read_stdin() -> str | None:
@@ -49,7 +50,7 @@ class OrderedGroup(click.Group):
     SECTIONS = [
         ("Workflow", ["plan", "stories", "webgen", "implement"]),
         ("Replan", ["add", "ideate", "refine"]),
-        ("Tools", ["compound", "viewer"]),
+        ("Tools", ["compound", "viewer", "query"]),
     ]
 
     def list_commands(self, ctx):
@@ -442,3 +443,170 @@ def viewer(ctx, port, no_open):
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  stories: {len(stories)}")
     run_viewer(state, port=port, open_browser=not no_open)
+
+
+# ── Built-in queries for pralph query ────────────────────────────────
+
+_BUILTIN_QUERIES = {
+    "progress": (
+        "Story progress by status",
+        "SELECT status, COUNT(*) as count FROM stories WHERE project_id = ? GROUP BY status ORDER BY count DESC",
+    ),
+    "cost": (
+        "Cost breakdown by phase",
+        """SELECT phase,
+                  COUNT(*) as iterations,
+                  ROUND(SUM(cost_usd), 4) as total_cost,
+                  SUM(input_tokens) as input_tokens,
+                  SUM(output_tokens) as output_tokens
+           FROM run_log WHERE project_id = ?
+           GROUP BY phase ORDER BY total_cost DESC""",
+    ),
+    "stories": (
+        "All stories",
+        "SELECT id, title, status, priority, category, complexity FROM stories WHERE project_id = ? ORDER BY priority, id",
+    ),
+    "cost-per-story": (
+        "Cost per story",
+        """SELECT story_id, COUNT(*) as iterations,
+                  ROUND(SUM(cost_usd), 4) as total_cost,
+                  SUM(input_tokens) as input_tokens,
+                  SUM(output_tokens) as output_tokens
+           FROM run_log WHERE project_id = ? AND story_id != ''
+           GROUP BY story_id ORDER BY total_cost DESC""",
+    ),
+    "errors": (
+        "Recent errors",
+        """SELECT iteration, phase, story_id, error, ROUND(duration, 1) as duration_s
+           FROM run_log WHERE project_id = ? AND success = false AND error != ''
+           ORDER BY logged_at DESC LIMIT 20""",
+    ),
+    "timeline": (
+        "Implementation timeline",
+        """SELECT story_id, phase, success, ROUND(cost_usd, 4) as cost, ROUND(duration, 1) as duration_s, logged_at
+           FROM run_log WHERE project_id = ? AND story_id != ''
+           ORDER BY logged_at""",
+    ),
+    "projects": (
+        "All registered projects",
+        "SELECT project_id, name, created_at FROM projects ORDER BY created_at DESC",
+    ),
+}
+
+
+def _format_table(columns: list[str], rows: list[tuple]) -> str:
+    """Format query results as an aligned text table."""
+    if not rows:
+        return "(no results)"
+    str_rows = [[str(v) if v is not None else "" for v in row] for row in rows]
+    widths = [len(c) for c in columns]
+    for row in str_rows:
+        for i, val in enumerate(row):
+            widths[i] = max(widths[i], len(val))
+    header = "  ".join(c.ljust(widths[i]) for i, c in enumerate(columns))
+    separator = "  ".join("-" * widths[i] for i in range(len(columns)))
+    lines = [header, separator]
+    for row in str_rows:
+        lines.append("  ".join(row[i].ljust(widths[i]) for i in range(len(columns))))
+    return "\n".join(lines)
+
+
+def _format_csv(columns: list[str], rows: list[tuple]) -> str:
+    """Format query results as CSV."""
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(columns)
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+def _format_json(columns: list[str], rows: list[tuple]) -> str:
+    """Format query results as JSON."""
+    import json
+    data = [dict(zip(columns, row)) for row in rows]
+    return json.dumps(data, indent=2, default=str)
+
+
+@main.command("query")
+@click.argument("sql", required=False)
+@click.option("--progress", is_flag=True, help="Story progress by status")
+@click.option("--cost", is_flag=True, help="Cost breakdown by phase")
+@click.option("--stories", "show_stories", is_flag=True, help="List all stories with status")
+@click.option("--cost-per-story", is_flag=True, help="Cost per story")
+@click.option("--errors", is_flag=True, help="Recent errors")
+@click.option("--timeline", is_flag=True, help="Implementation timeline")
+@click.option("--projects", is_flag=True, help="All registered projects")
+@click.option("--all-projects", is_flag=True, help="Include all projects in custom SQL")
+@click.option("--format", "fmt", type=click.Choice(["table", "csv", "json"]), default="table", help="Output format")
+@click.pass_context
+def query_cmd(ctx, sql, progress, cost, show_stories, cost_per_story, errors, timeline, projects, all_projects, fmt):
+    """Query project data stored in DuckDB.
+
+    Run built-in queries with flags (--progress, --cost, --stories, etc.)
+    or pass arbitrary SQL as an argument.
+
+    \b
+    Examples:
+      pralph query --progress
+      pralph query --cost --format json
+      pralph query "SELECT * FROM stories WHERE priority = 1"
+      pralph query --projects
+    """
+    project_id = str(os.path.realpath(ctx.obj["project_dir"]))
+
+    # Determine which query to run
+    builtin_flags = {
+        "progress": progress,
+        "cost": cost,
+        "stories": show_stories,
+        "cost-per-story": cost_per_story,
+        "errors": errors,
+        "timeline": timeline,
+        "projects": projects,
+    }
+
+    selected = [name for name, flag in builtin_flags.items() if flag]
+
+    if not selected and not sql:
+        # Default: show progress
+        selected = ["progress"]
+
+    # Run built-in queries
+    for name in selected:
+        label, builtin_sql = _BUILTIN_QUERIES[name]
+        click.echo(click.style(f"\n  {label}", bold=True))
+        click.echo()
+        if name == "projects":
+            # projects query doesn't filter by project_id
+            columns, rows = db.execute_query(builtin_sql)
+        else:
+            columns, rows = db.execute_query(builtin_sql, [project_id])
+        if fmt == "table":
+            click.echo(_format_table(columns, rows))
+        elif fmt == "csv":
+            click.echo(_format_csv(columns, rows))
+        else:
+            click.echo(_format_json(columns, rows))
+
+    # Run custom SQL
+    if sql:
+        click.echo()
+        try:
+            columns, rows = db.execute_query(sql)
+            if fmt == "table":
+                click.echo(_format_table(columns, rows))
+            elif fmt == "csv":
+                click.echo(_format_csv(columns, rows))
+            else:
+                click.echo(_format_json(columns, rows))
+        except Exception as e:
+            click.echo(click.style(f"Query error: {e}", fg="red"))
+            if not all_projects:
+                click.echo(click.style(
+                    f"\n  Hint: filter by project with WHERE project_id = '{project_id}'",
+                    dim=True,
+                ))
+    click.echo()
