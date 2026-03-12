@@ -37,22 +37,55 @@ def _row_to_story(row: tuple, columns: list[str]) -> Story:
 
 
 class StateManager:
-    def __init__(self, project_dir: str, *, project_name: str | None = None) -> None:
+    def __init__(self, project_dir: str, *, project_name: str | None = None, readonly: bool = False) -> None:
         self.project_dir = Path(project_dir).resolve()
         self.state_dir = self.project_dir / ".pralph"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._readonly = readonly
 
         # Resolve project_id from project.json or create it
         self.project_id = self._resolve_project_id(project_name)
 
         # Initialize DuckDB
-        self._conn = db.get_connection()
-        db.register_project(self._conn, self.project_id, self.project_dir.name)
+        if readonly:
+            self._conn = db.get_readonly_connection()
+        else:
+            self._conn = db.get_connection()
+            db.register_project(self._conn, self.project_id, self.project_dir.name)
 
-        # Auto-migrate existing JSONL data
-        if needs_migration(self.state_dir, self.project_id, self._conn):
-            migrate_project(self.state_dir, self.project_id, self._conn)
+            # Auto-migrate existing JSONL data
+            if needs_migration(self.state_dir, self.project_id, self._conn):
+                migrate_project(self.state_dir, self.project_id, self._conn)
+
+    def refresh_readonly(self) -> None:
+        """Re-snapshot the database so reads see the latest data."""
+        if not self._readonly:
+            return
+        self._conn.close()
+        self._conn = db.get_readonly_connection()
+
+    def _transient_write(self, sql: str, params: list) -> None:
+        """Execute a write via a short-lived connection to the real database.
+
+        Retries briefly to handle transient lock contention with a running
+        implement process (which releases the lock between iterations).
+        """
+        import time
+
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                conn = duckdb.connect(str(db._DB_PATH))
+                try:
+                    conn.execute(sql, params)
+                finally:
+                    conn.close()
+                return
+            except duckdb.IOException as e:
+                last_err = e
+                time.sleep(0.5)
+        raise last_err  # type: ignore[misc]
 
     @property
     def _project_config_path(self) -> Path:
@@ -450,6 +483,23 @@ class StateManager:
 
     def _rewrite_stories(self, stories: list[Story]) -> None:
         """Update all stories in bulk (used by viewer edit, etc.)."""
+        if self._readonly:
+            for s in stories:
+                self._transient_write(
+                    """UPDATE stories SET
+                         title = ?, content = ?, acceptance_criteria = ?,
+                         priority = ?, category = ?, complexity = ?,
+                         dependencies = ?, source = ?, status = ?,
+                         metadata = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    [
+                        s.title, s.content, json.dumps(s.acceptance_criteria),
+                        s.priority, s.category, s.complexity,
+                        json.dumps(s.dependencies), s.source, s.status.value,
+                        json.dumps(s.metadata), self.project_id, s.id,
+                    ],
+                )
+            return
         with self._lock:
             for s in stories:
                 self._conn.execute(

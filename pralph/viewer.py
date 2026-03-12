@@ -655,7 +655,8 @@ async function saveStory(id) {
     updateStats();
     selectStory(id);
   } else {
-    alert('Failed to save: ' + r.status);
+    const err = await r.json().catch(() => null);
+    alert(err?.error || 'Failed to save: ' + r.status);
   }
 }
 
@@ -669,6 +670,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
     state: StateManager
 
     def do_GET(self):
+        self.state.refresh_readonly()
         if self.path == '/api/stories':
             self._serve_stories()
         elif self.path == '/api/status':
@@ -743,7 +745,16 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 else:
                     setattr(story, field, body[field])
 
-        self.state._rewrite_stories(stories)
+        try:
+            self.state._rewrite_stories(stories)
+        except Exception:
+            msg = b'{"error": "Database is locked by another pralph process. Try again later."}'
+            self.send_response(HTTPStatus.CONFLICT)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            return
 
         resp = json.dumps(story.to_dict()).encode()
         self.send_response(HTTPStatus.OK)

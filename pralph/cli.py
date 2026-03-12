@@ -37,10 +37,10 @@ def _resolve_prompt(flag_value: str | None, interactive_label: str, file_value: 
     return click.prompt(interactive_label)
 
 
-def _get_state(ctx: click.Context) -> StateManager:
+def _get_state(ctx: click.Context, *, readonly: bool = False) -> StateManager:
     """Create a StateManager, exiting with a message if project is not initialized."""
     try:
-        return StateManager(ctx.obj["project_dir"])
+        return StateManager(ctx.obj["project_dir"], readonly=readonly)
     except ProjectNotInitializedError as e:
         click.echo(click.style(str(e), fg="red"))
         raise SystemExit(1)
@@ -509,7 +509,7 @@ def reset_errors(ctx):
 @click.pass_context
 def viewer(ctx, port, no_open):
     """Browse and review user stories in a web UI."""
-    state = _get_state(ctx)
+    state = _get_state(ctx, readonly=True)
     stories = state.load_stories()
     if not stories:
         click.echo("No stories found. Run 'pralph stories' first.")
