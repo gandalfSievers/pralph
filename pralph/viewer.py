@@ -3,15 +3,97 @@ from __future__ import annotations
 import json
 import threading
 import webbrowser
-from functools import partial
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 from urllib.parse import unquote
 
+from pralph import db
 from pralph.models import StoryStatus
 from pralph.state import StateManager
+
+def _gather_report(state: StateManager) -> dict:
+    """Gather report data using the state's current connection."""
+    conn = state._conn
+    pid = state.project_id
+
+    rows = conn.execute("SELECT * FROM phase_state WHERE project_id = ? ORDER BY phase", [pid])
+    cols = [d[0] for d in rows.description]
+    phase_states = [dict(zip(cols, r)) for r in rows.fetchall()]
+
+    current_phase = {}
+    for ps in phase_states:
+        if not ps.get("completed", False):
+            current_phase = ps
+            break
+    if not current_phase and phase_states:
+        current_phase = phase_states[-1]
+
+    rows = conn.execute(
+        "SELECT id, title, status, priority, category, complexity FROM stories WHERE project_id = ? ORDER BY priority, id",
+        [pid],
+    )
+    cols = [d[0] for d in rows.description]
+    stories = {r[0]: dict(zip(cols, r)) for r in rows.fetchall()}
+
+    rows = conn.execute(
+        "SELECT status, COUNT(*) FROM stories WHERE project_id = ? GROUP BY status", [pid]
+    )
+    status_counts = {r[0]: r[1] for r in rows.fetchall()}
+
+    rows = conn.execute(
+        """SELECT story_id,
+                  COUNT(*) as iterations,
+                  COALESCE(SUM(cost_usd), 0) as cost_usd,
+                  COALESCE(SUM(duration), 0) as duration
+           FROM run_log
+           WHERE project_id = ? AND story_id != '' AND mode = 'implement'
+           GROUP BY story_id ORDER BY cost_usd DESC""",
+        [pid],
+    )
+    story_costs = {}
+    for r in rows.fetchall():
+        story_costs[r[0]] = {"iterations": r[1], "cost_usd": r[2], "duration": r[3]}
+
+    rows = conn.execute(
+        "SELECT phase, COALESCE(SUM(cost_usd), 0) FROM run_log WHERE project_id = ? GROUP BY phase", [pid]
+    )
+    phase_costs = {r[0]: r[1] for r in rows.fetchall()}
+
+    row = conn.execute(
+        "SELECT COALESCE(SUM(duration), 0) FROM run_log WHERE project_id = ?", [pid]
+    ).fetchone()
+    total_duration = row[0] if row else 0.0
+
+    active_story = current_phase.get("active_story_id", "") or None
+
+    # Cost projection
+    implemented = status_counts.get("implemented", 0)
+    pending = status_counts.get("pending", 0) + status_counts.get("rework", 0)
+    avg_cost = sum(sc["cost_usd"] for sc in story_costs.values()) / max(implemented, 1) if story_costs else 0
+    avg_duration = sum(sc["duration"] for sc in story_costs.values()) / max(implemented, 1) if story_costs else 0
+
+    return {
+        "phase_states": phase_states,
+        "current_phase": current_phase,
+        "stories": stories,
+        "story_costs": story_costs,
+        "phase_costs": phase_costs,
+        "status_counts": status_counts,
+        "total_duration": total_duration,
+        "active_story": active_story,
+        "grand_total_cost": round(sum(phase_costs.values()), 4),
+        "projection": {
+            "implemented": implemented,
+            "remaining": pending,
+            "avg_cost_per_story": round(avg_cost, 4),
+            "avg_duration_per_story": round(avg_duration, 1),
+            "estimated_remaining_cost": round(avg_cost * pending, 2),
+            "estimated_remaining_duration": round(avg_duration * pending, 1),
+        },
+    }
+
 
 VIEWER_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -131,6 +213,75 @@ VIEWER_HTML = r"""<!DOCTYPE html>
   .tab-btn:hover { color: var(--text); }
   .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
 
+  /* Dashboard */
+  .dashboard { padding: 24px 32px; overflow-y: auto; height: calc(100vh - 49px); }
+  .dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+  .dash-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+  .dash-card h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--muted); margin-bottom: 12px; }
+  .dash-card .big-number { font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .dash-card .sub { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  .phase-pipeline { display: flex; gap: 4px; align-items: center; margin-bottom: 20px; }
+  .phase-pill { padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    background: var(--bg); border: 1px solid var(--border); color: var(--muted); }
+  .phase-pill.completed { background: #0d2818; color: var(--green); border-color: #1a4d2e; }
+  .phase-pill.running { background: #2d2300; color: var(--yellow); border-color: #4d3d00;
+    animation: pulse 2s ease-in-out infinite; }
+  .phase-pill.not-started { opacity: 0.5; }
+  .phase-arrow { color: var(--border); font-size: 18px; }
+  .status-bar-row { display: flex; height: 24px; border-radius: 6px; overflow: hidden; margin: 8px 0; }
+  .status-bar-row > div { display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 600; min-width: 20px; transition: width 0.4s; }
+  .cost-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .cost-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 0;
+    border-bottom: 1px solid var(--border); }
+  .cost-table td { padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .cost-table td:nth-child(n+2) { text-align: right; font-variant-numeric: tabular-nums; }
+  .activity-list { list-style: none; max-height: 300px; overflow-y: auto; }
+  .activity-list li { padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,0.3);
+    font-size: 13px; display: flex; gap: 10px; }
+  .activity-list .ts { color: var(--muted); white-space: nowrap; font-size: 12px; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+
+  /* Solutions tab */
+  .solutions-layout { display: flex; height: calc(100vh - 49px); }
+  .solutions-list { width: 380px; min-width: 300px; border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; background: var(--surface); }
+  .solutions-list .filters { padding: 12px; border-bottom: 1px solid var(--border); }
+  .solutions-items { flex: 1; overflow-y: auto; }
+  .sol-item { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.1s; }
+  .sol-item:hover { background: rgba(88,166,255,0.06); }
+  .sol-item.active { background: rgba(88,166,255,0.12); border-left: 3px solid var(--accent); padding-left: 11px; }
+  .sol-item .sol-title { font-size: 14px; font-weight: 600; }
+  .sol-item .sol-meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .sol-detail { flex: 1; overflow-y: auto; padding: 24px 32px; }
+  .sol-detail.empty { display: flex; align-items: center; justify-content: center; color: var(--muted); }
+  .sol-detail pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.6; }
+
+  /* Settings tab */
+  .settings-page { padding: 24px 32px; overflow-y: auto; height: calc(100vh - 49px); max-width: 700px; }
+  .settings-section { margin-bottom: 28px; }
+  .settings-section h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--muted); margin-bottom: 12px; }
+  .settings-row { display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 0; border-bottom: 1px solid rgba(48,54,61,0.3); font-size: 14px; }
+  .settings-row .label { color: var(--muted); }
+  .settings-row .value { font-weight: 600; font-variant-numeric: tabular-nums; word-break: break-all; }
+
+  /* Status history in story detail */
+  .status-timeline { list-style: none; }
+  .status-timeline li { padding: 4px 0; font-size: 13px; display: flex; gap: 10px; border-left: 2px solid var(--border); padding-left: 12px; margin-left: 4px; }
+  .status-timeline .st-time { color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+  /* Error detail in story */
+  .error-box { background: #2d0f0f; border: 1px solid rgba(248,81,73,0.3); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
+  .error-box h4 { color: var(--red); font-size: 13px; margin-bottom: 6px; }
+  .error-box pre { font-size: 12px; color: var(--muted); white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; }
+  .reset-btn { background: var(--yellow); color: #000; border: none; border-radius: 6px;
+    padding: 4px 12px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; margin-left: 8px; }
+  .reset-btn:hover { opacity: 0.85; }
+
   /* Progress bar */
   .progress-wrap { flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px; }
   .progress-bar { width: 220px; height: 16px; border: 1.5px solid var(--border);
@@ -179,8 +330,11 @@ VIEWER_HTML = r"""<!DOCTYPE html>
 <header>
   <h1>Planned Ralph</h1>
   <div class="tab-bar">
-    <button class="tab-btn active" data-tab="stories" onclick="switchTab('stories')">Stories</button>
+    <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="tab-btn" data-tab="stories" onclick="switchTab('stories')">Stories</button>
     <button class="tab-btn" data-tab="timeline" onclick="switchTab('timeline')">Timeline</button>
+    <button class="tab-btn" data-tab="solutions" onclick="switchTab('solutions')">Solutions</button>
+    <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
   </div>
   <div class="progress-wrap">
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
@@ -188,7 +342,8 @@ VIEWER_HTML = r"""<!DOCTYPE html>
   </div>
   <span class="stats" id="stats"></span>
 </header>
-<div class="layout">
+<div class="dashboard" id="dashboardContainer">Loading...</div>
+<div class="layout" id="storiesContainer" style="display:none">
   <div class="sidebar">
     <div class="filters">
       <input type="text" id="search" placeholder="Search stories...">
@@ -205,16 +360,50 @@ VIEWER_HTML = r"""<!DOCTYPE html>
     <svg class="timeline-lines" id="timelineLines"></svg>
   </div>
 </div>
+<div class="solutions-layout" id="solutionsContainer" style="display:none">
+  <div class="solutions-list">
+    <div class="filters">
+      <input type="text" id="solSearch" placeholder="Search solutions..." style="width:100%">
+    </div>
+    <div class="solutions-items" id="solList"></div>
+  </div>
+  <div class="sol-detail empty" id="solDetail">Select a solution to view</div>
+</div>
+<div class="settings-page" id="settingsContainer" style="display:none">Loading...</div>
 <script>
-let stories = [], selected = null, tokenData = {};
+let stories = [], selected = null, tokenData = {}, statusLog = [];
+let reportData = null, solutionsData = [], settingsData = {};
+let selectedSolution = null;
+let autoRefreshId = null;
 
 async function load() {
-  const [r, t] = await Promise.all([fetch('/api/stories'), fetch('/api/tokens')]);
+  const [r, t, s] = await Promise.all([
+    fetch('/api/stories'), fetch('/api/tokens'), fetch('/api/status')
+  ]);
   stories = await r.json();
   tokenData = await t.json();
+  statusLog = await s.json();
   populateFilters();
   render();
   updateStats();
+  loadDashboard();
+  startAutoRefresh();
+}
+
+function startAutoRefresh() {
+  if (autoRefreshId) clearInterval(autoRefreshId);
+  autoRefreshId = setInterval(async () => {
+    try {
+      const [r, t, s] = await Promise.all([
+        fetch('/api/stories'), fetch('/api/tokens'), fetch('/api/status')
+      ]);
+      stories = await r.json();
+      tokenData = await t.json();
+      statusLog = await s.json();
+      render(); updateStats();
+      if (currentTab === 'dashboard') loadDashboard();
+    } catch(e) {}
+  }, 10000);
 }
 
 function populateFilters() {
@@ -293,6 +482,7 @@ function selectStory(id) {
       <span class="badge badge-cx">${s.complexity}</span>
       <span class="badge" style="background:var(--border);color:var(--muted)">${esc(s.id)}</span>
     </div>
+    ${renderErrorSection(s)}
     <div class="section">
       <h3>Content</h3>
       <div class="content">${esc(s.content || '(empty)')}</div>
@@ -306,6 +496,7 @@ function selectStory(id) {
       <div>${deps}</div>
     </div>
     ${renderTokenSection(s.id)}
+    ${renderStatusHistory(s.id)}
     ${s.metadata && Object.keys(s.metadata).length ? `
     <div class="section">
       <h3>Metadata</h3>
@@ -384,16 +575,22 @@ document.getElementById('fPriority').addEventListener('change', render);
 
 /* --- Timeline view (Gantt grid: rows=priority, cols=global dependency depth) --- */
 let timelineBuilt = false;
-let currentTab = 'stories';
+let currentTab = 'dashboard';
 
 function switchTab(tab) {
   currentTab = tab;
   document.querySelectorAll('.tab-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.tab === tab);
   });
-  document.querySelector('.layout').style.display = tab === 'stories' ? 'flex' : 'none';
+  document.getElementById('dashboardContainer').style.display = tab === 'dashboard' ? 'block' : 'none';
+  document.getElementById('storiesContainer').style.display = tab === 'stories' ? 'flex' : 'none';
   document.getElementById('timelineContainer').style.display = tab === 'timeline' ? 'block' : 'none';
+  document.getElementById('solutionsContainer').style.display = tab === 'solutions' ? 'flex' : 'none';
+  document.getElementById('settingsContainer').style.display = tab === 'settings' ? 'block' : 'none';
   if (tab === 'timeline') renderTimeline();
+  if (tab === 'dashboard') loadDashboard();
+  if (tab === 'solutions') loadSolutions();
+  if (tab === 'settings') loadSettings();
 }
 
 function computeGlobalColumns() {
@@ -660,6 +857,266 @@ async function saveStory(id) {
   }
 }
 
+/* --- Dashboard --- */
+async function loadDashboard() {
+  try {
+    const r = await fetch('/api/report');
+    reportData = await r.json();
+    renderDashboard();
+  } catch(e) {
+    document.getElementById('dashboardContainer').innerHTML = '<p style="color:var(--muted)">Failed to load report data.</p>';
+  }
+}
+
+function fmtCost(v) { return '$' + (v||0).toFixed(2); }
+function fmtDur(s) {
+  if (!s || s < 60) return Math.round(s||0) + 's';
+  const m = Math.floor(s/60), sec = Math.round(s%60);
+  if (m < 60) return m + 'm ' + sec + 's';
+  const h = Math.floor(m/60); return h + 'h ' + (m%60) + 'm';
+}
+
+function renderDashboard() {
+  const d = reportData;
+  if (!d) return;
+  const el = document.getElementById('dashboardContainer');
+
+  const phases = ['plan','stories','webgen','implement'];
+  const phaseMap = {};
+  (d.phase_states||[]).forEach(p => { phaseMap[p.phase] = p; });
+  const pipeline = phases.map(p => {
+    const ps = phaseMap[p];
+    if (!ps) return `<span class="phase-pill not-started">${p}</span>`;
+    if (ps.completed) return `<span class="phase-pill completed">${p}</span>`;
+    return `<span class="phase-pill running">${p}</span>`;
+  }).join('<span class="phase-arrow">→</span>');
+
+  const sc = d.status_counts || {};
+  const total = Object.values(sc).reduce((a,b)=>a+b, 0);
+  const statusColors = {
+    implemented:'var(--green)', in_progress:'var(--yellow)', pending:'var(--accent)',
+    rework:'var(--purple)', error:'var(--red)', skipped:'var(--muted)', duplicate:'var(--muted)',
+    external:'var(--cyan)'
+  };
+  let barHtml = '';
+  for (const [status, count] of Object.entries(sc)) {
+    const pct = total > 0 ? (count/total*100) : 0;
+    if (pct > 0) barHtml += `<div style="width:${pct}%;background:${statusColors[status]||'var(--border)'}" title="${status}: ${count}">${count}</div>`;
+  }
+
+  const proj = d.projection || {};
+  const pc = d.phase_costs || {};
+  let costRows = '';
+  for (const [phase, cost] of Object.entries(pc)) {
+    costRows += `<tr><td>${phase}</td><td>${fmtCost(cost)}</td></tr>`;
+  }
+  costRows += `<tr style="font-weight:700"><td>Total</td><td>${fmtCost(d.grand_total_cost)}</td></tr>`;
+
+  // Activity feed from run log
+  let activityHtml = '';
+  const runLog = d.story_costs ? Object.entries(d.story_costs).slice(0, 10) : [];
+
+  // Active work
+  let activeHtml = '<span style="color:var(--muted)">No active work</span>';
+  if (d.active_story) {
+    const s = d.stories[d.active_story] || {};
+    const sc2 = d.story_costs[d.active_story] || {};
+    activeHtml = `<strong>${d.active_story}</strong> — ${esc(s.title||'')}`;
+    if (sc2.cost_usd) activeHtml += ` · ${fmtCost(sc2.cost_usd)} · ${sc2.iterations||0} iters`;
+  } else if (d.current_phase && d.current_phase.completed) {
+    activeHtml = '<span style="color:var(--green)">All work completed</span>';
+  }
+
+  el.innerHTML = `
+    <div class="phase-pipeline">${pipeline}</div>
+    <div class="dash-grid">
+      <div class="dash-card">
+        <h3>Stories</h3>
+        <div class="big-number">${total}</div>
+        <div class="status-bar-row">${barHtml}</div>
+        <div class="sub">${sc.implemented||0} implemented · ${sc.pending||0} pending · ${sc.error||0} errors</div>
+      </div>
+      <div class="dash-card">
+        <h3>Cost</h3>
+        <div class="big-number">${fmtCost(d.grand_total_cost)}</div>
+        <div class="sub">Total duration: ${fmtDur(d.total_duration)}</div>
+        <table class="cost-table" style="margin-top:12px">
+          <tr><th>Phase</th><th>Cost</th></tr>
+          ${costRows}
+        </table>
+      </div>
+      <div class="dash-card">
+        <h3>Projection</h3>
+        <div class="big-number">${proj.remaining||0} <span style="font-size:16px;color:var(--muted)">remaining</span></div>
+        <div class="sub">Avg cost/story: ${fmtCost(proj.avg_cost_per_story)}</div>
+        <div class="sub">Avg time/story: ${fmtDur(proj.avg_duration_per_story)}</div>
+        <div class="sub" style="margin-top:8px;font-weight:600">
+          Est. remaining cost: ${fmtCost(proj.estimated_remaining_cost)}<br>
+          Est. remaining time: ${fmtDur(proj.estimated_remaining_duration)}
+        </div>
+      </div>
+      <div class="dash-card">
+        <h3>Active Work</h3>
+        <div style="font-size:15px;margin-top:8px">${activeHtml}</div>
+      </div>
+    </div>
+    <div class="dash-card" style="margin-bottom:24px">
+      <h3>Story Cost Breakdown</h3>
+      <table class="cost-table">
+        <tr><th>Story</th><th>Title</th><th>Status</th><th>Cost</th><th>Duration</th><th>Iters</th></tr>
+        ${Object.entries(d.story_costs||{}).map(([sid, sc]) => {
+          const s = d.stories[sid] || {};
+          const title = (s.title||'').length > 45 ? (s.title||'').slice(0,42)+'...' : (s.title||'');
+          return `<tr><td style="color:var(--accent)">${esc(sid)}</td><td>${esc(title)}</td>
+            <td><span class="badge badge-status" data-v="${s.status||''}" style="font-size:11px;padding:1px 8px">${s.status||''}</span></td>
+            <td>${fmtCost(sc.cost_usd)}</td><td>${fmtDur(sc.duration)}</td><td>${sc.iterations}</td></tr>`;
+        }).join('')}
+      </table>
+    </div>
+  `;
+}
+
+/* --- Solutions --- */
+async function loadSolutions() {
+  try {
+    const r = await fetch('/api/solutions');
+    solutionsData = await r.json();
+    renderSolutionsList();
+  } catch(e) {}
+}
+
+function renderSolutionsList() {
+  const q = (document.getElementById('solSearch')?.value || '').toLowerCase();
+  const filtered = solutionsData.filter(s => {
+    if (!q) return true;
+    return (s.title||'').toLowerCase().includes(q) ||
+           (s.category||'').toLowerCase().includes(q) ||
+           (s.tags||[]).some(t => t.toLowerCase().includes(q));
+  });
+  const list = document.getElementById('solList');
+  list.innerHTML = filtered.map(s => `
+    <div class="sol-item ${selectedSolution === s.filename ? 'active' : ''}" data-fn="${esc(s.filename)}">
+      <div class="sol-title">${esc(s.title)}</div>
+      <div class="sol-meta">
+        <span class="badge badge-cat" style="font-size:10px;padding:1px 6px">${esc(s.category)}</span>
+        ${(s.tags||[]).map(t => '<span>'+esc(t)+'</span>').join(' · ')}
+        ${s.story_id ? ' · ' + esc(s.story_id) : ''}
+      </div>
+    </div>
+  `).join('');
+  if (filtered.length === 0) list.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center">No solutions found</div>';
+  list.querySelectorAll('.sol-item').forEach(el => {
+    el.addEventListener('click', () => selectSolution(el.dataset.fn));
+  });
+}
+
+async function selectSolution(filename) {
+  selectedSolution = filename;
+  renderSolutionsList();
+  const detail = document.getElementById('solDetail');
+  try {
+    const r = await fetch('/api/solutions/' + encodeURIComponent(filename));
+    if (!r.ok) { detail.innerHTML = '<p style="color:var(--red)">Failed to load</p>'; return; }
+    const content = await r.text();
+    const entry = solutionsData.find(s => s.filename === filename);
+    detail.classList.remove('empty');
+    detail.innerHTML = `
+      <h2>${esc(entry?.title || filename)}</h2>
+      <div class="meta-row" style="margin:8px 0 16px">
+        <span class="badge badge-cat">${esc(entry?.category || '')}</span>
+        ${(entry?.tags||[]).map(t => '<span class="badge" style="background:var(--border);color:var(--muted)">'+esc(t)+'</span>').join('')}
+        ${entry?.story_id ? '<span class="badge" style="background:var(--border);color:var(--muted)">'+esc(entry.story_id)+'</span>' : ''}
+      </div>
+      <pre>${esc(content)}</pre>
+    `;
+  } catch(e) { detail.innerHTML = '<p style="color:var(--red)">Error loading solution</p>'; }
+}
+
+document.getElementById('solSearch')?.addEventListener('input', renderSolutionsList);
+
+/* --- Settings --- */
+async function loadSettings() {
+  try {
+    const r = await fetch('/api/settings');
+    settingsData = await r.json();
+    renderSettings();
+  } catch(e) {}
+}
+
+function renderSettings() {
+  const s = settingsData;
+  const el = document.getElementById('settingsContainer');
+  const models = s.models || {};
+
+  el.innerHTML = `
+    <div class="settings-section">
+      <h3>Project</h3>
+      <div class="settings-row"><span class="label">Project ID</span><span class="value">${esc(s.project_id||'')}</span></div>
+      <div class="settings-row"><span class="label">Directory</span><span class="value" style="font-size:12px">${esc(s.project_dir||'')}</span></div>
+    </div>
+    <div class="settings-section">
+      <h3>Claude Models</h3>
+      <div class="settings-row"><span class="label">Active model</span><span class="value" style="font-size:12px">${esc(s.model||'(default)')}</span></div>
+      <div class="settings-row"><span class="label">Opus</span><span class="value" style="font-size:11px">${esc(models.opus||'(not configured)')}</span></div>
+      <div class="settings-row"><span class="label">Sonnet</span><span class="value" style="font-size:11px">${esc(models.sonnet||'(not configured)')}</span></div>
+      <div class="settings-row"><span class="label">Haiku</span><span class="value" style="font-size:11px">${esc(models.haiku||'(not configured)')}</span></div>
+    </div>
+  `;
+}
+
+/* --- Enhanced story detail: error details + status history + reset --- */
+function renderErrorSection(s) {
+  if (s.status !== 'error' || !s.metadata) return '';
+  const reason = s.metadata.error_reason || '';
+  const output = s.metadata.error_output || '';
+  const at = s.metadata.error_at || '';
+  if (!reason && !output) return '';
+  return `
+    <div class="error-box">
+      <h4>Error${at ? ' — ' + at : ''}
+        <button class="reset-btn" onclick="resetStory('${esc(s.id)}')">Reset to pending</button>
+      </h4>
+      ${reason ? '<div style="margin-bottom:6px">' + esc(reason) + '</div>' : ''}
+      ${output ? '<pre>' + esc(output) + '</pre>' : ''}
+    </div>`;
+}
+
+function renderStatusHistory(storyId) {
+  const entries = statusLog.filter(e => e.story_id === storyId);
+  if (entries.length === 0) return '';
+  return `
+    <div class="section">
+      <h3>Status History</h3>
+      <ul class="status-timeline">
+        ${entries.map(e => `
+          <li>
+            <span class="badge badge-status" data-v="${e.status}" style="font-size:11px;padding:1px 8px">${e.status}</span>
+            <span>${esc(e.summary||'')}</span>
+            <span class="st-time">${e.logged_at ? new Date(e.logged_at).toLocaleString() : ''}</span>
+          </li>
+        `).join('')}
+      </ul>
+    </div>`;
+}
+
+async function resetStory(id) {
+  if (!confirm('Reset ' + id + ' to pending?')) return;
+  const r = await fetch('/api/stories/' + encodeURIComponent(id), {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({status: 'pending'}),
+  });
+  if (r.ok) {
+    const updated = await r.json();
+    const idx = stories.findIndex(s => s.id === id);
+    if (idx !== -1) stories[idx] = updated;
+    render(); updateStats(); selectStory(id);
+  } else {
+    const err = await r.json().catch(() => null);
+    alert(err?.error || 'Failed to reset');
+  }
+}
+
 load();
 </script>
 </body>
@@ -677,6 +1134,20 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self._serve_status()
         elif self.path == '/api/tokens':
             self._serve_tokens()
+        elif self.path == '/api/report':
+            self._serve_report()
+        elif self.path == '/api/phases':
+            self._serve_phases()
+        elif self.path == '/api/projects':
+            self._serve_projects()
+        elif self.path == '/api/solutions':
+            self._serve_solutions()
+        elif self.path.startswith('/api/solutions/'):
+            self._serve_solution_detail()
+        elif self.path == '/api/run-log':
+            self._serve_run_log()
+        elif self.path == '/api/settings':
+            self._serve_settings()
         else:
             self._serve_html()
 
@@ -710,6 +1181,89 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def _serve_tokens(self):
         data = self.state.get_story_tokens()
         body = json.dumps(data).encode()
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_report(self):
+        data = _gather_report(self.state)
+        self._json_response(data)
+
+    def _serve_phases(self):
+        conn = self.state._conn
+        result = conn.execute(
+            "SELECT * FROM phase_state WHERE project_id = ? ORDER BY phase",
+            [self.state.project_id],
+        )
+        cols = [d[0] for d in result.description]
+        rows = [dict(zip(cols, r)) for r in result.fetchall()]
+        self._json_response(rows)
+
+    def _serve_projects(self):
+        conn = db.get_readonly_connection()
+        try:
+            result = conn.execute(
+                "SELECT project_id, name, created_at FROM projects ORDER BY created_at DESC"
+            )
+            cols = [d[0] for d in result.description]
+            rows = [dict(zip(cols, r)) for r in result.fetchall()]
+        finally:
+            conn.close()
+        self._json_response(rows)
+
+    def _serve_solutions(self):
+        entries = self.state.load_solutions_index()
+        self._json_response(entries)
+
+    def _serve_solution_detail(self):
+        filename = unquote(self.path[len('/api/solutions/'):])
+        content = self.state.read_solution(filename)
+        if not content:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        body = content.encode()
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-Type', 'text/markdown; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_run_log(self):
+        conn = self.state._conn
+        result = conn.execute(
+            """SELECT iteration, phase, mode, success, stories_generated,
+                      impl_status, error, ROUND(duration, 1) as duration,
+                      ROUND(cost_usd, 4) as cost_usd, story_id,
+                      input_tokens, output_tokens, logged_at
+               FROM run_log WHERE project_id = ?
+               ORDER BY logged_at DESC LIMIT 50""",
+            [self.state.project_id],
+        )
+        cols = [d[0] for d in result.description]
+        rows = [dict(zip(cols, r)) for r in result.fetchall()]
+        self._json_response(rows)
+
+    def _serve_settings(self):
+        settings = {"project_id": self.state.project_id, "project_dir": str(self.state.project_dir)}
+        claude_settings_path = Path.home() / ".claude" / "settings.json"
+        if claude_settings_path.exists():
+            try:
+                claude_data = json.loads(claude_settings_path.read_text())
+                env = claude_data.get("env", {})
+                settings["models"] = {
+                    "opus": env.get("ANTHROPIC_DEFAULT_OPUS_MODEL", ""),
+                    "sonnet": env.get("ANTHROPIC_DEFAULT_SONNET_MODEL", ""),
+                    "haiku": env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL", ""),
+                }
+                settings["model"] = claude_data.get("model", "")
+            except (json.JSONDecodeError, OSError):
+                pass
+        self._json_response(settings)
+
+    def _json_response(self, data):
+        body = json.dumps(data, default=str).encode()
         self.send_response(HTTPStatus.OK)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
