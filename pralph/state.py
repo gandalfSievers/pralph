@@ -13,6 +13,11 @@ from pralph.migrate import migrate_project, needs_migration
 from pralph.models import IterationResult, PhaseState, Story, StoryStatus
 
 
+class ProjectNotInitializedError(Exception):
+    """Raised when a command is run in a directory without a project.json."""
+    pass
+
+
 def _row_to_story(row: tuple, columns: list[str]) -> Story:
     """Convert a DuckDB row + column names into a Story object."""
     d = dict(zip(columns, row))
@@ -32,12 +37,14 @@ def _row_to_story(row: tuple, columns: list[str]) -> Story:
 
 
 class StateManager:
-    def __init__(self, project_dir: str) -> None:
+    def __init__(self, project_dir: str, *, project_name: str | None = None) -> None:
         self.project_dir = Path(project_dir).resolve()
         self.state_dir = self.project_dir / ".pralph"
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.project_id = str(self.project_dir)
         self._lock = threading.RLock()
+
+        # Resolve project_id from project.json or create it
+        self.project_id = self._resolve_project_id(project_name)
 
         # Initialize DuckDB
         self._conn = db.get_connection()
@@ -46,6 +53,50 @@ class StateManager:
         # Auto-migrate existing JSONL data
         if needs_migration(self.state_dir, self.project_id, self._conn):
             migrate_project(self.state_dir, self.project_id, self._conn)
+
+    @property
+    def _project_config_path(self) -> Path:
+        return self.state_dir / "project.json"
+
+    def _resolve_project_id(self, project_name: str | None) -> str:
+        """Resolve project_id: read from project.json, or create from project_name."""
+        if self._project_config_path.exists():
+            try:
+                data = json.loads(self._project_config_path.read_text())
+                stored_id = data.get("project_id", "")
+                if stored_id:
+                    return stored_id
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if project_name:
+            self._save_project_config(project_name)
+            return project_name
+
+        # Legacy project: has JSONL files but no project.json — auto-assign basename
+        if self._has_legacy_data():
+            legacy_name = self.project_dir.name
+            self._save_project_config(legacy_name)
+            return legacy_name
+
+        # No project.json and no name provided — not initialized yet
+        raise ProjectNotInitializedError(
+            f"Project not initialized. Run 'pralph plan --name <project-name>' first.\n"
+            f"  directory: {self.project_dir}"
+        )
+
+    def _has_legacy_data(self) -> bool:
+        """Check if this project has old-style JSONL files (pre-DuckDB)."""
+        return (
+            (self.state_dir / "stories.jsonl").exists()
+            or (self.state_dir / "phase-state.json").exists()
+            or self.design_doc_path.exists()
+        )
+
+    def _save_project_config(self, project_id: str) -> None:
+        self._project_config_path.write_text(
+            json.dumps({"project_id": project_id}, indent=2) + "\n"
+        )
 
     # -- file paths (markdown files remain on disk) --
 

@@ -9,7 +9,7 @@ from pralph import __version__
 from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_plan_loop, run_refine, run_stories_loop, run_webgen_loop
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
-from pralph.state import StateManager
+from pralph.state import ProjectNotInitializedError, StateManager
 from pralph import db
 
 
@@ -28,6 +28,15 @@ def _resolve_prompt(flag_value: str | None, interactive_label: str) -> str:
     if stdin:
         return stdin
     return click.prompt(interactive_label)
+
+
+def _get_state(ctx: click.Context) -> StateManager:
+    """Create a StateManager, exiting with a message if project is not initialized."""
+    try:
+        return StateManager(ctx.obj["project_dir"])
+    except ProjectNotInitializedError as e:
+        click.echo(click.style(str(e), fg="red"))
+        raise SystemExit(1)
 
 
 def _reset_phase(state: StateManager, phase: str) -> None:
@@ -98,17 +107,25 @@ def main(ctx, model, max_iterations, max_budget_usd, cooldown, verbose, project_
 
 
 @main.command()
+@click.option("--name", default=None, help="Project name (required on first run, e.g. 'myapp')")
 @click.option("--prompt", default=None, help="Guidance for design doc creation")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def plan(ctx, prompt, reset):
+def plan(ctx, name, prompt, reset):
     """Phase 1: Create/refine a design document."""
-    state = StateManager(ctx.obj["project_dir"])
+    project_dir = ctx.obj["project_dir"]
+    config_path = os.path.join(project_dir, ".pralph", "project.json")
+
+    # On first run, require --name or prompt for it
+    if not os.path.exists(config_path) and not name:
+        name = click.prompt("Project name (used as ID across sessions)")
+
+    state = StateManager(project_dir, project_name=name)
     if reset:
         _reset_phase(state, "plan")
     prompt = _resolve_prompt(prompt, "Design prompt")
     click.echo(f"pralph plan — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
 
     run_plan_loop(
@@ -129,11 +146,11 @@ def plan(ctx, prompt, reset):
 @click.pass_context
 def stories(ctx, extract_weight, reset):
     """Phase 2: Extract user stories from design doc."""
-    state = StateManager(ctx.obj["project_dir"])
+    state = _get_state(ctx)
     if reset:
         _reset_phase(state, "stories")
     click.echo(f"pralph stories — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  extract_weight: {extract_weight}%")
 
@@ -154,11 +171,11 @@ def stories(ctx, extract_weight, reset):
 @click.pass_context
 def webgen(ctx, reset):
     """Phase 2b: Discover missing requirements via web research."""
-    state = StateManager(ctx.obj["project_dir"])
+    state = _get_state(ctx)
     if reset:
         _reset_phase(state, "webgen")
     click.echo(f"pralph webgen — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
 
     run_webgen_loop(
@@ -180,9 +197,9 @@ def webgen(ctx, reset):
 def add(ctx, prompt, is_next, anytime):
     """Add a single story from an idea."""
     prompt = _resolve_prompt(prompt, "Idea")
-    state = StateManager(ctx.obj["project_dir"])
+    state = _get_state(ctx)
     click.echo(f"pralph add")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  priority: {'next (1)' if is_next else 'claude picks'}")
     click.echo(f"  idea: {prompt}")
@@ -224,7 +241,7 @@ def ideate(ctx, ideas_args, ideas_file, prompt, reset):
 
     Ideas can be passed as arguments: pralph ideate "add dark mode" "CSV export"
     """
-    state = StateManager(ctx.obj["project_dir"])
+    state = _get_state(ctx)
     if reset:
         _reset_phase(state, "ideate")
 
@@ -265,7 +282,7 @@ def ideate(ctx, ideas_args, ideas_file, prompt, reset):
         return
 
     click.echo(f"pralph ideate — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  ideas: {len(ideas_text)} chars")
 
@@ -291,7 +308,7 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
     """Refine existing stories: split, merge, or rewrite."""
     import fnmatch
 
-    state = StateManager(ctx.obj["project_dir"])
+    state = _get_state(ctx)
     all_stories = state.load_stories()
     stories_by_id = {s.id: s for s in all_stories}
 
@@ -333,7 +350,7 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
         return
 
     click.echo(f"pralph refine")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  stories: {', '.join(s.id for s in selected)}")
     click.echo(f"  instruction: {instruction}")
@@ -371,12 +388,12 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
 @click.pass_context
 def implement(ctx, story_id, phase1, review, compound, prompt, reset):
     """Phase 3: Implement stories from backlog."""
-    state = StateManager(ctx.obj["project_dir"])
+    state = _get_state(ctx)
     if reset:
         _reset_phase(state, "implement")
     prompt = prompt or _read_stdin() or ""
     click.echo(f"pralph implement — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  review: {'on' if review else 'off'}")
     click.echo(f"  compound: {'on' if compound else 'off'}")
@@ -407,9 +424,9 @@ def implement(ctx, story_id, phase1, review, compound, prompt, reset):
 def compound(ctx, story_id, prompt):
     """Capture learnings from recent work (compound learning)."""
     prompt = _resolve_prompt(prompt, "Description of work done")
-    state = StateManager(ctx.obj["project_dir"])
+    state = _get_state(ctx)
     click.echo(f"pralph compound")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     if story_id:
         click.echo(f"  story: {story_id}")
@@ -435,12 +452,12 @@ def compound(ctx, story_id, prompt):
 @click.pass_context
 def viewer(ctx, port, no_open):
     """Browse and review user stories in a web UI."""
-    state = StateManager(ctx.obj["project_dir"])
+    state = _get_state(ctx)
     stories = state.load_stories()
     if not stories:
         click.echo("No stories found. Run 'pralph stories' first.")
         return
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  stories: {len(stories)}")
     run_viewer(state, port=port, open_browser=not no_open)
 
@@ -555,8 +572,6 @@ def query_cmd(ctx, sql, progress, cost, show_stories, cost_per_story, errors, ti
       pralph query "SELECT * FROM stories WHERE priority = 1"
       pralph query --projects
     """
-    project_id = str(os.path.realpath(ctx.obj["project_dir"]))
-
     # Determine which query to run
     builtin_flags = {
         "progress": progress,
@@ -574,16 +589,17 @@ def query_cmd(ctx, sql, progress, cost, show_stories, cost_per_story, errors, ti
         # Default: show progress
         selected = ["progress"]
 
-    # Run built-in queries
-    for name in selected:
-        label, builtin_sql = _BUILTIN_QUERIES[name]
-        click.echo(click.style(f"\n  {label}", bold=True))
-        click.echo()
-        if name == "projects":
-            # projects query doesn't filter by project_id
-            columns, rows = db.execute_query(builtin_sql)
-        else:
-            columns, rows = db.execute_query(builtin_sql, [project_id])
+    # Only resolve project_id if we need it (project-scoped queries)
+    needs_project = any(name != "projects" for name in selected)
+    project_id = ""
+    if needs_project:
+        try:
+            state = _get_state(ctx)
+            project_id = state.project_id
+        except SystemExit:
+            return
+
+    def _output(columns: list[str], rows: list[tuple]) -> None:
         if fmt == "table":
             click.echo(_format_table(columns, rows))
         elif fmt == "csv":
@@ -591,20 +607,26 @@ def query_cmd(ctx, sql, progress, cost, show_stories, cost_per_story, errors, ti
         else:
             click.echo(_format_json(columns, rows))
 
+    # Run built-in queries
+    for name in selected:
+        label, builtin_sql = _BUILTIN_QUERIES[name]
+        click.echo(click.style(f"\n  {label}", bold=True))
+        click.echo()
+        if name == "projects":
+            columns, rows = db.execute_query(builtin_sql)
+        else:
+            columns, rows = db.execute_query(builtin_sql, [project_id])
+        _output(columns, rows)
+
     # Run custom SQL
     if sql:
         click.echo()
         try:
             columns, rows = db.execute_query(sql)
-            if fmt == "table":
-                click.echo(_format_table(columns, rows))
-            elif fmt == "csv":
-                click.echo(_format_csv(columns, rows))
-            else:
-                click.echo(_format_json(columns, rows))
+            _output(columns, rows)
         except Exception as e:
             click.echo(click.style(f"Query error: {e}", fg="red"))
-            if not all_projects:
+            if not all_projects and project_id:
                 click.echo(click.style(
                     f"\n  Hint: filter by project with WHERE project_id = '{project_id}'",
                     dim=True,
