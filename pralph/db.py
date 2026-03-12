@@ -172,13 +172,17 @@ def register_project(conn: duckdb.DuckDBPyConnection, project_id: str, name: str
 def execute_query(sql: str, params: list | None = None) -> tuple[list[str], list[tuple]]:
     """Execute arbitrary SQL and return (column_names, rows).
 
-    For use by ``pralph query``.
+    Uses a read-only snapshot so queries work while another pralph process
+    holds the write lock.
     """
-    conn = get_connection()
-    if params:
-        result = conn.execute(sql, params)
-    else:
-        result = conn.execute(sql)
-    columns = [desc[0] for desc in result.description] if result.description else []
-    rows = result.fetchall()
-    return columns, rows
+    conn = get_readonly_connection()
+    try:
+        if params:
+            result = conn.execute(sql, params)
+        else:
+            result = conn.execute(sql)
+        columns = [desc[0] for desc in result.description] if result.description else []
+        rows = result.fetchall()
+        return columns, rows
+    finally:
+        conn.close()

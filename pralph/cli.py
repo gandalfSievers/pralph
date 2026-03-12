@@ -967,9 +967,9 @@ def query_cmd(ctx, sql, progress, cost, show_stories, cost_per_story, errors, ti
     project_id = ""
     if needs_project:
         try:
-            state = _get_state(ctx)
-            project_id = state.project_id
-        except SystemExit:
+            project_id = _read_project_id(ctx.obj["project_dir"])
+        except (click.ClickException, FileNotFoundError) as e:
+            click.echo(click.style(str(e), fg="red"))
             return
 
     def _output(columns: list[str], rows: list[tuple]) -> None:
