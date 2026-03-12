@@ -201,7 +201,7 @@ cat requirements.txt | pralph plan --name myproject
 gh issue view 42 --json body -q .body | pralph add --next
 ```
 
-Input is resolved in order: `--prompt` flag > stdin pipe > interactive prompt.
+Input is resolved in order: `--prompt` flag > `--prompt-file` > stdin pipe > interactive prompt.
 
 ### Global options
 
@@ -220,6 +220,7 @@ Input is resolved in order: `--prompt` flag > stdin pipe > interactive prompt.
 
 - `--name` — Project name, used as the project identifier across sessions (required on first run, prompted if omitted)
 - `--prompt` — Guidance for design doc creation
+- `--prompt-file` — Read prompt from a file
 - `--reset` — Reset phase state and start fresh
 
 #### `stories`
@@ -234,6 +235,7 @@ Input is resolved in order: `--prompt` flag > stdin pipe > interactive prompt.
 #### `add`
 
 - `--prompt` — Brief idea to turn into a story (prompted if omitted)
+- `--prompt-file` — Read prompt from a file
 - `--next` — Priority 1 — implement next
 - `--anytime` — Let Claude pick priority
 
@@ -250,6 +252,7 @@ Accepts ideas as positional arguments (e.g. `pralph ideate "idea one" "idea two"
 Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "split into login and registration"`).
 
 - `--prompt` — Refinement instruction (alternative to positional arg)
+- `--prompt-file` — Read prompt from a file
 - `-s`, `--story` — Story ID(s) to refine (repeatable)
 - `-p`, `--pattern` — Glob pattern to match story IDs (e.g. `I18N-*`)
 
@@ -260,12 +263,15 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 - `--review` / `--no-review` (default: on) — Run reviewer after each implementation
 - `--compound` / `--no-compound` (default: off) — Capture learnings after each story
 - `--prompt` — Guidance for implementation (e.g. "use FastAPI")
+- `--prompt-file` — Read prompt from a file
+- `--parallel` — Max concurrent stories (default: 1 = sequential)
 - `--reset` — Reset phase state and start fresh
 
 #### `compound`
 
 - `--story-id` — Story ID to capture learnings from
 - `--prompt` — Description of what was done
+- `--prompt-file` — Read prompt from a file
 
 #### `reset-errors`
 
@@ -327,11 +333,11 @@ pralph viewer            # opens http://localhost:8411
 pralph viewer --port 9000 --no-open
 ```
 
-A dark-themed web UI for browsing and managing your story backlog. Features:
+A dark-themed web UI for browsing and managing your story backlog. The viewer uses a read-only database snapshot, so it works while `implement` is running — each page load sees the latest data.
 
 - **Sidebar + detail panel** — click any story to see its full content, acceptance criteria, dependencies, and metadata.
 - **Filtering** — filter by status, category, priority, or search by text.
-- **In-place editing** — edit story fields (title, content, priority, status, etc.) directly in the browser and save back to disk.
+- **In-place editing** — edit story fields (title, content, priority, status, etc.) directly in the browser and save back to DuckDB. If another process holds the database lock, edits will retry briefly and show an error if the lock can't be acquired.
 - **Timeline view** — a Gantt-style visualization that lays out stories by dependency depth, with arrows showing dependency relationships.
 
 <img src="docs/viewer-stories.png" alt="Story viewer — card view with detail panel" width="800">
