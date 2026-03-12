@@ -35,6 +35,29 @@ def get_connection() -> duckdb.DuckDBPyConnection:
         return _conn
 
 
+def get_readonly_connection() -> duckdb.DuckDBPyConnection:
+    """Return a read-only DuckDB connection that works even while another process writes.
+
+    DuckDB doesn't allow concurrent connections (even read-only) when a write lock
+    is held, so we snapshot the file to a temp copy and open that instead.
+    The caller should close the connection when done.
+    """
+    import shutil
+    import tempfile
+
+    if not _DB_PATH.exists():
+        raise FileNotFoundError(f"Database not found: {_DB_PATH}")
+    # Copy to a temp file so we don't conflict with the writer
+    tmp = tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False)
+    tmp.close()
+    shutil.copy2(str(_DB_PATH), tmp.name)
+    # Also copy WAL file if it exists
+    wal_path = Path(str(_DB_PATH) + ".wal")
+    if wal_path.exists():
+        shutil.copy2(str(wal_path), tmp.name + ".wal")
+    return duckdb.connect(tmp.name, read_only=True)
+
+
 def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create tables if they don't exist."""
     conn.execute("""
