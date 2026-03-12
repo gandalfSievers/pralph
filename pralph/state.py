@@ -1,21 +1,104 @@
 from __future__ import annotations
 
 import json
-import os
+import threading
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import duckdb
+
+from pralph import db
+from pralph.migrate import migrate_project, needs_migration
 from pralph.models import IterationResult, PhaseState, Story, StoryStatus
 
 
+class ProjectNotInitializedError(Exception):
+    """Raised when a command is run in a directory without a project.json."""
+    pass
+
+
+def _row_to_story(row: tuple, columns: list[str]) -> Story:
+    """Convert a DuckDB row + column names into a Story object."""
+    d = dict(zip(columns, row))
+    return Story(
+        id=d["id"],
+        title=d.get("title", ""),
+        content=d.get("content", ""),
+        acceptance_criteria=json.loads(d.get("acceptance_criteria", "[]")),
+        priority=d.get("priority", 3),
+        category=d.get("category", ""),
+        complexity=d.get("complexity", "medium"),
+        dependencies=json.loads(d.get("dependencies", "[]")),
+        source=d.get("source", "extract"),
+        status=StoryStatus(d.get("status", "pending")),
+        metadata=json.loads(d.get("metadata", "{}")),
+    )
+
+
 class StateManager:
-    def __init__(self, project_dir: str) -> None:
-        self.project_dir = Path(project_dir)
+    def __init__(self, project_dir: str, *, project_name: str | None = None) -> None:
+        self.project_dir = Path(project_dir).resolve()
         self.state_dir = self.project_dir / ".pralph"
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
 
-    # -- file paths --
+        # Resolve project_id from project.json or create it
+        self.project_id = self._resolve_project_id(project_name)
+
+        # Initialize DuckDB
+        self._conn = db.get_connection()
+        db.register_project(self._conn, self.project_id, self.project_dir.name)
+
+        # Auto-migrate existing JSONL data
+        if needs_migration(self.state_dir, self.project_id, self._conn):
+            migrate_project(self.state_dir, self.project_id, self._conn)
+
+    @property
+    def _project_config_path(self) -> Path:
+        return self.state_dir / "project.json"
+
+    def _resolve_project_id(self, project_name: str | None) -> str:
+        """Resolve project_id: read from project.json, or create from project_name."""
+        if self._project_config_path.exists():
+            try:
+                data = json.loads(self._project_config_path.read_text())
+                stored_id = data.get("project_id", "")
+                if stored_id:
+                    return stored_id
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if project_name:
+            self._save_project_config(project_name)
+            return project_name
+
+        # Legacy project: has JSONL files but no project.json — auto-assign basename
+        if self._has_legacy_data():
+            legacy_name = self.project_dir.name
+            self._save_project_config(legacy_name)
+            return legacy_name
+
+        # No project.json and no name provided — not initialized yet
+        raise ProjectNotInitializedError(
+            f"Project not initialized. Run 'pralph plan --name <project-name>' first.\n"
+            f"  directory: {self.project_dir}"
+        )
+
+    def _has_legacy_data(self) -> bool:
+        """Check if this project has old-style JSONL files (pre-DuckDB)."""
+        return (
+            (self.state_dir / "stories.jsonl").exists()
+            or (self.state_dir / "phase-state.json").exists()
+            or self.design_doc_path.exists()
+        )
+
+    def _save_project_config(self, project_id: str) -> None:
+        self._project_config_path.write_text(
+            json.dumps({"project_id": project_id}, indent=2) + "\n"
+        )
+
+    # -- file paths (markdown files remain on disk) --
 
     @property
     def design_doc_path(self) -> Path:
@@ -24,26 +107,6 @@ class StateManager:
     @property
     def guardrails_path(self) -> Path:
         return self.state_dir / "guardrails.md"
-
-    @property
-    def stories_path(self) -> Path:
-        return self.state_dir / "stories.jsonl"
-
-    @property
-    def status_path(self) -> Path:
-        return self.state_dir / "status.jsonl"
-
-    @property
-    def run_log_path(self) -> Path:
-        return self.state_dir / "run-log.jsonl"
-
-    @property
-    def phase_state_path(self) -> Path:
-        return self.state_dir / "phase-state.json"
-
-    @property
-    def phase1_analysis_path(self) -> Path:
-        return self.state_dir / "phase1-analysis.json"
 
     @property
     def research_notes_path(self) -> Path:
@@ -61,7 +124,6 @@ class StateManager:
         return Path.home() / ".pralph"
 
     def read_phase_prompt(self, phase: str) -> str:
-        # Project-level overrides home-level
         path = self.phase_prompt_path(phase)
         if path.exists():
             return path.read_text().strip()
@@ -89,11 +151,10 @@ class StateManager:
         if not self.extra_tools_path.exists():
             return ""
         raw = self.extra_tools_path.read_text().strip()
-        # Normalize: support one-per-line or comma-separated
         tools = [t.strip() for t in raw.replace("\n", ",").split(",") if t.strip()]
         return ",".join(tools)
 
-    # -- review feedback --
+    # -- review feedback (stays on disk — Claude reads by path) --
 
     @property
     def review_feedback_dir(self) -> Path:
@@ -143,93 +204,165 @@ class StateManager:
             return self.guardrails_path.read_text()
         return ""
 
-    # -- stories --
+    # -- phase1 analysis (DuckDB) --
+
+    def has_phase1_analysis(self) -> bool:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM phase1_analysis WHERE project_id = ?",
+            [self.project_id],
+        ).fetchone()
+        return row is not None and row[0] > 0
+
+    def load_phase1_analysis(self) -> dict | None:
+        row = self._conn.execute(
+            "SELECT data FROM phase1_analysis WHERE project_id = ?",
+            [self.project_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+    def save_phase1_analysis(self, data: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO phase1_analysis (project_id, data) VALUES (?, ?)",
+                [self.project_id, json.dumps(data)],
+            )
+
+    def delete_phase1_analysis(self) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM phase1_analysis WHERE project_id = ?",
+                [self.project_id],
+            )
+
+    # -- stories (DuckDB) --
+
+    def _story_columns(self) -> list[str]:
+        """Column names for the stories table, in SELECT * order."""
+        return [
+            "project_id", "id", "title", "content", "acceptance_criteria",
+            "priority", "category", "complexity", "dependencies", "source",
+            "status", "metadata", "created_at", "updated_at",
+        ]
+
+    def _query_stories(self, where: str = "", params: list | None = None) -> list[Story]:
+        """Run a SELECT on stories and return Story objects."""
+        sql = f"SELECT * FROM stories WHERE project_id = ?"
+        p: list = [self.project_id]
+        if where:
+            sql += f" AND ({where})"
+            if params:
+                p.extend(params)
+        result = self._conn.execute(sql, p)
+        cols = [desc[0] for desc in result.description]
+        return [_row_to_story(row, cols) for row in result.fetchall()]
 
     def load_stories(self) -> list[Story]:
-        stories: list[Story] = []
-        if not self.stories_path.exists():
-            return stories
-        for line in self.stories_path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                stories.append(Story.from_dict(json.loads(line)))
-            except (json.JSONDecodeError, KeyError):
-                continue
-        return stories
+        return self._query_stories()
+
+    def has_stories(self) -> bool:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM stories WHERE project_id = ?",
+            [self.project_id],
+        ).fetchone()
+        return row is not None and row[0] > 0
 
     def append_stories(self, stories: list[Story]) -> None:
-        with open(self.stories_path, "a") as f:
+        with self._lock:
             for s in stories:
-                f.write(json.dumps(s.to_dict()) + "\n")
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO stories
+                       (project_id, id, title, content, acceptance_criteria, priority,
+                        category, complexity, dependencies, source, status, metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        self.project_id,
+                        s.id,
+                        s.title,
+                        s.content,
+                        json.dumps(s.acceptance_criteria),
+                        s.priority,
+                        s.category,
+                        s.complexity,
+                        json.dumps(s.dependencies),
+                        s.source,
+                        s.status.value,
+                        json.dumps(s.metadata),
+                    ],
+                )
 
     def get_pending_stories(self) -> list[Story]:
-        return [s for s in self.load_stories() if s.status == StoryStatus.pending]
+        return self._query_stories("status = ?", ["pending"])
 
     def get_actionable_stories(self) -> list[Story]:
         """Return stories that are pending or need rework (rework first)."""
-        stories = self.load_stories()
+        stories = self._query_stories("status IN (?, ?)", ["rework", "pending"])
         rework = [s for s in stories if s.status == StoryStatus.rework]
         pending = [s for s in stories if s.status == StoryStatus.pending]
         return rework + pending
 
     def reset_error_stories(self) -> list[Story]:
         """Find stories with error status and reset them to pending."""
-        stories = self.load_stories()
-        reset: list[Story] = []
+        with self._lock:
+            error_stories = self._query_stories("status = ?", ["error"])
+            if not error_stories:
+                return []
 
-        for s in stories:
-            if s.status == StoryStatus.error:
+            for s in error_stories:
                 s.status = StoryStatus.pending
                 s.metadata.pop("error_reason", None)
                 s.metadata.pop("error_output", None)
                 s.metadata.pop("error_at", None)
-                reset.append(s)
+                self._conn.execute(
+                    """UPDATE stories SET status = ?, metadata = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    ["pending", json.dumps(s.metadata), self.project_id, s.id],
+                )
+                self._conn.execute(
+                    """INSERT INTO status_log (project_id, story_id, status, summary, extra)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [self.project_id, s.id, "pending", "Reset from error status", "{}"],
+                )
 
-        if reset:
-            self._rewrite_stories(stories)
-            with open(self.status_path, "a") as f:
-                for s in reset:
-                    entry = {
-                        "story_id": s.id,
-                        "status": "pending",
-                        "summary": "Reset from error status",
-                    }
-                    f.write(json.dumps(entry) + "\n")
-
-        return reset
+            return error_stories
 
     def recover_orphaned_stories(self) -> list[Story]:
         """Find in_progress stories (orphans from crashes) and reset to pending."""
-        stories = self.load_stories()
-        recovered: list[Story] = []
+        with self._lock:
+            in_progress = self._query_stories("status = ?", ["in_progress"])
+            if not in_progress:
+                return []
 
-        for s in stories:
-            if s.status == StoryStatus.in_progress:
+            now = datetime.now().isoformat()
+            for s in in_progress:
                 s.status = StoryStatus.pending
                 s.metadata["previous_attempt"] = {
                     "was_in_progress": True,
-                    "recovered_at": datetime.now().isoformat(),
+                    "recovered_at": now,
                 }
-                recovered.append(s)
-
-        if recovered:
-            self._rewrite_stories(stories)
-            with open(self.status_path, "a") as f:
-                for s in recovered:
-                    entry = {
-                        "story_id": s.id,
-                        "status": "pending",
-                        "summary": "Recovered from crash (was in_progress)",
-                        "recovery": True,
-                    }
-                    f.write(json.dumps(entry) + "\n")
-
-        return recovered
+                self._conn.execute(
+                    """UPDATE stories SET status = ?, metadata = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    ["pending", json.dumps(s.metadata), self.project_id, s.id],
+                )
+                self._conn.execute(
+                    """INSERT INTO status_log (project_id, story_id, status, summary, extra)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [
+                        self.project_id, s.id, "pending",
+                        "Recovered from crash (was in_progress)",
+                        json.dumps({"recovery": True}),
+                    ],
+                )
+            return in_progress
 
     def get_story_ids(self) -> set[str]:
-        return {s.id for s in self.load_stories()}
+        rows = self._conn.execute(
+            "SELECT id FROM stories WHERE project_id = ?",
+            [self.project_id],
+        ).fetchall()
+        return {row[0] for row in rows}
 
     def get_category_stats(self) -> dict[str, dict[str, int]]:
         stats: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "next_id": 1})
@@ -238,7 +371,6 @@ class StateManager:
             if not cat:
                 continue
             stats[cat]["count"] += 1
-            # Parse numeric suffix from id like "AUTH-043"
             parts = story.id.rsplit("-", 1)
             if len(parts) == 2:
                 try:
@@ -267,7 +399,7 @@ class StateManager:
             lines.append(f"- {cat}: count={info['count']}, next_id={info['next_id']:03d}")
         return "\n".join(lines)
 
-    # -- story status --
+    # -- story status (DuckDB) --
 
     def mark_story_status(
         self,
@@ -278,101 +410,193 @@ class StateManager:
         error_reason: str = "",
         error_output: str = "",
     ) -> None:
-        entry = {
-            "story_id": story_id,
-            "status": status.value,
-            "summary": summary,
-            **(extra or {}),
-        }
-        if error_reason:
-            entry["error_reason"] = error_reason
-        with open(self.status_path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        with self._lock:
+            log_extra = dict(extra or {})
+            if error_reason:
+                log_extra["error_reason"] = error_reason
+            self._conn.execute(
+                """INSERT INTO status_log (project_id, story_id, status, summary, extra)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [self.project_id, story_id, status.value, summary, json.dumps(log_extra)],
+            )
 
-        # Also rewrite stories.jsonl with updated status
-        stories = self.load_stories()
-        for s in stories:
-            if s.id == story_id:
-                s.status = status
-                if status == StoryStatus.error:
-                    s.metadata["error_reason"] = error_reason or summary
-                    if error_output:
-                        # Keep last 2000 chars of output for context
-                        s.metadata["error_output"] = error_output[-2000:]
-                    s.metadata["error_at"] = datetime.now().isoformat()
-                break
-        self._rewrite_stories(stories)
+            # Build metadata update for error context
+            metadata_update = None
+            if status == StoryStatus.error:
+                # Read current metadata, merge error fields
+                row = self._conn.execute(
+                    "SELECT metadata FROM stories WHERE project_id = ? AND id = ?",
+                    [self.project_id, story_id],
+                ).fetchone()
+                meta = json.loads(row[0]) if row and row[0] else {}
+                meta["error_reason"] = error_reason or summary
+                if error_output:
+                    meta["error_output"] = error_output[-2000:]
+                meta["error_at"] = datetime.now().isoformat()
+                metadata_update = json.dumps(meta)
+
+            if metadata_update is not None:
+                self._conn.execute(
+                    """UPDATE stories SET status = ?, metadata = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    [status.value, metadata_update, self.project_id, story_id],
+                )
+            else:
+                self._conn.execute(
+                    """UPDATE stories SET status = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    [status.value, self.project_id, story_id],
+                )
 
     def _rewrite_stories(self, stories: list[Story]) -> None:
-        with open(self.stories_path, "w") as f:
+        """Update all stories in bulk (used by viewer edit, etc.)."""
+        with self._lock:
             for s in stories:
-                f.write(json.dumps(s.to_dict()) + "\n")
+                self._conn.execute(
+                    """UPDATE stories SET
+                         title = ?, content = ?, acceptance_criteria = ?,
+                         priority = ?, category = ?, complexity = ?,
+                         dependencies = ?, source = ?, status = ?,
+                         metadata = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    [
+                        s.title, s.content, json.dumps(s.acceptance_criteria),
+                        s.priority, s.category, s.complexity,
+                        json.dumps(s.dependencies), s.source, s.status.value,
+                        json.dumps(s.metadata), self.project_id, s.id,
+                    ],
+                )
 
     def get_implemented_summary(self) -> str:
-        if not self.status_path.exists():
-            return ""
-        count = 0
-        for raw in self.status_path.read_text().splitlines():
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                json.loads(raw)
-                count += 1
-            except json.JSONDecodeError:
-                continue
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM status_log WHERE project_id = ?",
+            [self.project_id],
+        ).fetchone()
+        count = row[0] if row else 0
         if count == 0:
             return ""
-        return f"## Previously Implemented Stories\n\n{count} stories tracked in {self.status_path}"
+        return f"## Previously Implemented Stories\n\n{count} status transitions tracked in DuckDB"
 
-    # -- phase state --
+    def load_status_log(self) -> list[dict]:
+        """Load all status log entries for this project."""
+        result = self._conn.execute(
+            "SELECT story_id, status, summary, extra, logged_at FROM status_log WHERE project_id = ? ORDER BY logged_at",
+            [self.project_id],
+        )
+        cols = [desc[0] for desc in result.description]
+        entries = []
+        for row in result.fetchall():
+            d = dict(zip(cols, row))
+            # Merge extra fields into the dict for backward compatibility
+            extra = json.loads(d.pop("extra", "{}"))
+            d.update(extra)
+            entries.append(d)
+        return entries
+
+    # -- phase state (DuckDB) --
 
     def load_phase_state(self, phase: str) -> PhaseState:
-        if self.phase_state_path.exists():
-            try:
-                data = json.loads(self.phase_state_path.read_text())
-                if data.get("phase") == phase:
-                    return PhaseState.from_dict(data)
-            except (json.JSONDecodeError, KeyError):
-                pass
-        return PhaseState(phase=phase)
+        result = self._conn.execute(
+            "SELECT * FROM phase_state WHERE project_id = ? AND phase = ?",
+            [self.project_id, phase],
+        )
+        row = result.fetchone()
+        if row is None:
+            return PhaseState(phase=phase)
+        cols = [desc[0] for desc in result.description]
+        d = dict(zip(cols, row))
+        return PhaseState(
+            phase=d["phase"],
+            current_iteration=d.get("current_iteration", 0),
+            consecutive_empty=d.get("consecutive_empty", 0),
+            consecutive_errors=d.get("consecutive_errors", 0),
+            completed=bool(d.get("completed", False)),
+            completion_reason=d.get("completion_reason", ""),
+            total_cost_usd=d.get("total_cost_usd", 0.0),
+            last_error=d.get("last_error", ""),
+            last_summary=d.get("last_summary", ""),
+            active_session_id=d.get("active_session_id", ""),
+            active_story_id=d.get("active_story_id", ""),
+            active_session_started=d.get("active_session_started", ""),
+        )
 
     def save_phase_state(self, state: PhaseState) -> None:
-        self.phase_state_path.write_text(json.dumps(state.to_dict(), indent=2) + "\n")
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO phase_state
+                   (project_id, phase, current_iteration, consecutive_empty,
+                    consecutive_errors, completed, completion_reason, total_cost_usd,
+                    last_error, last_summary, active_session_id, active_story_id,
+                    active_session_started)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    self.project_id,
+                    state.phase,
+                    state.current_iteration,
+                    state.consecutive_empty,
+                    state.consecutive_errors,
+                    state.completed,
+                    state.completion_reason,
+                    state.total_cost_usd,
+                    state.last_error,
+                    state.last_summary,
+                    state.active_session_id,
+                    state.active_story_id,
+                    state.active_session_started,
+                ],
+            )
 
-    # -- run log --
+    # -- run log (DuckDB) --
 
     def log_iteration(self, result: IterationResult) -> None:
-        with open(self.run_log_path, "a") as f:
-            f.write(json.dumps(result.to_dict()) + "\n")
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO run_log
+                   (project_id, iteration, phase, mode, success, stories_generated,
+                    impl_status, error, duration, cost_usd, story_id,
+                    input_tokens, output_tokens, cache_read_input_tokens,
+                    cache_creation_input_tokens)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    self.project_id,
+                    result.iteration,
+                    result.phase,
+                    result.mode,
+                    result.success,
+                    result.stories_generated,
+                    result.impl_status,
+                    result.error,
+                    result.duration,
+                    result.cost_usd,
+                    result.story_id,
+                    result.input_tokens,
+                    result.output_tokens,
+                    result.cache_read_input_tokens,
+                    result.cache_creation_input_tokens,
+                ],
+            )
 
     def get_story_tokens(self) -> dict[str, dict[str, int]]:
-        """Aggregate tokens per story from run-log.jsonl."""
+        """Aggregate tokens per story from run_log."""
+        rows = self._conn.execute(
+            """SELECT story_id,
+                      SUM(input_tokens) as input_tokens,
+                      SUM(output_tokens) as output_tokens,
+                      SUM(cache_read_input_tokens) as cache_read_input_tokens,
+                      SUM(cache_creation_input_tokens) as cache_creation_input_tokens
+               FROM run_log
+               WHERE project_id = ? AND story_id != ''
+               GROUP BY story_id""",
+            [self.project_id],
+        ).fetchall()
         totals: dict[str, dict[str, int]] = {}
-        if not self.run_log_path.exists():
-            return totals
-        for line in self.run_log_path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            story_id = entry.get("story_id")
-            if not story_id:
-                continue
-            if story_id not in totals:
-                totals[story_id] = {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                }
-            totals[story_id]["input_tokens"] += entry.get("input_tokens", 0)
-            totals[story_id]["output_tokens"] += entry.get("output_tokens", 0)
-            totals[story_id]["cache_read_input_tokens"] += entry.get("cache_read_input_tokens", 0)
-            totals[story_id]["cache_creation_input_tokens"] += entry.get("cache_creation_input_tokens", 0)
+        for row in rows:
+            totals[row[0]] = {
+                "input_tokens": int(row[1] or 0),
+                "output_tokens": int(row[2] or 0),
+                "cache_read_input_tokens": int(row[3] or 0),
+                "cache_creation_input_tokens": int(row[4] or 0),
+            }
         return totals
 
     # -- solutions (compound learning) --
@@ -381,12 +605,12 @@ class StateManager:
     def solutions_dir(self) -> Path:
         return self.state_dir / "solutions"
 
-    @property
-    def solutions_index_path(self) -> Path:
-        return self.solutions_dir / "index.jsonl"
-
     def has_solutions(self) -> bool:
-        return self.solutions_index_path.exists() and self.solutions_index_path.stat().st_size > 0
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM solutions_index WHERE project_id = ?",
+            [self.project_id],
+        ).fetchone()
+        return row is not None and row[0] > 0
 
     def save_solution(
         self,
@@ -395,33 +619,42 @@ class StateManager:
         content: str,
         index_entry: dict,
     ) -> Path:
-        """Write a solution markdown file and append to index."""
-        cat_dir = self.solutions_dir / category
-        cat_dir.mkdir(parents=True, exist_ok=True)
-        solution_path = cat_dir / filename
-        solution_path.write_text(content)
+        """Write a solution markdown file and add to DuckDB index."""
+        with self._lock:
+            cat_dir = self.solutions_dir / category
+            cat_dir.mkdir(parents=True, exist_ok=True)
+            solution_path = cat_dir / filename
+            solution_path.write_text(content)
 
-        # Append index entry
-        with open(self.solutions_index_path, "a") as f:
-            f.write(json.dumps(index_entry) + "\n")
+            self._conn.execute(
+                """INSERT INTO solutions_index
+                   (project_id, title, category, filename, tags, error_signature, story_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    self.project_id,
+                    index_entry.get("title", ""),
+                    index_entry.get("category", ""),
+                    index_entry.get("filename", ""),
+                    json.dumps(index_entry.get("tags", [])),
+                    index_entry.get("error_signature", ""),
+                    index_entry.get("story_id", ""),
+                ],
+            )
 
-        return solution_path
+            return solution_path
 
     def load_solutions_index(self) -> list[dict]:
-        """Read all index entries."""
-        entries: list[dict] = []
-        if not self.solutions_index_path.exists():
-            return entries
-        for line in self.solutions_index_path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-                if isinstance(parsed, dict):
-                    entries.append(parsed)
-            except json.JSONDecodeError:
-                continue
+        """Read all solution index entries for this project."""
+        result = self._conn.execute(
+            "SELECT title, category, filename, tags, error_signature, story_id FROM solutions_index WHERE project_id = ?",
+            [self.project_id],
+        )
+        cols = [desc[0] for desc in result.description]
+        entries = []
+        for row in result.fetchall():
+            d = dict(zip(cols, row))
+            d["tags"] = json.loads(d.get("tags", "[]"))
+            entries.append(d)
         return entries
 
     def search_solutions(self, query: str, max_results: int = 5) -> list[dict]:
@@ -435,8 +668,6 @@ class StateManager:
 
         scored: list[tuple[int, dict]] = []
         for entry in entries:
-            if not isinstance(entry, dict):
-                continue
             score = 0
             title = (entry.get("title") or "").lower()
             tags = [t.lower() for t in (entry.get("tags") or [])]
