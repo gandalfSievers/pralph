@@ -11,6 +11,7 @@
   - [Standard workflow](#standard-workflow)
   - [Adding stories later](#adding-stories-later)
   - [Compound learning](#compound-learning)
+  - [Exporting solutions](#exporting-solutions)
   - [Querying project data](#querying-project-data)
   - [Piping from stdin](#piping-from-stdin)
   - [Global options](#global-options)
@@ -147,6 +148,24 @@ pralph compound --prompt "Fixed CORS issue by adding middleware"
 pralph compound --story-id AUTH-001
 ```
 
+### Exporting solutions
+
+Solutions are scoped to a single project. Use `export-solutions` to extract them for reuse in other projects or for reference.
+
+```bash
+# Export all solutions as markdown to stdout
+pralph export-solutions
+
+# Write to a file
+pralph export-solutions -o learnings.md
+
+# Filter by category
+pralph export-solutions -c deployment -o deployment-playbook.md
+
+# Export as JSON (includes full content + metadata)
+pralph export-solutions --format json -o solutions.json
+```
+
 ### Querying project data
 
 All structured data is stored in DuckDB, queryable via `pralph query`. Use built-in shortcuts or write arbitrary SQL.
@@ -272,6 +291,12 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 - `--story-id` — Story ID to capture learnings from
 - `--prompt` — Description of what was done
 - `--prompt-file` — Read prompt from a file
+
+#### `export-solutions`
+
+- `-o`, `--output` — Write to file (default: stdout)
+- `-c`, `--category` — Filter by category
+- `--format` (`markdown` | `json`, default: `markdown`) — Output format
 
 #### `reset-errors`
 

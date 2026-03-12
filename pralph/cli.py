@@ -465,6 +465,56 @@ def compound(ctx, story_id, prompt, prompt_file):
     click.echo(f"\n  Cost: ${cost:.4f}")
 
 
+@main.command("export-solutions")
+@click.option("--output", "-o", default=None, type=click.Path(), help="Write to file (default: stdout)")
+@click.option("--category", "-c", default=None, help="Filter by category")
+@click.option("--format", "fmt", default="markdown", type=click.Choice(["markdown", "json"]), help="Output format")
+@click.pass_context
+def export_solutions(ctx, output, category, fmt):
+    """Export compound learning solutions for reuse across projects."""
+    import json as json_mod
+
+    state = _get_state(ctx, readonly=True)
+    entries = state.load_solutions_index()
+    if not entries:
+        click.echo("No solutions found. Run 'pralph implement --compound' or 'pralph compound' first.")
+        return
+
+    if category:
+        entries = [e for e in entries if e.get("category", "").lower() == category.lower()]
+        if not entries:
+            click.echo(f"No solutions found in category '{category}'.")
+            return
+
+    if fmt == "json":
+        items = []
+        for entry in entries:
+            content = state.read_solution(entry.get("filename", ""))
+            items.append({**entry, "content": content})
+        text = json_mod.dumps(items, indent=2)
+    else:
+        parts = []
+        for entry in entries:
+            content = state.read_solution(entry.get("filename", ""))
+            title = entry.get("title", "Untitled")
+            cat = entry.get("category", "")
+            tags = ", ".join(entry.get("tags", []))
+            header = f"# [{cat}] {title}"
+            if tags:
+                header += f"\n\nTags: {tags}"
+            if content:
+                parts.append(f"{header}\n\n{content}")
+            else:
+                parts.append(header)
+        text = "\n\n---\n\n".join(parts) + "\n"
+
+    if output:
+        Path(output).write_text(text)
+        click.echo(f"Exported {len(entries)} solution(s) to {output}")
+    else:
+        click.echo(text)
+
+
 @main.command("reset-errors")
 @click.pass_context
 def reset_errors(ctx):
