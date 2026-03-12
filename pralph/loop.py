@@ -770,10 +770,8 @@ def run_webgen_loop(
         return PhaseState(phase="webgen", completed=True, completion_reason="no_design_doc")
 
     if not state.has_stories():
-        click.echo(click.style("Warning: No stories found. Run 'pralph stories' before 'webgen'.", fg='yellow'))
-        click.echo("  webgen discovers gaps relative to existing stories — without them it has no baseline.")
-        if not click.confirm("  Continue anyway?", default=False):
-            return PhaseState(phase="webgen", completed=True, completion_reason="no_stories")
+        click.echo("Error: No stories found. Run 'pralph stories' before 'webgen'.")
+        return PhaseState(phase="webgen", completed=True, completion_reason="no_stories")
 
     system_prompt = build_guardrails_system_prompt("stories", state)
 
