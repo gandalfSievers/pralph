@@ -697,17 +697,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_status(self):
-        entries = []
-        if self.state.status_path.exists():
-            for line in self.state.status_path.read_text().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        body = json.dumps(entries).encode()
+        entries = self.state.load_status_log()
+        body = json.dumps(entries, default=str).encode()
         self.send_response(HTTPStatus.OK)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))

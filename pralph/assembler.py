@@ -406,7 +406,7 @@ def assemble_phase1_analyze_prompt(
 
     if len(stories_json) > _STORIES_INLINE_THRESHOLD:
         # Too large to inline — write to file and reference it
-        stories_file = state.phase1_analysis_path.with_name("phase1-stories-input.json")
+        stories_file = state.state_dir / "phase1-stories-input.json"
         stories_file.write_text(stories_json)
         stories_json = (
             f"(Stories too large to inline — {len(pending)} stories. "
