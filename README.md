@@ -261,6 +261,14 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 - `--story-id` — Story ID to capture learnings from
 - `--prompt` — Description of what was done
 
+#### `reset-errors`
+
+No options. Resets all stories with `error` status back to `pending` and clears the current phase's error state (`consecutive_errors`, `last_error`, and `completion_reason` if the phase was stopped due to errors). This unblocks a phase that halted after hitting too many consecutive errors.
+
+```bash
+pralph reset-errors
+```
+
 #### `viewer`
 
 - `--port` (default: `8411`) — Port to serve on

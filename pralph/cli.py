@@ -59,7 +59,7 @@ class OrderedGroup(click.Group):
     SECTIONS = [
         ("Workflow", ["plan", "stories", "webgen", "implement"]),
         ("Replan", ["add", "ideate", "refine"]),
-        ("Tools", ["compound", "viewer", "query"]),
+        ("Tools", ["compound", "reset-errors", "viewer", "query"]),
     ]
 
     def list_commands(self, ctx):
@@ -448,6 +448,44 @@ def compound(ctx, story_id, prompt):
     )
 
     click.echo(f"\n  Cost: ${cost:.4f}")
+
+
+@main.command("reset-errors")
+@click.pass_context
+def reset_errors(ctx):
+    """Reset error stories to pending and clear error state."""
+    state = _get_state(ctx)
+
+    # Show error details before resetting
+    error_stories = [s for s in state.load_stories() if s.status == StoryStatus.error]
+    if error_stories:
+        click.echo(click.style(f"  {len(error_stories)} stories in error state:", fg='red'))
+        for s in error_stories:
+            reason = s.metadata.get("error_reason", "(no reason captured)")
+            error_at = s.metadata.get("error_at", "")
+            click.echo(f"    {click.style(s.id, fg='blue')}: {s.title}")
+            click.echo(f"      Reason: {reason[:200]}")
+            if error_at:
+                click.echo(f"      Error at: {error_at}")
+
+    # Reset error stories back to pending
+    reset_stories = state.reset_error_stories()
+
+    # Clear error fields in the implement phase state
+    ps = state.load_phase_state("implement")
+    if ps.consecutive_errors > 0 or ps.last_error or ps.completion_reason in ("consecutive_errors", "error"):
+        ps.consecutive_errors = 0
+        ps.last_error = ""
+        if ps.completion_reason in ("consecutive_errors", "error"):
+            ps.completed = False
+            ps.completion_reason = ""
+        state.save_phase_state(ps)
+        click.echo(f"  Cleared 'implement' phase error state")
+
+    if reset_stories:
+        click.echo(click.style(f"  Reset {len(reset_stories)} stories to pending", fg='green'))
+    else:
+        click.echo("  No error stories found")
 
 
 @main.command()

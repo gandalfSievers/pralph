@@ -302,6 +302,31 @@ class StateManager:
         pending = [s for s in stories if s.status == StoryStatus.pending]
         return rework + pending
 
+    def reset_error_stories(self) -> list[Story]:
+        """Find stories with error status and reset them to pending."""
+        with self._lock:
+            error_stories = self._query_stories("status = ?", ["error"])
+            if not error_stories:
+                return []
+
+            for s in error_stories:
+                s.status = StoryStatus.pending
+                s.metadata.pop("error_reason", None)
+                s.metadata.pop("error_output", None)
+                s.metadata.pop("error_at", None)
+                self._conn.execute(
+                    """UPDATE stories SET status = ?, metadata = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    ["pending", json.dumps(s.metadata), self.project_id, s.id],
+                )
+                self._conn.execute(
+                    """INSERT INTO status_log (project_id, story_id, status, summary, extra)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [self.project_id, s.id, "pending", "Reset from error status", "{}"],
+                )
+
+            return error_stories
+
     def recover_orphaned_stories(self) -> list[Story]:
         """Find in_progress stories (orphans from crashes) and reset to pending."""
         with self._lock:
@@ -382,18 +407,46 @@ class StateManager:
         status: StoryStatus,
         summary: str = "",
         extra: dict | None = None,
+        error_reason: str = "",
+        error_output: str = "",
     ) -> None:
         with self._lock:
+            log_extra = dict(extra or {})
+            if error_reason:
+                log_extra["error_reason"] = error_reason
             self._conn.execute(
                 """INSERT INTO status_log (project_id, story_id, status, summary, extra)
                    VALUES (?, ?, ?, ?, ?)""",
-                [self.project_id, story_id, status.value, summary, json.dumps(extra or {})],
+                [self.project_id, story_id, status.value, summary, json.dumps(log_extra)],
             )
-            self._conn.execute(
-                """UPDATE stories SET status = ?, updated_at = current_timestamp
-                   WHERE project_id = ? AND id = ?""",
-                [status.value, self.project_id, story_id],
-            )
+
+            # Build metadata update for error context
+            metadata_update = None
+            if status == StoryStatus.error:
+                # Read current metadata, merge error fields
+                row = self._conn.execute(
+                    "SELECT metadata FROM stories WHERE project_id = ? AND id = ?",
+                    [self.project_id, story_id],
+                ).fetchone()
+                meta = json.loads(row[0]) if row and row[0] else {}
+                meta["error_reason"] = error_reason or summary
+                if error_output:
+                    meta["error_output"] = error_output[-2000:]
+                meta["error_at"] = datetime.now().isoformat()
+                metadata_update = json.dumps(meta)
+
+            if metadata_update is not None:
+                self._conn.execute(
+                    """UPDATE stories SET status = ?, metadata = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    [status.value, metadata_update, self.project_id, story_id],
+                )
+            else:
+                self._conn.execute(
+                    """UPDATE stories SET status = ?, updated_at = current_timestamp
+                       WHERE project_id = ? AND id = ?""",
+                    [status.value, self.project_id, story_id],
+                )
 
     def _rewrite_stories(self, stories: list[Story]) -> None:
         """Update all stories in bulk (used by viewer edit, etc.)."""

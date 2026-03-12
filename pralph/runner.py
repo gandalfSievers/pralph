@@ -196,9 +196,17 @@ def run_claude(
             # Check if interrupted by ESC (process is SIGSTOP'd)
             if monitor_state and monitor_state[0].is_set():
                 _stop_elapsed_timer(timer_stop)
+                tty_file = monitor_state[3]
                 _stop_esc_monitor(monitor_state)
 
-                choice = _handle_interrupt(session_id, cwd)
+                choice, verbose = _handle_interrupt(session_id, cwd, tty_file=tty_file, verbose=verbose)
+
+                # Close /dev/tty if we opened it; a new one is opened if we continue
+                if tty_file is not None:
+                    try:
+                        tty_file.close()
+                    except OSError:
+                        pass
 
                 if choice == "continue":
                     try:
@@ -336,6 +344,11 @@ def run_claude(
     finally:
         _stop_elapsed_timer(timer_stop)
         _stop_esc_monitor(monitor_state)
+        if monitor_state is not None and monitor_state[3] is not None:
+            try:
+                monitor_state[3].close()
+            except OSError:
+                pass
 
     if error_result:
         return error_result
@@ -375,30 +388,43 @@ def run_claude(
 
 def _start_esc_monitor(
     proc: subprocess.Popen,
-) -> tuple[threading.Event, threading.Event, list] | None:
-    """Start monitoring stdin for ESC key. Returns (interrupted, stop, old_settings) or None."""
+) -> tuple[threading.Event, threading.Event, list, "io.BufferedReader | None"] | None:
+    """Start monitoring stdin for ESC key.
+
+    Returns (interrupted, stop, old_settings, tty_file) or None.
+    tty_file is non-None when /dev/tty was opened because stdin is not a TTY.
+    """
     if not _HAS_TERMIOS:
         return None
+
+    tty_file = None
     try:
         stdin_fd = sys.stdin.fileno()
     except (ValueError, AttributeError):
         return None
-    if not os.isatty(stdin_fd):
-        return None
+
+    if os.isatty(stdin_fd):
+        input_fd = stdin_fd
+    else:
+        try:
+            tty_file = open("/dev/tty", "rb", buffering=0)  # noqa: SIM115
+            input_fd = tty_file.fileno()
+        except OSError:
+            return None
 
     interrupted = threading.Event()
     stop = threading.Event()
-    old_settings = termios.tcgetattr(stdin_fd)
-    tty.setcbreak(stdin_fd)
+    old_settings = termios.tcgetattr(input_fd)
+    tty.setcbreak(input_fd)
 
     def monitor() -> None:
         try:
             while not stop.is_set():
-                ready, _, _ = select.select([stdin_fd], [], [], 0.2)
+                ready, _, _ = select.select([input_fd], [], [], 0.2)
                 if stop.is_set():
                     return
                 if ready:
-                    ch = os.read(stdin_fd, 1)
+                    ch = os.read(input_fd, 1)
                     if ch == b"\x1b":
                         interrupted.set()
                         try:
@@ -411,32 +437,58 @@ def _start_esc_monitor(
 
     t = threading.Thread(target=monitor, daemon=True)
     t.start()
-    return interrupted, stop, old_settings
+    return interrupted, stop, old_settings, tty_file
 
 
 def _stop_esc_monitor(
-    monitor_state: tuple[threading.Event, threading.Event, list] | None,
+    monitor_state: tuple[threading.Event, threading.Event, list, "io.BufferedReader | None"] | None,
 ) -> None:
     """Stop ESC monitor and restore terminal settings."""
     if monitor_state is None:
         return
-    _, stop, old_settings = monitor_state
+    _, stop, old_settings, tty_file = monitor_state
     stop.set()
     try:
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+        if tty_file is not None:
+            termios.tcsetattr(tty_file.fileno(), termios.TCSADRAIN, old_settings)
+        else:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
     except (OSError, ValueError):
         pass
 
 
-def _handle_interrupt(session_id: str, project_dir: str | None) -> str:
-    """Show interrupt menu and return choice: 'continue', 'takeover', 'skip', or 'abort'."""
+def _handle_interrupt(
+    session_id: str,
+    project_dir: str | None,
+    tty_file: "io.BufferedReader | None" = None,
+    verbose: bool = False,
+) -> tuple[str, bool]:
+    """Show interrupt menu and return (choice, verbose).
+
+    Choice is one of: 'continue', 'takeover', 'skip', or 'abort'.
+    verbose is the (possibly toggled) verbose state.
+    """
     import click
 
     # Flush any stale input from the ESC detection
     try:
-        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        flush_fd = tty_file.fileno() if tty_file is not None else sys.stdin.fileno()
+        termios.tcflush(flush_fd, termios.TCIFLUSH)
     except (OSError, ValueError):
         pass
+
+    # When stdin is piped, redirect stdin to /dev/tty so click.prompt reads
+    # from the terminal instead of the exhausted pipe.
+    restore_stdin = None
+    if not sys.stdin.isatty():
+        try:
+            restore_stdin = sys.stdin
+            sys.stdin = open("/dev/tty", "r")  # noqa: SIM115
+        except OSError:
+            sys.stdin = restore_stdin
+            restore_stdin = None
+
+    verbose_label = "Off" if verbose else "On"
 
     click.echo()
     click.echo(click.style("  ⏸  Interrupted", fg="yellow", bold=True))
@@ -446,18 +498,30 @@ def _handle_interrupt(session_id: str, project_dir: str | None) -> str:
     click.echo("  [3] Skip      — continue to next iteration")
     click.echo("  [4] Abort     — stop the loop")
     click.echo()
-    choice = click.prompt(
-        "  Choice", type=click.Choice(["1", "2", "3", "4"]), default="1",
-    )
+    click.echo(f"  [5] Toggle verbose ({verbose_label})")
+    click.echo()
+    try:
+        choice = click.prompt(
+            "  Choice", type=click.Choice(["1", "2", "3", "4", "5"]), default="1",
+        )
+    finally:
+        if restore_stdin is not None:
+            sys.stdin.close()
+            sys.stdin = restore_stdin
 
-    if choice == "1":
-        return "continue"
+    if choice == "5":
+        verbose = not verbose
+        state = "on" if verbose else "off"
+        click.echo(click.style(f"  Verbose {state}", fg="cyan"))
+        return "continue", verbose
+    elif choice == "1":
+        return "continue", verbose
     elif choice == "2":
-        return "takeover"
+        return "takeover", verbose
     elif choice == "3":
-        return "skip"
+        return "skip", verbose
     else:
-        return "abort"
+        return "abort", verbose
 
 
 def _post_takeover_menu(session_id: str) -> str:
@@ -557,8 +621,50 @@ def _print_event(event: dict, verbose: bool) -> None:
             first_line = content.split("\n")[0][:200]
             _click.echo(_click.style(f"  📋 {first_line}", dim=True), err=True)
 
-    elif etype in ("system", "rate_limit_event"):
-        pass  # skip noisy system events
+    elif etype == "user":
+        # Tool result coming back from a tool call
+        output = ""
+        tool_result = event.get("tool_use_result")
+        if isinstance(tool_result, dict):
+            stdout = tool_result.get("stdout", "")
+            stderr = tool_result.get("stderr", "")
+            output = stderr if stderr else stdout
+        if not output:
+            # Fallback: extract content from message.content tool_result blocks
+            msg = event.get("message", {})
+            if isinstance(msg, dict):
+                for block in msg.get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        c = block.get("content", "")
+                        if isinstance(c, str) and c:
+                            output = c
+                            break
+        if output:
+            if verbose:
+                _click.echo(_click.style(f"  📋 {output}", dim=True), err=True)
+            else:
+                lines = output.strip().split("\n")
+                preview = lines[0]
+                if len(lines) > 1:
+                    preview += _click.style(f" (+{len(lines)-1} lines)", dim=True)
+                _click.echo(_click.style(f"  📋 {preview}", dim=True), err=True)
+
+    elif etype == "rate_limit_event":
+        info = event.get("rate_limit_info", {})
+        status = info.get("status", "unknown")
+        if status != "allowed":
+            limit_type = info.get("rateLimitType", "")
+            resets_at = info.get("resetsAt", "")
+            _click.echo(_click.style(f"  ⚠ rate limited ({limit_type}, resets {resets_at})", fg='yellow'), err=True)
+
+    elif etype == "system":
+        if verbose:
+            subtype = event.get("subtype", "")
+            model = event.get("model", "")
+            cwd = event.get("cwd", "")
+            version = event.get("claude_code_version", "")
+            parts = [s for s in [subtype, model, cwd, version] if s]
+            _click.echo(_click.style(f"  [system] {' | '.join(parts)}", dim=True), err=True)
 
     elif verbose:
         _click.echo(_click.style(f"  [{etype}] {str(event)[:120]}", dim=True), err=True)
