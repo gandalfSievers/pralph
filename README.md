@@ -100,8 +100,8 @@ pralph viewer
 pralph implement --compound --max-iterations 30
 
 # 5. Check progress and costs
-pralph query --progress
-pralph query --cost
+pralph query --report
+pralph query --report --watch 10  # live dashboard while implement runs
 ```
 
 The `--name` flag is only required the first time you run `plan` in a directory. It's stored in `.pralph/project.json` and all subsequent commands read it automatically. If you omit `--name`, pralph will prompt for it.
@@ -159,7 +159,11 @@ pralph query --stories         # list all stories with status
 pralph query --errors          # recent errors
 pralph query --timeline        # implementation timeline
 pralph query --projects        # all registered projects
+pralph query --report          # full progress report (phases, stories, costs, active work)
+pralph query --report --watch 10  # auto-refresh every 10 seconds
 ```
+
+All query commands use a read-only database snapshot, so they work safely while another pralph process is running.
 
 **Custom SQL:**
 
@@ -283,6 +287,8 @@ pralph reset-errors
 - `--errors` — Recent errors
 - `--timeline` — Implementation timeline
 - `--projects` — All registered projects (no project context needed)
+- `--report` — Full progress report (phases, stories, costs, active work)
+- `--watch SECONDS` — Auto-refresh every N seconds (use with `--report`)
 - `--all-projects` — Hint for custom SQL across all projects
 - `--format` (`table` | `csv` | `json`, default: `table`) — Output format
 - Positional `SQL` argument — Arbitrary SQL query
