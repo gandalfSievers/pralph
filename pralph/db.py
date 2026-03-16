@@ -14,11 +14,13 @@ processes (e.g. `pralph query --report`).
 """
 from __future__ import annotations
 
+import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 _DB_DIR = Path.home() / ".pralph"
 _DB_PATH = _DB_DIR / "pralph.duckdb"
@@ -134,11 +136,23 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
+@retry(
+    retry=retry_if_exception_type(duckdb.IOException),
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=1, min=1, max=15),
+    before_sleep=lambda retry_state: print(
+        f"  [db] lock contention, retrying in {retry_state.next_action.sleep:.1f}s "
+        f"(attempt {retry_state.attempt_number}/10)",
+        file=sys.stderr,
+    ),
+    reraise=True,
+)
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Return a new short-lived DuckDB connection.
 
     Callers should close the connection when done, ideally via the
     `connection()` context manager. Schema is ensured on first call.
+    Retries on IOException (lock contention) with exponential backoff.
     """
     global _schema_initialized
     _ensure_db_dir()
