@@ -869,13 +869,63 @@ def run_webgen_loop(
 # ── Phase 3: Implement ───────────────────────────────────────────────
 
 
+def _resolve_story_ids(
+    state: StateManager,
+    story_ids: list[str],
+    with_deps: bool,
+) -> list[str]:
+    """Resolve story IDs, optionally including upstream dependencies.
+
+    Returns IDs in dependency order (deps first), filtered to only
+    pending/rework stories.
+    """
+    all_stories = state.load_stories()
+    by_id = {s.id: s for s in all_stories}
+
+    # Validate requested IDs exist
+    missing = [sid for sid in story_ids if sid not in by_id]
+    if missing:
+        raise click.ClickException(f"Stories not found: {', '.join(missing)}")
+
+    target_ids = set(story_ids)
+
+    if with_deps:
+        # Walk upstream: for each target, collect all transitive dependencies
+        def collect_deps(sid: str, visited: set[str]) -> None:
+            if sid in visited:
+                return
+            visited.add(sid)
+            story = by_id.get(sid)
+            if story:
+                for dep_id in story.dependencies:
+                    collect_deps(dep_id, visited)
+
+        all_needed: set[str] = set()
+        for sid in story_ids:
+            collect_deps(sid, all_needed)
+        target_ids = all_needed
+
+    # Filter to only actionable stories (pending/rework)
+    done_statuses = {StoryStatus.implemented, StoryStatus.skipped,
+                     StoryStatus.duplicate, StoryStatus.external}
+    actionable = [
+        by_id[sid] for sid in target_ids
+        if sid in by_id and by_id[sid].status not in done_statuses
+    ]
+
+    # Sort in dependency order
+    ordered = sort_stories(actionable)
+    return [s.id for s in ordered]
+
+
 def run_implement_loop(
     state: StateManager,
     *,
     model: str = "sonnet",
     max_iterations: int = 50,
     cooldown: int = 5,
-    story_id: str | None = None,
+    story_ids: list[str] | None = None,
+    with_deps: bool = False,
     phase1: bool = True,
     review: bool = True,
     compound: bool = False,
@@ -905,13 +955,32 @@ def run_implement_loop(
     if extra_tools:
         tools = tools + "," + extra_tools
 
-    # If specific story requested, just implement it
-    if story_id:
-        return _implement_single(state, story_id, model=model, system_prompt=system_prompt,
-                                 tools=tools, user_prompt=user_prompt, review=review,
-                                 compound=compound, verbose=verbose,
-                                 dangerously_skip_permissions=dangerously_skip_permissions,
-                                 max_budget_usd=max_budget_usd)
+    # If specific stories requested, resolve and implement them in order
+    if story_ids:
+        resolved = _resolve_story_ids(state, story_ids, with_deps)
+        if not resolved:
+            click.echo("  All requested stories (and dependencies) are already done.")
+            return PhaseState(phase="implement", completed=True, completion_reason="all_stories_done")
+        if with_deps and len(resolved) > len(story_ids):
+            dep_ids = [sid for sid in resolved if sid not in set(story_ids)]
+            click.echo(click.style(f"  Including {len(dep_ids)} dependencies:", fg='cyan'))
+            for sid in dep_ids:
+                click.echo(f"    {click.style(sid, fg='blue')}")
+        click.echo(f"  Implementation order: {', '.join(resolved)}")
+        last_ps = PhaseState(phase="implement")
+        for sid in resolved:
+            last_ps = _implement_single(
+                state, sid, model=model, system_prompt=system_prompt,
+                tools=tools, user_prompt=user_prompt, review=review,
+                compound=compound, verbose=verbose,
+                dangerously_skip_permissions=dangerously_skip_permissions,
+                max_budget_usd=max_budget_usd,
+            )
+            # Stop on user abort/interrupt or error
+            if last_ps.completion_reason in ("user_aborted", "user_interrupted", "error"):
+                break
+        last_ps.completion_reason = last_ps.completion_reason or "all_stories_done"
+        return last_ps
 
     # Parallel mode: run up to N stories concurrently
     if parallel > 1:

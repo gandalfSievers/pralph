@@ -544,7 +544,8 @@ def edit(ctx, story_id, title, content, priority, category, complexity, status,
 
 
 @main.command()
-@click.option("--story-id", default=None, help="Implement a specific story")
+@click.option("--story-id", default=None, help="Implement specific stories (comma-separated IDs)")
+@click.option("--with-deps", is_flag=True, help="Also implement unfinished upstream dependencies of --story-id")
 @click.option("--phase1/--no-phase1", default=True, help="Architecture-first grouping")
 @click.option("--review/--no-review", default=True, help="Run reviewer after each implementation")
 @click.option("--compound/--no-compound", default=False, help="Capture learnings after each story (compound learning)")
@@ -553,11 +554,13 @@ def edit(ctx, story_id, title, content, priority, category, complexity, status,
 @click.option("--parallel", default=1, type=click.IntRange(min=1), help="Max concurrent stories (default: 1 = sequential)")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def implement(ctx, story_id, phase1, review, compound, prompt, prompt_file, parallel, reset):
+def implement(ctx, story_id, with_deps, phase1, review, compound, prompt, prompt_file, parallel, reset):
     """Phase 3: Implement stories from backlog."""
     state = _get_state(ctx)
     if reset:
         _reset_phase(state, "implement")
+    if with_deps and not story_id:
+        raise click.UsageError("--with-deps requires --story-id")
     if not prompt and prompt_file:
         from pathlib import Path
         p = Path(prompt_file)
@@ -565,6 +568,10 @@ def implement(ctx, story_id, phase1, review, compound, prompt, prompt_file, para
             raise click.BadParameter(f"File not found: {prompt_file}", param_hint="'--prompt-file'")
         prompt = p.read_text().strip()
     prompt = prompt or _read_stdin() or ""
+
+    # Parse comma-separated story IDs
+    story_ids = [s.strip() for s in story_id.split(",") if s.strip()] if story_id else None
+
     click.echo(f"pralph implement — max {ctx.obj['max_iterations']} iterations")
     click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
@@ -572,15 +579,18 @@ def implement(ctx, story_id, phase1, review, compound, prompt, prompt_file, para
     click.echo(f"  compound: {'on' if compound else 'off'}")
     if parallel > 1:
         click.echo(f"  parallel: {parallel}")
-    if story_id:
-        click.echo(f"  story: {story_id}")
+    if story_ids:
+        click.echo(f"  stories: {', '.join(story_ids)}")
+        if with_deps:
+            click.echo(f"  with-deps: on")
 
     run_implement_loop(
         state,
         model=ctx.obj["model"],
         max_iterations=ctx.obj["max_iterations"],
         cooldown=ctx.obj["cooldown"],
-        story_id=story_id,
+        story_ids=story_ids,
+        with_deps=with_deps,
         phase1=phase1,
         review=review,
         compound=compound,
