@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pralph.runner import _start_esc_monitor, _stop_esc_monitor
+from pralph.terminal import start_esc_monitor, stop_esc_monitor
 
 
 @pytest.fixture()
@@ -19,7 +19,7 @@ def mock_proc():
 
 
 class TestStartEscMonitorPipedStdin:
-    """When stdin is not a TTY, _start_esc_monitor should open /dev/tty."""
+    """When stdin is not a TTY, start_esc_monitor should open /dev/tty."""
 
     def test_uses_dev_tty_when_stdin_is_pipe(self, mock_proc):
         mock_tty_file = MagicMock()
@@ -29,14 +29,14 @@ class TestStartEscMonitorPipedStdin:
         mock_stdin.fileno.return_value = 0
 
         with (
-            patch("pralph.runner.sys.stdin", mock_stdin),
-            patch("pralph.runner.os.isatty", return_value=False),
+            patch("pralph.terminal.sys.stdin", mock_stdin),
+            patch("pralph.terminal.os.isatty", return_value=False),
             patch("builtins.open", return_value=mock_tty_file) as mock_open,
-            patch("pralph.runner.termios.tcgetattr", return_value=[1, 2, 3]),
-            patch("pralph.runner.tty.setcbreak") as mock_setcbreak,
-            patch("pralph.runner.select.select", return_value=([], [], [])),
+            patch("pralph.terminal.termios.tcgetattr", return_value=[1, 2, 3]),
+            patch("pralph.terminal.tty.setcbreak") as mock_setcbreak,
+            patch("pralph.terminal.select.select", return_value=([], [], [])),
         ):
-            result = _start_esc_monitor(mock_proc)
+            result = start_esc_monitor(mock_proc)
 
             assert result is not None
             interrupted, stop, old_settings, tty_file = result
@@ -54,11 +54,11 @@ class TestStartEscMonitorPipedStdin:
         mock_stdin.fileno.return_value = 0
 
         with (
-            patch("pralph.runner.sys.stdin", mock_stdin),
-            patch("pralph.runner.os.isatty", return_value=False),
+            patch("pralph.terminal.sys.stdin", mock_stdin),
+            patch("pralph.terminal.os.isatty", return_value=False),
             patch("builtins.open", side_effect=OSError("No TTY")),
         ):
-            result = _start_esc_monitor(mock_proc)
+            result = start_esc_monitor(mock_proc)
             assert result is None
 
     def test_normal_tty_path_unchanged(self, mock_proc):
@@ -66,13 +66,13 @@ class TestStartEscMonitorPipedStdin:
         mock_stdin.fileno.return_value = 0
 
         with (
-            patch("pralph.runner.sys.stdin", mock_stdin),
-            patch("pralph.runner.os.isatty", return_value=True),
-            patch("pralph.runner.termios.tcgetattr", return_value=[1, 2, 3]),
-            patch("pralph.runner.tty.setcbreak") as mock_setcbreak,
-            patch("pralph.runner.select.select", return_value=([], [], [])),
+            patch("pralph.terminal.sys.stdin", mock_stdin),
+            patch("pralph.terminal.os.isatty", return_value=True),
+            patch("pralph.terminal.termios.tcgetattr", return_value=[1, 2, 3]),
+            patch("pralph.terminal.tty.setcbreak") as mock_setcbreak,
+            patch("pralph.terminal.select.select", return_value=([], [], [])),
         ):
-            result = _start_esc_monitor(mock_proc)
+            result = start_esc_monitor(mock_proc)
 
             assert result is not None
             interrupted, stop, old_settings, tty_file = result
@@ -84,7 +84,7 @@ class TestStartEscMonitorPipedStdin:
 
 
 class TestStopEscMonitorCleanup:
-    """_stop_esc_monitor should restore settings on the correct fd."""
+    """stop_esc_monitor should restore settings on the correct fd."""
 
     def test_restores_settings_on_tty_fd(self):
         mock_tty_file = MagicMock()
@@ -93,8 +93,8 @@ class TestStopEscMonitorCleanup:
         stop = threading.Event()
         monitor_state = (threading.Event(), stop, [1, 2, 3], mock_tty_file)
 
-        with patch("pralph.runner.termios.tcsetattr") as mock_tcsetattr:
-            _stop_esc_monitor(monitor_state)
+        with patch("pralph.terminal.termios.tcsetattr") as mock_tcsetattr:
+            stop_esc_monitor(monitor_state)
 
         assert stop.is_set()
         mock_tcsetattr.assert_called_once_with(42, termios.TCSADRAIN, [1, 2, 3])
@@ -107,13 +107,13 @@ class TestStopEscMonitorCleanup:
         monitor_state = (threading.Event(), stop, [1, 2, 3], None)
 
         with (
-            patch("pralph.runner.sys.stdin", mock_stdin),
-            patch("pralph.runner.termios.tcsetattr") as mock_tcsetattr,
+            patch("pralph.terminal.sys.stdin", mock_stdin),
+            patch("pralph.terminal.termios.tcsetattr") as mock_tcsetattr,
         ):
-            _stop_esc_monitor(monitor_state)
+            stop_esc_monitor(monitor_state)
 
         assert stop.is_set()
         mock_tcsetattr.assert_called_once_with(0, termios.TCSADRAIN, [1, 2, 3])
 
     def test_handles_none_state_gracefully(self):
-        _stop_esc_monitor(None)  # Should not raise
+        stop_esc_monitor(None)  # Should not raise
