@@ -11,88 +11,8 @@ from urllib.parse import unquote
 
 from pralph import db
 from pralph.models import StoryStatus
+from pralph.report import gather_report_data
 from pralph.state import StateManager
-
-def _gather_report(state: StateManager) -> dict:
-    """Gather report data using the state's current connection."""
-    conn = state._conn
-    pid = state.project_id
-
-    rows = conn.execute("SELECT * FROM phase_state WHERE project_id = ? ORDER BY phase", [pid])
-    cols = [d[0] for d in rows.description]
-    phase_states = [dict(zip(cols, r)) for r in rows.fetchall()]
-
-    current_phase = {}
-    for ps in phase_states:
-        if not ps.get("completed", False):
-            current_phase = ps
-            break
-    if not current_phase and phase_states:
-        current_phase = phase_states[-1]
-
-    rows = conn.execute(
-        "SELECT id, title, status, priority, category, complexity FROM stories WHERE project_id = ? ORDER BY priority, id",
-        [pid],
-    )
-    cols = [d[0] for d in rows.description]
-    stories = {r[0]: dict(zip(cols, r)) for r in rows.fetchall()}
-
-    rows = conn.execute(
-        "SELECT status, COUNT(*) FROM stories WHERE project_id = ? GROUP BY status", [pid]
-    )
-    status_counts = {r[0]: r[1] for r in rows.fetchall()}
-
-    rows = conn.execute(
-        """SELECT story_id,
-                  COUNT(*) as iterations,
-                  COALESCE(SUM(cost_usd), 0) as cost_usd,
-                  COALESCE(SUM(duration), 0) as duration
-           FROM run_log
-           WHERE project_id = ? AND story_id != '' AND mode = 'implement'
-           GROUP BY story_id ORDER BY cost_usd DESC""",
-        [pid],
-    )
-    story_costs = {}
-    for r in rows.fetchall():
-        story_costs[r[0]] = {"iterations": r[1], "cost_usd": r[2], "duration": r[3]}
-
-    rows = conn.execute(
-        "SELECT phase, COALESCE(SUM(cost_usd), 0) FROM run_log WHERE project_id = ? GROUP BY phase", [pid]
-    )
-    phase_costs = {r[0]: r[1] for r in rows.fetchall()}
-
-    row = conn.execute(
-        "SELECT COALESCE(SUM(duration), 0) FROM run_log WHERE project_id = ?", [pid]
-    ).fetchone()
-    total_duration = row[0] if row else 0.0
-
-    active_story = current_phase.get("active_story_id", "") or None
-
-    # Cost projection
-    implemented = status_counts.get("implemented", 0)
-    pending = status_counts.get("pending", 0) + status_counts.get("rework", 0)
-    avg_cost = sum(sc["cost_usd"] for sc in story_costs.values()) / max(implemented, 1) if story_costs else 0
-    avg_duration = sum(sc["duration"] for sc in story_costs.values()) / max(implemented, 1) if story_costs else 0
-
-    return {
-        "phase_states": phase_states,
-        "current_phase": current_phase,
-        "stories": stories,
-        "story_costs": story_costs,
-        "phase_costs": phase_costs,
-        "status_counts": status_counts,
-        "total_duration": total_duration,
-        "active_story": active_story,
-        "grand_total_cost": round(sum(phase_costs.values()), 4),
-        "projection": {
-            "implemented": implemented,
-            "remaining": pending,
-            "avg_cost_per_story": round(avg_cost, 4),
-            "avg_duration_per_story": round(avg_duration, 1),
-            "estimated_remaining_cost": round(avg_cost * pending, 2),
-            "estimated_remaining_duration": round(avg_duration * pending, 1),
-        },
-    }
 
 
 VIEWER_HTML = r"""<!DOCTYPE html>
@@ -1188,7 +1108,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_report(self):
-        data = _gather_report(self.state)
+        data = gather_report_data(self.state.project_id)
         self._json_response(data)
 
     def _serve_phases(self):
