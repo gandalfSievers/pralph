@@ -65,7 +65,7 @@ class OrderedGroup(click.Group):
 
     SECTIONS = [
         ("Workflow", ["plan", "stories", "webgen", "implement"]),
-        ("Replan", ["add", "ideate", "refine"]),
+        ("Replan", ["add", "ideate", "refine", "edit"]),
         ("Tools", ["compound", "reset-errors", "viewer", "query"]),
     ]
 
@@ -383,6 +383,158 @@ def refine(ctx, instruction, prompt, prompt_file, story_ids, id_pattern):
             click.echo(f"    {click.style(s.id, dim=True)}: {s.title}")
     else:
         click.echo(click.style("\n  Failed to refine stories", fg='red'))
+
+
+@main.command()
+@click.argument("story_id")
+@click.option("--title", default=None, help="New title")
+@click.option("--content", default=None, help="New content/description")
+@click.option("--priority", type=int, default=None, help="New priority (1=highest)")
+@click.option("--category", default=None, help="New category")
+@click.option("--complexity", default=None, help="New complexity (e.g. trivial, simple, medium, complex, large, epic)")
+@click.option("--status", type=click.Choice([s.value for s in StoryStatus]), default=None, help="New status")
+@click.option("--add-dep", multiple=True, help="Add dependency (story ID)")
+@click.option("--remove-dep", multiple=True, help="Remove dependency (story ID)")
+@click.option("--set-deps", default=None, help="Replace all dependencies (comma-separated IDs, or 'none')")
+@click.option("--add-criteria", multiple=True, help="Add acceptance criterion")
+@click.option("--remove-criteria", type=int, multiple=True, help="Remove acceptance criterion by index (0-based)")
+@click.option("--set-criteria", default=None, help="Replace all criteria (semicolon-separated)")
+@click.option("--delete", "do_delete", is_flag=True, help="Delete the story entirely")
+@click.option("--show", is_flag=True, help="Show story details (no changes)")
+@click.pass_context
+def edit(ctx, story_id, title, content, priority, category, complexity, status,
+         add_dep, remove_dep, set_deps, add_criteria, remove_criteria, set_criteria,
+         do_delete, show):
+    """Edit a story's fields directly (no AI involved).
+
+    \b
+    Examples:
+      pralph edit STORY-001 --title "New title"
+      pralph edit STORY-001 --priority 1 --status pending
+      pralph edit STORY-001 --add-dep STORY-002 --add-criteria "Must handle errors"
+      pralph edit STORY-001 --set-deps "STORY-002,STORY-003"
+      pralph edit STORY-001 --set-criteria "Criterion 1;Criterion 2;Criterion 3"
+      pralph edit STORY-001 --delete
+      pralph edit STORY-001 --show
+    """
+    state = _get_state(ctx)
+    stories = state.load_stories()
+    stories_by_id = {s.id: s for s in stories}
+
+    if story_id not in stories_by_id:
+        click.echo(click.style(f"Error: story '{story_id}' not found", fg="red"))
+        available = sorted(stories_by_id.keys())
+        if available:
+            click.echo(f"  Available: {', '.join(available[:20])}")
+            if len(available) > 20:
+                click.echo(f"  ... and {len(available) - 20} more")
+        raise SystemExit(1)
+
+    story = stories_by_id[story_id]
+
+    # Show mode
+    if show:
+        click.echo(f"\n  {click.style(story.id, fg='blue', bold=True)}: {story.title}")
+        click.echo(f"  Status:     {story.status.value}")
+        click.echo(f"  Priority:   {story.priority}")
+        click.echo(f"  Category:   {story.category}")
+        click.echo(f"  Complexity: {story.complexity}")
+        click.echo(f"  Source:     {story.source}")
+        click.echo(f"  Deps:       {', '.join(story.dependencies) or 'none'}")
+        click.echo(f"  Criteria:   {len(story.acceptance_criteria)} items")
+        for i, ac in enumerate(story.acceptance_criteria):
+            click.echo(f"    [{i}] {ac}")
+        if story.content:
+            click.echo(f"  Content:")
+            for line in story.content.split("\n")[:10]:
+                click.echo(f"    {line}")
+            if story.content.count("\n") > 10:
+                click.echo(f"    ... ({story.content.count(chr(10)) + 1} lines total)")
+        click.echo()
+        return
+
+    # Delete mode
+    if do_delete:
+        confirm = click.confirm(f"  Delete story {story_id} ({story.title})?")
+        if not confirm:
+            click.echo("  Cancelled")
+            return
+        if state.delete_story(story_id):
+            click.echo(click.style(f"  Deleted {story_id}", fg="green"))
+        else:
+            click.echo(click.style(f"  Failed to delete {story_id}", fg="red"))
+        return
+
+    # Collect changes
+    changes = []
+
+    if title is not None:
+        story.title = title
+        changes.append(f"title -> {title}")
+
+    if content is not None:
+        story.content = content
+        changes.append(f"content -> ({len(content)} chars)")
+
+    if priority is not None:
+        story.priority = priority
+        changes.append(f"priority -> {priority}")
+
+    if category is not None:
+        story.category = category
+        changes.append(f"category -> {category}")
+
+    if complexity is not None:
+        story.complexity = complexity
+        changes.append(f"complexity -> {complexity}")
+
+    if status is not None:
+        story.status = StoryStatus(status)
+        changes.append(f"status -> {status}")
+
+    # Dependencies
+    if set_deps is not None:
+        if set_deps.lower() == "none":
+            story.dependencies = []
+        else:
+            story.dependencies = [d.strip() for d in set_deps.split(",") if d.strip()]
+        changes.append(f"dependencies -> {story.dependencies}")
+    else:
+        if add_dep:
+            for dep in add_dep:
+                if dep not in story.dependencies:
+                    story.dependencies.append(dep)
+            changes.append(f"added deps: {list(add_dep)}")
+        if remove_dep:
+            story.dependencies = [d for d in story.dependencies if d not in remove_dep]
+            changes.append(f"removed deps: {list(remove_dep)}")
+
+    # Acceptance criteria
+    if set_criteria is not None:
+        story.acceptance_criteria = [c.strip() for c in set_criteria.split(";") if c.strip()]
+        changes.append(f"criteria -> {len(story.acceptance_criteria)} items")
+    else:
+        if add_criteria:
+            story.acceptance_criteria.extend(add_criteria)
+            changes.append(f"added {len(add_criteria)} criteria")
+        if remove_criteria:
+            indices = sorted(set(remove_criteria), reverse=True)
+            removed = 0
+            for idx in indices:
+                if 0 <= idx < len(story.acceptance_criteria):
+                    story.acceptance_criteria.pop(idx)
+                    removed += 1
+            changes.append(f"removed {removed} criteria")
+
+    if not changes:
+        click.echo("  No changes specified. Use --show to view, or pass options like --title, --priority, etc.")
+        click.echo("  Run 'pralph edit --help' for all options.")
+        return
+
+    state.update_story(story)
+    click.echo(click.style(f"  Updated {story_id}:", fg="green"))
+    for change in changes:
+        click.echo(f"    {change}")
 
 
 @main.command()

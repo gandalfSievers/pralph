@@ -6,10 +6,16 @@ lives in a single DuckDB file at ~/.pralph/pralph.duckdb, keyed by project_id
 
 Markdown files (design docs, guardrails, review feedback, prompt overrides)
 remain on disk under each project's .pralph/ directory.
+
+Connection strategy: short-lived connections opened per operation and closed
+immediately after. This avoids holding the DuckDB write lock while Claude
+runs (which can take minutes), allowing concurrent read access from other
+processes (e.g. `pralph query --report`).
 """
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
@@ -17,45 +23,12 @@ import duckdb
 _DB_DIR = Path.home() / ".pralph"
 _DB_PATH = _DB_DIR / "pralph.duckdb"
 
-_lock = threading.Lock()
-_conn: duckdb.DuckDBPyConnection | None = None
+_schema_initialized = False
+_schema_lock = threading.Lock()
 
 
-def get_connection() -> duckdb.DuckDBPyConnection:
-    """Return a module-level DuckDB connection (created on first call)."""
-    global _conn
-    if _conn is not None:
-        return _conn
-    with _lock:
-        if _conn is not None:
-            return _conn
-        _DB_DIR.mkdir(parents=True, exist_ok=True)
-        _conn = duckdb.connect(str(_DB_PATH))
-        _ensure_schema(_conn)
-        return _conn
-
-
-def get_readonly_connection() -> duckdb.DuckDBPyConnection:
-    """Return a read-only DuckDB connection that works even while another process writes.
-
-    DuckDB doesn't allow concurrent connections (even read-only) when a write lock
-    is held, so we snapshot the file to a temp copy and open that instead.
-    The caller should close the connection when done.
-    """
-    import shutil
-    import tempfile
-
-    if not _DB_PATH.exists():
-        raise FileNotFoundError(f"Database not found: {_DB_PATH}")
-    # Copy to a temp file so we don't conflict with the writer
-    tmp = tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False)
-    tmp.close()
-    shutil.copy2(str(_DB_PATH), tmp.name)
-    # Also copy WAL file if it exists
-    wal_path = Path(str(_DB_PATH) + ".wal")
-    if wal_path.exists():
-        shutil.copy2(str(wal_path), tmp.name + ".wal")
-    return duckdb.connect(tmp.name, read_only=True)
+def _ensure_db_dir() -> None:
+    _DB_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
@@ -159,6 +132,61 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             created_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
+
+
+def get_connection() -> duckdb.DuckDBPyConnection:
+    """Return a new short-lived DuckDB connection.
+
+    Callers should close the connection when done, ideally via the
+    `connection()` context manager. Schema is ensured on first call.
+    """
+    global _schema_initialized
+    _ensure_db_dir()
+    conn = duckdb.connect(str(_DB_PATH))
+    if not _schema_initialized:
+        with _schema_lock:
+            if not _schema_initialized:
+                _ensure_schema(conn)
+                _schema_initialized = True
+    return conn
+
+
+@contextmanager
+def connection():
+    """Context manager that yields a DuckDB connection and closes it on exit.
+
+    Usage:
+        with db.connection() as conn:
+            conn.execute("INSERT ...")
+    """
+    conn = get_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def get_readonly_connection() -> duckdb.DuckDBPyConnection:
+    """Return a read-only DuckDB connection that works even while another process writes.
+
+    DuckDB doesn't allow concurrent connections (even read-only) when a write lock
+    is held, so we snapshot the file to a temp copy and open that instead.
+    The caller should close the connection when done.
+    """
+    import shutil
+    import tempfile
+
+    if not _DB_PATH.exists():
+        raise FileNotFoundError(f"Database not found: {_DB_PATH}")
+    # Copy to a temp file so we don't conflict with the writer
+    tmp = tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False)
+    tmp.close()
+    shutil.copy2(str(_DB_PATH), tmp.name)
+    # Also copy WAL file if it exists
+    wal_path = Path(str(_DB_PATH) + ".wal")
+    if wal_path.exists():
+        shutil.copy2(str(wal_path), tmp.name + ".wal")
+    return duckdb.connect(tmp.name, read_only=True)
 
 
 def register_project(conn: duckdb.DuckDBPyConnection, project_id: str, name: str) -> None:

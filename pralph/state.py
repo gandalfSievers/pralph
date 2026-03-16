@@ -43,27 +43,66 @@ class StateManager:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._readonly = readonly
+        self.__conn: duckdb.DuckDBPyConnection | None = None
 
         # Resolve project_id from project.json or create it
         self.project_id = self._resolve_project_id(project_name)
 
-        # Initialize DuckDB
+        # Initialize DuckDB — short-lived connection for setup only
         if readonly:
-            self._conn = db.get_readonly_connection()
+            pass  # readonly connections opened on demand
         else:
-            self._conn = db.get_connection()
-            db.register_project(self._conn, self.project_id, self.project_dir.name)
+            with db.connection() as conn:
+                db.register_project(conn, self.project_id, self.project_dir.name)
+                if needs_migration(self.state_dir, self.project_id, conn):
+                    migrate_project(self.state_dir, self.project_id, conn)
 
-            # Auto-migrate existing JSONL data
-            if needs_migration(self.state_dir, self.project_id, self._conn):
-                migrate_project(self.state_dir, self.project_id, self._conn)
+    @property
+    def _conn(self) -> duckdb.DuckDBPyConnection:
+        """Return the currently held DuckDB connection.
+
+        All callers must be inside a _hold_conn() context. For read-only mode,
+        a persistent snapshot connection is used.
+        """
+        if self.__conn is not None:
+            return self.__conn
+        if self._readonly:
+            self.__conn = db.get_readonly_connection()
+            return self.__conn
+        raise RuntimeError("No held connection — wrap operation in _hold_conn()")
+
+    def _hold_conn(self):
+        """Context manager to hold a single connection open for batched operations.
+
+        Usage:
+            with self._hold_conn():
+                self._conn.execute(...)  # reuses same connection
+                self._conn.execute(...)
+            # connection closed here
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            if self.__conn is not None:
+                yield  # already held (nested or readonly)
+                return
+            self.__conn = db.get_connection()
+            try:
+                yield
+            finally:
+                self.__conn.close()
+                self.__conn = None
+
+        return _cm()
 
     def refresh_readonly(self) -> None:
         """Re-snapshot the database so reads see the latest data."""
         if not self._readonly:
             return
-        self._conn.close()
-        self._conn = db.get_readonly_connection()
+        if self.__conn is not None:
+            self.__conn.close()
+        self.__conn = db.get_readonly_connection()
 
     def _transient_write(self, sql: str, params: list) -> None:
         """Execute a write via a short-lived connection to the real database.
@@ -76,11 +115,8 @@ class StateManager:
         last_err: Exception | None = None
         for attempt in range(5):
             try:
-                conn = duckdb.connect(str(db._DB_PATH))
-                try:
+                with db.connection() as conn:
                     conn.execute(sql, params)
-                finally:
-                    conn.close()
                 return
             except duckdb.IOException as e:
                 last_err = e
@@ -240,30 +276,32 @@ class StateManager:
     # -- phase1 analysis (DuckDB) --
 
     def has_phase1_analysis(self) -> bool:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM phase1_analysis WHERE project_id = ?",
-            [self.project_id],
-        ).fetchone()
-        return row is not None and row[0] > 0
+        with self._hold_conn():
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM phase1_analysis WHERE project_id = ?",
+                [self.project_id],
+            ).fetchone()
+            return row is not None and row[0] > 0
 
     def load_phase1_analysis(self) -> dict | None:
-        row = self._conn.execute(
-            "SELECT data FROM phase1_analysis WHERE project_id = ?",
-            [self.project_id],
-        ).fetchone()
-        if row is None:
-            return None
-        return json.loads(row[0])
+        with self._hold_conn():
+            row = self._conn.execute(
+                "SELECT data FROM phase1_analysis WHERE project_id = ?",
+                [self.project_id],
+            ).fetchone()
+            if row is None:
+                return None
+            return json.loads(row[0])
 
     def save_phase1_analysis(self, data: dict) -> None:
-        with self._lock:
+        with self._lock, self._hold_conn():
             self._conn.execute(
                 "INSERT OR REPLACE INTO phase1_analysis (project_id, data) VALUES (?, ?)",
                 [self.project_id, json.dumps(data)],
             )
 
     def delete_phase1_analysis(self) -> None:
-        with self._lock:
+        with self._lock, self._hold_conn():
             self._conn.execute(
                 "DELETE FROM phase1_analysis WHERE project_id = ?",
                 [self.project_id],
@@ -287,22 +325,24 @@ class StateManager:
             sql += f" AND ({where})"
             if params:
                 p.extend(params)
-        result = self._conn.execute(sql, p)
-        cols = [desc[0] for desc in result.description]
-        return [_row_to_story(row, cols) for row in result.fetchall()]
+        with self._hold_conn():
+            result = self._conn.execute(sql, p)
+            cols = [desc[0] for desc in result.description]
+            return [_row_to_story(row, cols) for row in result.fetchall()]
 
     def load_stories(self) -> list[Story]:
         return self._query_stories()
 
     def has_stories(self) -> bool:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM stories WHERE project_id = ?",
-            [self.project_id],
-        ).fetchone()
-        return row is not None and row[0] > 0
+        with self._hold_conn():
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM stories WHERE project_id = ?",
+                [self.project_id],
+            ).fetchone()
+            return row is not None and row[0] > 0
 
     def append_stories(self, stories: list[Story]) -> None:
-        with self._lock:
+        with self._lock, self._hold_conn():
             for s in stories:
                 self._conn.execute(
                     """INSERT OR IGNORE INTO stories
@@ -337,7 +377,7 @@ class StateManager:
 
     def reset_error_stories(self) -> list[Story]:
         """Find stories with error status and reset them to pending."""
-        with self._lock:
+        with self._lock, self._hold_conn():
             error_stories = self._query_stories("status = ?", ["error"])
             if not error_stories:
                 return []
@@ -362,7 +402,7 @@ class StateManager:
 
     def recover_orphaned_stories(self) -> list[Story]:
         """Find in_progress stories (orphans from crashes) and reset to pending."""
-        with self._lock:
+        with self._lock, self._hold_conn():
             in_progress = self._query_stories("status = ?", ["in_progress"])
             if not in_progress:
                 return []
@@ -391,11 +431,12 @@ class StateManager:
             return in_progress
 
     def get_story_ids(self) -> set[str]:
-        rows = self._conn.execute(
-            "SELECT id FROM stories WHERE project_id = ?",
-            [self.project_id],
-        ).fetchall()
-        return {row[0] for row in rows}
+        with self._hold_conn():
+            rows = self._conn.execute(
+                "SELECT id FROM stories WHERE project_id = ?",
+                [self.project_id],
+            ).fetchall()
+            return {row[0] for row in rows}
 
     def get_category_stats(self) -> dict[str, dict[str, int]]:
         stats: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "next_id": 1})
@@ -443,7 +484,7 @@ class StateManager:
         error_reason: str = "",
         error_output: str = "",
     ) -> None:
-        with self._lock:
+        with self._lock, self._hold_conn():
             log_extra = dict(extra or {})
             if error_reason:
                 log_extra["error_reason"] = error_reason
@@ -500,7 +541,7 @@ class StateManager:
                     ],
                 )
             return
-        with self._lock:
+        with self._lock, self._hold_conn():
             for s in stories:
                 self._conn.execute(
                     """UPDATE stories SET
@@ -517,43 +558,69 @@ class StateManager:
                     ],
                 )
 
+    def update_story(self, story: Story) -> None:
+        """Update a single story's fields in DuckDB."""
+        self._rewrite_stories([story])
+
+    def delete_story(self, story_id: str) -> bool:
+        """Delete a story by ID. Returns True if a row was deleted."""
+        with self._lock, self._hold_conn():
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM stories WHERE project_id = ? AND id = ?",
+                [self.project_id, story_id],
+            ).fetchone()
+            if not row or row[0] == 0:
+                return False
+            self._conn.execute(
+                "DELETE FROM stories WHERE project_id = ? AND id = ?",
+                [self.project_id, story_id],
+            )
+            self._conn.execute(
+                """INSERT INTO status_log (project_id, story_id, status, summary, extra)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [self.project_id, story_id, "deleted", "Deleted via edit command", "{}"],
+            )
+            return True
+
     def get_implemented_summary(self) -> str:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM status_log WHERE project_id = ?",
-            [self.project_id],
-        ).fetchone()
-        count = row[0] if row else 0
-        if count == 0:
-            return ""
-        return f"## Previously Implemented Stories\n\n{count} status transitions tracked in DuckDB"
+        with self._hold_conn():
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM status_log WHERE project_id = ?",
+                [self.project_id],
+            ).fetchone()
+            count = row[0] if row else 0
+            if count == 0:
+                return ""
+            return f"## Previously Implemented Stories\n\n{count} status transitions tracked in DuckDB"
 
     def load_status_log(self) -> list[dict]:
         """Load all status log entries for this project."""
-        result = self._conn.execute(
-            "SELECT story_id, status, summary, extra, logged_at FROM status_log WHERE project_id = ? ORDER BY logged_at",
-            [self.project_id],
-        )
-        cols = [desc[0] for desc in result.description]
-        entries = []
-        for row in result.fetchall():
-            d = dict(zip(cols, row))
-            # Merge extra fields into the dict for backward compatibility
-            extra = json.loads(d.pop("extra", "{}"))
-            d.update(extra)
-            entries.append(d)
-        return entries
+        with self._hold_conn():
+            result = self._conn.execute(
+                "SELECT story_id, status, summary, extra, logged_at FROM status_log WHERE project_id = ? ORDER BY logged_at",
+                [self.project_id],
+            )
+            cols = [desc[0] for desc in result.description]
+            entries = []
+            for row in result.fetchall():
+                d = dict(zip(cols, row))
+                extra = json.loads(d.pop("extra", "{}"))
+                d.update(extra)
+                entries.append(d)
+            return entries
 
     # -- phase state (DuckDB) --
 
     def load_phase_state(self, phase: str) -> PhaseState:
-        result = self._conn.execute(
-            "SELECT * FROM phase_state WHERE project_id = ? AND phase = ?",
-            [self.project_id, phase],
-        )
-        row = result.fetchone()
-        if row is None:
-            return PhaseState(phase=phase)
-        cols = [desc[0] for desc in result.description]
+        with self._hold_conn():
+            result = self._conn.execute(
+                "SELECT * FROM phase_state WHERE project_id = ? AND phase = ?",
+                [self.project_id, phase],
+            )
+            row = result.fetchone()
+            if row is None:
+                return PhaseState(phase=phase)
+            cols = [desc[0] for desc in result.description]
         d = dict(zip(cols, row))
         return PhaseState(
             phase=d["phase"],
@@ -571,7 +638,7 @@ class StateManager:
         )
 
     def save_phase_state(self, state: PhaseState) -> None:
-        with self._lock:
+        with self._lock, self._hold_conn():
             self._conn.execute(
                 """INSERT OR REPLACE INTO phase_state
                    (project_id, phase, current_iteration, consecutive_empty,
@@ -599,7 +666,7 @@ class StateManager:
     # -- run log (DuckDB) --
 
     def log_iteration(self, result: IterationResult) -> None:
-        with self._lock:
+        with self._lock, self._hold_conn():
             self._conn.execute(
                 """INSERT INTO run_log
                    (project_id, iteration, phase, mode, success, stories_generated,
@@ -628,26 +695,27 @@ class StateManager:
 
     def get_story_tokens(self) -> dict[str, dict[str, int]]:
         """Aggregate tokens per story from run_log."""
-        rows = self._conn.execute(
-            """SELECT story_id,
-                      SUM(input_tokens) as input_tokens,
-                      SUM(output_tokens) as output_tokens,
-                      SUM(cache_read_input_tokens) as cache_read_input_tokens,
-                      SUM(cache_creation_input_tokens) as cache_creation_input_tokens
-               FROM run_log
-               WHERE project_id = ? AND story_id != ''
-               GROUP BY story_id""",
-            [self.project_id],
-        ).fetchall()
-        totals: dict[str, dict[str, int]] = {}
-        for row in rows:
-            totals[row[0]] = {
-                "input_tokens": int(row[1] or 0),
-                "output_tokens": int(row[2] or 0),
-                "cache_read_input_tokens": int(row[3] or 0),
-                "cache_creation_input_tokens": int(row[4] or 0),
-            }
-        return totals
+        with self._hold_conn():
+            rows = self._conn.execute(
+                """SELECT story_id,
+                          SUM(input_tokens) as input_tokens,
+                          SUM(output_tokens) as output_tokens,
+                          SUM(cache_read_input_tokens) as cache_read_input_tokens,
+                          SUM(cache_creation_input_tokens) as cache_creation_input_tokens
+                   FROM run_log
+                   WHERE project_id = ? AND story_id != ''
+                   GROUP BY story_id""",
+                [self.project_id],
+            ).fetchall()
+            totals: dict[str, dict[str, int]] = {}
+            for row in rows:
+                totals[row[0]] = {
+                    "input_tokens": int(row[1] or 0),
+                    "output_tokens": int(row[2] or 0),
+                    "cache_read_input_tokens": int(row[3] or 0),
+                    "cache_creation_input_tokens": int(row[4] or 0),
+                }
+            return totals
 
     # -- solutions (compound learning) --
 
@@ -656,11 +724,12 @@ class StateManager:
         return self.state_dir / "solutions"
 
     def has_solutions(self) -> bool:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM solutions_index WHERE project_id = ?",
-            [self.project_id],
-        ).fetchone()
-        return row is not None and row[0] > 0
+        with self._hold_conn():
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM solutions_index WHERE project_id = ?",
+                [self.project_id],
+            ).fetchone()
+            return row is not None and row[0] > 0
 
     def save_solution(
         self,
@@ -670,7 +739,7 @@ class StateManager:
         index_entry: dict,
     ) -> Path:
         """Write a solution markdown file and add to DuckDB index."""
-        with self._lock:
+        with self._lock, self._hold_conn():
             cat_dir = self.solutions_dir / category
             cat_dir.mkdir(parents=True, exist_ok=True)
             solution_path = cat_dir / filename
@@ -695,17 +764,18 @@ class StateManager:
 
     def load_solutions_index(self) -> list[dict]:
         """Read all solution index entries for this project."""
-        result = self._conn.execute(
-            "SELECT title, category, filename, tags, error_signature, story_id FROM solutions_index WHERE project_id = ?",
-            [self.project_id],
-        )
-        cols = [desc[0] for desc in result.description]
-        entries = []
-        for row in result.fetchall():
-            d = dict(zip(cols, row))
-            d["tags"] = json.loads(d.get("tags", "[]"))
-            entries.append(d)
-        return entries
+        with self._hold_conn():
+            result = self._conn.execute(
+                "SELECT title, category, filename, tags, error_signature, story_id FROM solutions_index WHERE project_id = ?",
+                [self.project_id],
+            )
+            cols = [desc[0] for desc in result.description]
+            entries = []
+            for row in result.fetchall():
+                d = dict(zip(cols, row))
+                d["tags"] = json.loads(d.get("tags", "[]"))
+                entries.append(d)
+            return entries
 
     def search_solutions(self, query: str, max_results: int = 5) -> list[dict]:
         """Keyword search on title/tags/error_signature."""
