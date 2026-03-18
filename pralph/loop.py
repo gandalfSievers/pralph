@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import random
 import time
-import uuid
 from datetime import datetime
 from typing import Callable
 
@@ -40,6 +39,7 @@ from pralph.runner import (
     STORIES_TOOLS_EXTRACT,
     STORIES_TOOLS_RESEARCH,
     ClaudeResult,
+    make_session_id,
     run_with_retry,
 )
 from pralph.terminal import resume_interactive
@@ -238,7 +238,7 @@ def run_plan_loop(
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
         prompt = assemble_plan_prompt(state, iteration=i, total=total, user_prompt=user_prompt, phase_state=ps)
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "plan")
         ps.active_session_id = sid
         ps.active_session_started = datetime.now().isoformat()
         state.save_phase_state(ps)
@@ -346,7 +346,7 @@ def run_stories_loop(
         prompt = assemble_stories_prompt(state, mode=mode, phase_state=ps)
         tools = STORIES_TOOLS_RESEARCH if mode == "research" else STORIES_TOOLS_EXTRACT
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "stories")
         ps.active_session_id = sid
         ps.active_session_started = datetime.now().isoformat()
         state.save_phase_state(ps)
@@ -632,7 +632,7 @@ def run_ideate_loop(
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
         prompt = assemble_ideate_prompt(state, ideas_text=ideas_text, phase_state=ps)
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "ideate")
         ps.active_session_id = sid
         ps.active_session_started = datetime.now().isoformat()
         state.save_phase_state(ps)
@@ -764,7 +764,7 @@ def run_webgen_loop(
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
         prompt = assemble_stories_prompt(state, mode="webgen", phase_state=ps)
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "webgen")
         ps.active_session_id = sid
         ps.active_session_started = datetime.now().isoformat()
         state.save_phase_state(ps)
@@ -1103,7 +1103,7 @@ def run_implement_loop(
 
         prompt = assemble_implement_prompt(state, story, phase_state=ps, user_prompt=user_prompt)
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "implement", story.id, story.title)
         ps.active_session_id = sid
         ps.active_story_id = story.id
         ps.active_session_started = datetime.now().isoformat()

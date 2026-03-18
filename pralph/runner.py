@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -54,6 +55,21 @@ ADD_TOOLS = "Read,Glob,Grep"
 IDEATE_TOOLS = "Read,Glob,Grep,WebSearch,WebFetch"
 REFINE_TOOLS = "Read,Glob,Grep"
 
+_SLUG_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+
+
+def make_session_id(project_id: str, phase: str, story_id: str = "", title: str = "") -> str:
+    """Build a human-readable session ID: {project_id}-{phase}[-{story_id}[-{title}]]-{short_uuid}."""
+    parts = [_SLUG_RE.sub("-", project_id), phase]
+    if story_id:
+        parts.append(_SLUG_RE.sub("-", story_id))
+    if title:
+        slug = _SLUG_RE.sub("-", title.lower()).strip("-")[:40].rstrip("-")
+        if slug:
+            parts.append(slug)
+    parts.append(uuid.uuid4().hex[:8])
+    return "-".join(parts)
+
 
 def run_claude(
     prompt: str,
@@ -83,7 +99,7 @@ def run_claude(
         if dangerously_skip_permissions:
             cmd.append("--dangerously-skip-permissions")
     else:
-        session_id = session_id or str(uuid.uuid4())
+        session_id = session_id or uuid.uuid4().hex[:8]
         cmd = [
             "claude", "-p", "--verbose", "--model", model,
             "--output-format", "stream-json", "--session-id", session_id,
@@ -525,13 +541,14 @@ def run_claude_parallel(
     timeout: int = 600,
     verbose: bool = False,
     project_dir: str | None = None,
+    session_id: str | None = None,
 ) -> ClaudeResult:
     """Invoke claude -p as a subprocess for parallel mode.
 
     Registers/unregisters with ProcessGroup instead of managing its own ESC monitor.
     Prefixes output with [story_id]. No timer management (handled centrally).
     """
-    session_id = str(uuid.uuid4())
+    session_id = session_id or uuid.uuid4().hex[:8]
     cmd = [
         "claude", "-p", "--verbose", "--model", model,
         "--output-format", "stream-json", "--session-id", session_id,

@@ -11,7 +11,7 @@ from pralph.compound import CompoundResult, run_compound_capture
 from pralph.models import IterationResult, PhaseState, Story, StoryStatus
 from pralph.parser import parse_implement_output
 from pralph.review import ReviewResult, run_review
-from pralph.runner import ClaudeResult, run_with_retry_parallel
+from pralph.runner import ClaudeResult, make_session_id, run_with_retry_parallel
 from pralph.terminal import ProcessGroup, handle_parallel_interrupt
 from pralph.state import StateManager
 
@@ -151,6 +151,7 @@ def run_parallel_implement(
     def _implement_one_story(story: Story) -> tuple[Story, ClaudeResult, dict]:
         """Worker function: implement a single story. Returns (story, claude_result, parsed)."""
         prompt = assemble_implement_prompt(state, story, phase_state=ps, user_prompt=user_prompt)
+        sid = make_session_id(state.project_id, "implement", story.id, story.title)
         result = run_with_retry_parallel(
             prompt,
             story_id=story.id,
@@ -163,6 +164,7 @@ def run_parallel_implement(
             timeout=1800,
             verbose=verbose,
             project_dir=str(state.project_dir),
+            session_id=sid,
         )
         parsed = {}
         if result.success:
