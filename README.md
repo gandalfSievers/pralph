@@ -10,6 +10,7 @@
 - [Usage](#usage)
   - [Standard workflow](#standard-workflow)
   - [Adding stories later](#adding-stories-later)
+  - [Justloop](#justloop)
   - [Compound learning](#compound-learning)
   - [Piping from stdin](#piping-from-stdin)
   - [Global options](#global-options)
@@ -121,6 +122,41 @@ pralph compound --prompt "Fixed CORS issue by adding middleware"
 pralph compound --story-id AUTH-001
 ```
 
+### Justloop
+
+A simple loop for running any prompt to completion without the full plan/stories/implement workflow. Give it a task and pralph handles the rest — it wraps the prompt with proper end conditions, runs it in a loop, and stops when Claude signals the task is done.
+
+```bash
+# Positional arguments
+pralph justloop "refactor the auth module to use JWT tokens"
+
+# Multi-word prompts work naturally
+pralph justloop fix all linting errors and update deprecated API calls
+
+# Via --prompt flag
+pralph justloop --prompt "add comprehensive test coverage for the utils module"
+
+# Piped from stdin
+gh issue view 42 --json body -q .body | pralph justloop
+
+# Reset and re-run
+pralph justloop --reset "migrate database schema to v2"
+```
+
+Each iteration has full tool access (Read, Write, Edit, Bash, Glob, Grep) and resume context from prior iterations. The loop terminates when Claude determines the task is fully complete, after 5 consecutive errors, or when max iterations is reached.
+
+**Tip: review-driven fix loop** — A powerful pattern is to first run Claude Code's `/review` command on your codebase and have it write the issues to a file, then let justloop work through them one by one:
+
+```bash
+# Step 1: In Claude Code, run /review and ask it to save issues to a markdown file
+#   e.g. "/review the codebase and write all issues to issues.md, ordered by severity"
+
+# Step 2: Let justloop fix them
+pralph justloop "Read issues.md. Pick the highest severity unresolved issue, fix it, then update issues.md to mark it as resolved."
+```
+
+Each iteration fixes one issue and updates the tracking file, giving you a clean audit trail. The loop stops when all issues are resolved.
+
 ### Compound learning
 
 Inspired by the [compound-engineering-plugin](https://github.com/EveryInc/compound-engineering-plugin), compound learning captures non-trivial solutions as structured documentation after each implementation.
@@ -149,6 +185,7 @@ echo "internationalization support" | pralph ideate
 echo "split into login and registration" | pralph refine -s AUTH-001
 echo "use vanilla JS" | pralph implement
 echo "Fixed CORS issue by adding middleware" | pralph compound
+echo "fix all linting errors" | pralph justloop
 
 # Compose with other tools
 cat requirements.txt | pralph plan
@@ -229,6 +266,15 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `--review` / `--no-review` | on | Run reviewer after each implementation |
 | `--compound` / `--no-compound` | off | Capture learnings after each story |
 | `--prompt` | — | Guidance for implementation (e.g. "use FastAPI") |
+| `--reset` | off | Reset phase state and start fresh |
+
+#### `justloop`
+
+Accepts the task as positional arguments (e.g. `pralph justloop fix all linting errors`).
+
+| Option | Default | Description |
+|---|---|---|
+| `--prompt` | — | Task prompt (alternative to positional args) |
 | `--reset` | off | Reset phase state and start fresh |
 
 #### `compound`
@@ -345,6 +391,7 @@ Use project-level overrides to tailor behavior for a specific project, or home-l
 | `implement-phase1-analyze.md` | Implement | Architecture-first grouping analysis |
 | `implement-phase1.md` | Implement | Phase 1 batch implementation |
 | `review.md` | Implement | Code review after implementation |
+| `justloop.md` | Justloop | Task execution prompt with completion signal |
 | `compound.md` | Compound | Solution capture after implementation |
 
 Templates use `{{variable}}` placeholders that are substituted at runtime (e.g. `{{design_doc}}`, `{{user_prompt}}`, `{{existing_stories}}`). Check the built-in defaults in `pralph/prompts/` to see which variables each template expects.

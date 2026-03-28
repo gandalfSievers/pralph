@@ -14,6 +14,7 @@ from pralph.prompts.implement import (
 from pralph.prompts.review import REVIEW_PROMPT
 from pralph.prompts.plan import INITIAL_PLAN_PROMPT, ITERATION_PROMPT_TEMPLATE
 from pralph.prompts.ideate import ADD_STORY_PROMPT, IDEATE_PROMPT, REFINE_PROMPT
+from pralph.prompts.justloop import JUSTLOOP_PROMPT
 from pralph.prompts.stories import (
     PLANNING_EXTRACT_PROMPT,
     PLANNING_RESEARCH_PROMPT,
@@ -517,3 +518,20 @@ def build_guardrails_system_prompt(phase: str, state: StateManager) -> str:
         parts.append(DEFAULT_GUARDRAILS)
 
     return "\n\n".join(parts)
+
+
+# -- Justloop prompts --
+
+
+def assemble_justloop_prompt(
+    state: StateManager,
+    *,
+    user_prompt: str,
+    phase_state: PhaseState | None = None,
+) -> str:
+    """Build the prompt for a justloop iteration."""
+    resume = _build_resume_context(phase_state)
+
+    prompt = state.resolve_prompt_template("justloop", JUSTLOOP_PROMPT)
+    prompt = _safe_sub(prompt, "user_prompt", _escape_template_vars(user_prompt))
+    return prompt + resume

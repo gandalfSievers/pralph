@@ -6,7 +6,7 @@ import sys
 import click
 
 from pralph import __version__
-from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_plan_loop, run_refine, run_stories_loop, run_webgen_loop
+from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_stories_loop, run_webgen_loop
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
 from pralph.state import StateManager
@@ -49,7 +49,7 @@ class OrderedGroup(click.Group):
     SECTIONS = [
         ("Workflow", ["plan", "stories", "webgen", "implement"]),
         ("Replan", ["add", "ideate", "refine"]),
-        ("Tools", ["compound", "reset-errors", "viewer"]),
+        ("Tools", ["justloop", "compound", "reset-errors", "viewer"]),
     ]
 
     def list_commands(self, ctx):
@@ -392,6 +392,43 @@ def implement(ctx, story_id, phase1, review, compound, prompt, reset):
         review=review,
         compound=compound,
         user_prompt=prompt,
+        extra_tools=_get_extra_tools(ctx, state),
+        verbose=ctx.obj["verbose"],
+        dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
+        max_budget_usd=ctx.obj["max_budget_usd"],
+    )
+
+
+@main.command()
+@click.argument("prompt_args", nargs=-1)
+@click.option("--prompt", default=None, help="Task prompt (prompted if omitted)")
+@click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
+@click.pass_context
+def justloop(ctx, prompt_args, prompt, reset):
+    """Run a prompt in a loop until complete."""
+    state = StateManager(ctx.obj["project_dir"])
+    if reset:
+        _reset_phase(state, "justloop")
+
+    # Resolve prompt: positional args > --prompt > stdin > interactive
+    if prompt_args:
+        user_prompt = " ".join(prompt_args)
+    elif prompt:
+        user_prompt = prompt
+    else:
+        user_prompt = _resolve_prompt(None, "Task prompt")
+
+    click.echo(f"pralph justloop — max {ctx.obj['max_iterations']} iterations")
+    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  model: {ctx.obj['model']}")
+    click.echo(f"  prompt: {user_prompt[:120]}")
+
+    run_justloop(
+        state,
+        user_prompt=user_prompt,
+        model=ctx.obj["model"],
+        max_iterations=ctx.obj["max_iterations"],
+        cooldown=ctx.obj["cooldown"],
         extra_tools=_get_extra_tools(ctx, state),
         verbose=ctx.obj["verbose"],
         dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
