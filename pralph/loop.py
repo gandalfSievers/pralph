@@ -994,8 +994,11 @@ def run_implement_loop(
             group = data["phase_1_group"]
             reasoning = data.get("reasoning", {})
             click.echo(click.style(f"  Phase 1 group ({len(group)} stories):", fg='blue', bold=True) + f" {', '.join(group)}")
-            for sid, reason in reasoning.items():
-                click.echo(f"    {click.style(sid, fg='blue')}: {reason[:80]}")
+            if isinstance(reasoning, dict):
+                for sid, reason in reasoning.items():
+                    click.echo(f"    {click.style(sid, fg='blue')}: {reason[:80]}")
+            elif reasoning:
+                click.echo(f"    {str(reasoning)[:120]}")
 
             return IterationResult(
                 iteration=i, phase="implement", mode="phase1_analyze",
