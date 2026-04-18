@@ -57,6 +57,103 @@ _DOMAIN_DETECTION_RULES: list[tuple[str, str]] = [
     ("Podfile", "cocoapods"),
 ]
 
+# Secondary tag-to-domain associations for common keywords that aren't exact
+# domain names but strongly imply one.
+_TAG_DOMAIN_HINTS: dict[str, str] = {
+    "container": "docker",
+    "dockerfile": "docker",
+    "docker-compose": "docker",
+    "pip": "python",
+    "pytest": "python",
+    "pyproject": "python",
+    "npm": "typescript",
+    "yarn": "typescript",
+    "node": "typescript",
+    "cargo": "rust",
+    "crate": "rust",
+    "helm": "kubernetes",
+    "k8s": "kubernetes",
+    "pod": "kubernetes",
+    "gradle": "java",
+    "maven": "java",
+    "cocoapods": "cocoapods",
+    "xcode": "swift-ios",
+    "swift-package": "swift-ios",
+    "flutter": "flutter",
+    "dart": "flutter",
+    "tf": "terraform",
+    "hcl": "terraform",
+}
+
+# Known error prefixes/substrings mapped to domains.
+_ERROR_DOMAIN_HINTS: list[tuple[str, str]] = [
+    ("ModuleNotFoundError", "python"),
+    ("ImportError", "python"),
+    ("SyntaxError", "python"),
+    ("IndentationError", "python"),
+    ("cannot find module", "typescript"),
+    ("Module not found", "typescript"),
+    ("TS2305", "typescript"),
+    ("TS2307", "typescript"),
+    ("ReferenceError", "javascript"),
+    ("cargo build", "rust"),
+    ("rustc", "rust"),
+    ("go build", "go"),
+    ("undefined reference", "cpp"),
+]
+
+
+def _infer_solution_domains(
+    related_files: list[str],
+    tags: list[str],
+    error_signature: str,
+    available_domains: list[str],
+) -> set[str]:
+    """Infer which domain(s) a solution applies to from its metadata.
+
+    Returns the subset of *available_domains* that match.  Returns an empty set
+    if nothing could be inferred (caller should fall back to all domains).
+    """
+    import fnmatch as _fnmatch
+
+    all_domains_set = set(available_domains)
+    matched: set[str] = set()
+
+    # A) File-extension matching via _DOMAIN_DETECTION_RULES
+    for fpath in related_files:
+        fname = fpath.rsplit("/", 1)[-1] if "/" in fpath else fpath
+        for pattern, domain in _DOMAIN_DETECTION_RULES:
+            if "/" in pattern:
+                continue  # skip path-based rules
+            if _fnmatch.fnmatch(fname, pattern):
+                matched.add(domain)
+
+    # B) Tag matching — exact domain name or hint lookup
+    for tag in tags:
+        tag_lower = tag.lower()
+        if tag_lower in all_domains_set:
+            matched.add(tag_lower)
+        if tag_lower in _TAG_DOMAIN_HINTS:
+            matched.add(_TAG_DOMAIN_HINTS[tag_lower])
+
+    # C) Error signature matching
+    if error_signature:
+        sig_lower = error_signature.lower()
+        for pattern, domain in _ERROR_DOMAIN_HINTS:
+            if pattern.lower() in sig_lower:
+                matched.add(domain)
+
+    # D) Intersect with available domains
+    return matched & all_domains_set
+
+
+def _safe_resolve(base: Path, untrusted: str) -> Path | None:
+    """Resolve *untrusted* relative to *base*, returning None if it escapes."""
+    resolved = (base / untrusted).resolve()
+    if not resolved.is_relative_to(base.resolve()):
+        return None
+    return resolved
+
 
 class StateManager:
     def __init__(self, project_dir: str, *, domains: list[str] | None = None) -> None:
@@ -64,6 +161,7 @@ class StateManager:
         self.state_dir = self.project_dir / ".pralph"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._domain_override = domains
+        self._detected_domains: list[str] | None = None
 
     # -- config --
 
@@ -145,15 +243,21 @@ class StateManager:
         """Return the active domains for this project.
 
         Resolution order: CLI override > .pralph/domains.txt > auto-detect from files.
+        Results are cached for the lifetime of this StateManager instance.
         """
+        if self._detected_domains is not None:
+            return self._detected_domains
+
         if self._domain_override:
-            return self._domain_override
+            self._detected_domains = self._domain_override
+            return self._detected_domains
 
         # Project-level explicit config
         if self.domains_path.exists():
             raw = self.domains_path.read_text().strip()
             if raw:
-                return [d.strip() for d in raw.splitlines() if d.strip() and not d.strip().startswith("#")]
+                self._detected_domains = [d.strip() for d in raw.splitlines() if d.strip() and not d.strip().startswith("#")]
+                return self._detected_domains
 
         # Auto-detect from project files (only scan top two levels for speed)
         import fnmatch as _fnmatch
@@ -162,7 +266,8 @@ class StateManager:
         try:
             entries = list(self.project_dir.iterdir())
         except OSError:
-            return []
+            self._detected_domains = []
+            return self._detected_domains
 
         # Level 0 (project root)
         names_l0 = [e.name for e in entries]
@@ -198,7 +303,8 @@ class StateManager:
                             found.add(domain)
                             break
 
-        return sorted(found)
+        self._detected_domains = sorted(found)
+        return self._detected_domains
 
     def read_phase_prompt(self, phase: str) -> str:
         # Project-level overrides home-level
@@ -536,9 +642,10 @@ class StateManager:
         index_entry: dict,
     ) -> Path:
         """Write a solution markdown file and append to index."""
-        cat_dir = self.solutions_dir / category
-        cat_dir.mkdir(parents=True, exist_ok=True)
-        solution_path = cat_dir / filename
+        solution_path = _safe_resolve(self.solutions_dir, f"{category}/{filename}")
+        if solution_path is None:
+            raise ValueError(f"Invalid solution path: {category}/{filename}")
+        solution_path.parent.mkdir(parents=True, exist_ok=True)
         solution_path.write_text(content)
 
         # Append index entry
@@ -564,45 +671,10 @@ class StateManager:
                 continue
         return entries
 
-    def search_solutions(self, query: str, max_results: int = 5) -> list[dict]:
-        """Keyword search on title/tags/error_signature."""
-        entries = self.load_solutions_index()
-        if not entries:
-            return []
-
-        query_lower = query.lower()
-        keywords = query_lower.split()
-
-        scored: list[tuple[int, dict]] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            score = 0
-            title = (entry.get("title") or "").lower()
-            tags = [t.lower() for t in (entry.get("tags") or [])]
-            error_sig = (entry.get("error_signature") or "").lower()
-            category = (entry.get("category") or "").lower()
-
-            for kw in keywords:
-                if kw in title:
-                    score += 3
-                if any(kw in tag for tag in tags):
-                    score += 2
-                if kw in error_sig:
-                    score += 2
-                if kw in category:
-                    score += 1
-
-            if score > 0:
-                scored.append((score, entry))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [entry for _, entry in scored[:max_results]]
-
     def read_solution(self, filename: str) -> str:
         """Read a specific solution file."""
-        path = self.solutions_dir / filename
-        if path.exists():
+        path = _safe_resolve(self.solutions_dir, filename)
+        if path is not None and path.exists():
             return path.read_text()
         return ""
 
@@ -642,14 +714,26 @@ class StateManager:
         content: str,
         index_entry: dict,
     ) -> list[Path]:
-        """Save a solution to ~/.pralph/solutions/{domain}/ for each detected domain.
+        """Save a solution to ~/.pralph/solutions/{domain}/ for relevant detected domains.
+
+        Uses heuristics (related_files, tags, error_signature) to infer which
+        domain(s) a solution applies to.  Falls back to all detected domains
+        when no signal is available.
 
         The index_entry is augmented with source_project for traceability.
         Returns list of paths written.
         """
-        domains = self.detect_domains()
-        if not domains:
+        all_domains = self.detect_domains()
+        if not all_domains:
             return []
+
+        inferred = _infer_solution_domains(
+            index_entry.get("related_files", []),
+            index_entry.get("tags", []),
+            index_entry.get("error_signature", ""),
+            all_domains,
+        )
+        domains = inferred if inferred else set(all_domains)
 
         entry = {
             **index_entry,
@@ -659,9 +743,10 @@ class StateManager:
         paths: list[Path] = []
         for domain in domains:
             domain_dir = self._global_domain_solutions_dir(domain)
-            cat_dir = domain_dir / category
-            cat_dir.mkdir(parents=True, exist_ok=True)
-            solution_path = cat_dir / filename
+            solution_path = _safe_resolve(domain_dir, f"{category}/{filename}")
+            if solution_path is None:
+                continue
+            solution_path.parent.mkdir(parents=True, exist_ok=True)
             solution_path.write_text(content)
 
             idx_path = self._global_domain_index_path(domain)
@@ -707,42 +792,10 @@ class StateManager:
                     continue
         return entries
 
-    def search_global_solutions(self, query: str, max_results: int = 5) -> list[dict]:
-        """Keyword search across global domain-matched solutions."""
-        entries = self.load_global_solutions_index()
-        if not entries:
-            return []
-
-        keywords = query.lower().split()
-
-        scored: list[tuple[int, dict]] = []
-        for entry in entries:
-            score = 0
-            title = (entry.get("title") or "").lower()
-            tags = [t.lower() for t in (entry.get("tags") or [])]
-            error_sig = (entry.get("error_signature") or "").lower()
-            category = (entry.get("category") or "").lower()
-
-            for kw in keywords:
-                if kw in title:
-                    score += 3
-                if any(kw in tag for tag in tags):
-                    score += 2
-                if kw in error_sig:
-                    score += 2
-                if kw in category:
-                    score += 1
-
-            if score > 0:
-                scored.append((score, entry))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [entry for _, entry in scored[:max_results]]
-
     def read_global_solution(self, domain: str, filename: str) -> str:
         """Read a specific solution file from global domain store."""
-        path = self._global_domain_solutions_dir(domain) / filename
-        if path.exists():
+        path = _safe_resolve(self._global_domain_solutions_dir(domain), filename)
+        if path is not None and path.exists():
             return path.read_text()
         return ""
 
@@ -827,3 +880,79 @@ class StateManager:
             if domain:
                 return self.read_global_solution(domain, filename)
         return self.read_solution(filename)
+
+    # -- index compaction --
+
+    def compact_local_index(self) -> dict:
+        """Compact the project-local solutions index: deduplicate and prune orphans.
+
+        Returns stats dict with counts of original, kept, duplicates, orphans.
+        """
+        return self._compact_index(self.solutions_index_path, self.solutions_dir)
+
+    def compact_global_indexes(self) -> list[dict]:
+        """Compact global solution indexes for all detected domains.
+
+        Returns a list of stats dicts, one per domain.
+        """
+        results = []
+        for domain in self.detect_domains():
+            idx_path = self._global_domain_index_path(domain)
+            if not idx_path.exists():
+                continue
+            stats = self._compact_index(idx_path, self._global_domain_solutions_dir(domain))
+            stats["domain"] = domain
+            results.append(stats)
+        return results
+
+    @staticmethod
+    def _compact_index(index_path: Path, solutions_base: Path) -> dict:
+        """Deduplicate an index.jsonl by filename (keep latest) and prune entries with missing files.
+
+        Rewrites index_path in place. Returns stats.
+        """
+        if not index_path.exists():
+            return {"original": 0, "kept": 0, "duplicates": 0, "orphans": 0}
+
+        raw_lines = index_path.read_text().splitlines()
+        entries: list[dict] = []
+        for line in raw_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    entries.append(parsed)
+            except json.JSONDecodeError:
+                continue
+
+        original = len(entries)
+
+        # Deduplicate by filename, keeping the last occurrence (most recent append)
+        seen: dict[str, int] = {}
+        for i, entry in enumerate(entries):
+            seen[entry.get("filename", "")] = i
+        deduped = [entries[i] for i in sorted(seen.values())]
+        duplicates = original - len(deduped)
+
+        # Prune entries whose solution file no longer exists
+        kept: list[dict] = []
+        orphans = 0
+        for entry in deduped:
+            filename = entry.get("filename", "")
+            if not filename:
+                orphans += 1
+                continue
+            solution_path = _safe_resolve(solutions_base, filename)
+            if solution_path is not None and solution_path.exists():
+                kept.append(entry)
+            else:
+                orphans += 1
+
+        # Rewrite index
+        with open(index_path, "w") as f:
+            for entry in kept:
+                f.write(json.dumps(entry) + "\n")
+
+        return {"original": original, "kept": len(kept), "duplicates": duplicates, "orphans": orphans}
