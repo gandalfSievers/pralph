@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import click
 
 from pralph import __version__
-from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_stories_loop, run_webgen_loop
+from pralph.compound import run_compound
+from pralph.loop import run_add, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_stories_loop, run_webgen_loop
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
-from pralph.state import StateManager
+from pralph.state import ProjectNotInitializedError, StateManager
+from pralph.report import (
+    BUILTIN_QUERIES, gather_report_data, read_project_id, read_storage_backend,
+    run_builtin_query,
+    format_cost, format_csv, format_duration, format_json, format_table,
+    print_report, build_report_json,
+)
 
 
 def _read_stdin() -> str | None:
@@ -19,14 +27,29 @@ def _read_stdin() -> str | None:
     return None
 
 
-def _resolve_prompt(flag_value: str | None, interactive_label: str) -> str:
-    """Resolve prompt: flag > stdin > interactive prompt."""
+def _resolve_prompt(flag_value: str | None, interactive_label: str, file_value: str | None = None) -> str:
+    """Resolve prompt: flag > file > stdin > interactive prompt."""
     if flag_value:
         return flag_value
+    if file_value:
+        from pathlib import Path
+        p = Path(file_value)
+        if not p.exists():
+            raise click.BadParameter(f"File not found: {file_value}", param_hint="'--prompt-file'")
+        return p.read_text().strip()
     stdin = _read_stdin()
     if stdin:
         return stdin
     return click.prompt(interactive_label)
+
+
+def _get_state(ctx: click.Context, *, readonly: bool = False) -> StateManager:
+    """Create a StateManager, exiting with a message if project is not initialized."""
+    try:
+        return StateManager(ctx.obj["project_dir"], readonly=readonly, domains=ctx.obj.get("domains"))
+    except ProjectNotInitializedError as e:
+        click.echo(click.style(str(e), fg="red"))
+        raise SystemExit(1)
 
 
 def _reset_phase(state: StateManager, phase: str) -> None:
@@ -48,8 +71,8 @@ class OrderedGroup(click.Group):
 
     SECTIONS = [
         ("Workflow", ["plan", "stories", "webgen", "implement"]),
-        ("Replan", ["add", "ideate", "refine"]),
-        ("Tools", ["justloop", "compound", "compact-index", "reset-errors", "viewer"]),
+        ("Replan", ["add", "ideate", "refine", "edit"]),
+        ("Tools", ["justloop", "compound", "compact-index", "reset-errors", "viewer", "query"]),
     ]
 
     def list_commands(self, ctx):
@@ -99,17 +122,35 @@ def main(ctx, model, max_iterations, max_budget_usd, cooldown, verbose, project_
 
 
 @main.command()
+@click.option("--name", default=None, help="Project name (required on first run, e.g. 'myapp')")
 @click.option("--prompt", default=None, help="Guidance for design doc creation")
+@click.option("--prompt-file", default=None, type=click.Path(), help="Read prompt from a file")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def plan(ctx, prompt, reset):
+def plan(ctx, name, prompt, prompt_file, reset):
     """Phase 1: Create/refine a design document."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    project_dir = ctx.obj["project_dir"]
+    config_path = os.path.join(project_dir, ".pralph", "project.json")
+
+    # On first run, require --name or derive from directory name or prompt for it
+    if not os.path.exists(config_path) and not name:
+        # Default to directory name if stdin is not a TTY (non-interactive)
+        if not sys.stdin.isatty():
+            name = os.path.basename(project_dir)
+            click.echo(f"  Auto-derived project name: {name}")
+        else:
+            name = click.prompt("Project name (used as ID across sessions)")
+
+    state = StateManager(project_dir, project_name=name, domains=ctx.obj.get("domains"))
     if reset:
         _reset_phase(state, "plan")
-    prompt = _resolve_prompt(prompt, "Design prompt")
+    # If .pralph/plan-prompt.md exists, don't require a CLI prompt
+    if not prompt and not prompt_file and state.read_phase_prompt("plan"):
+        prompt = ""  # assembler will use plan-prompt.md
+    else:
+        prompt = _resolve_prompt(prompt, "Design prompt", file_value=prompt_file)
     click.echo(f"pralph plan — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
 
     run_plan_loop(
@@ -130,11 +171,11 @@ def plan(ctx, prompt, reset):
 @click.pass_context
 def stories(ctx, extract_weight, reset):
     """Phase 2: Extract user stories from design doc."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _get_state(ctx)
     if reset:
         _reset_phase(state, "stories")
     click.echo(f"pralph stories — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  extract_weight: {extract_weight}%")
 
@@ -155,11 +196,11 @@ def stories(ctx, extract_weight, reset):
 @click.pass_context
 def webgen(ctx, reset):
     """Phase 2b: Discover missing requirements via web research."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _get_state(ctx)
     if reset:
         _reset_phase(state, "webgen")
     click.echo(f"pralph webgen — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
 
     run_webgen_loop(
@@ -175,15 +216,16 @@ def webgen(ctx, reset):
 
 @main.command()
 @click.option("--prompt", default=None, help="Brief idea to turn into a story (prompted if omitted)")
+@click.option("--prompt-file", default=None, type=click.Path(), help="Read prompt from a file")
 @click.option("--next", "is_next", is_flag=True, help="Priority 1 — implement next")
 @click.option("--anytime", is_flag=True, default=False, help="Claude picks priority (default)")
 @click.pass_context
-def add(ctx, prompt, is_next, anytime):
+def add(ctx, prompt, prompt_file, is_next, anytime):
     """Add a single story from an idea."""
-    prompt = _resolve_prompt(prompt, "Idea")
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    prompt = _resolve_prompt(prompt, "Idea", file_value=prompt_file)
+    state = _get_state(ctx)
     click.echo(f"pralph add")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  priority: {'next (1)' if is_next else 'claude picks'}")
     click.echo(f"  idea: {prompt}")
@@ -225,7 +267,7 @@ def ideate(ctx, ideas_args, ideas_file, prompt, reset):
 
     Ideas can be passed as arguments: pralph ideate "add dark mode" "CSV export"
     """
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _get_state(ctx)
     if reset:
         _reset_phase(state, "ideate")
 
@@ -266,7 +308,7 @@ def ideate(ctx, ideas_args, ideas_file, prompt, reset):
         return
 
     click.echo(f"pralph ideate — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  ideas: {len(ideas_text)} chars")
 
@@ -285,14 +327,15 @@ def ideate(ctx, ideas_args, ideas_file, prompt, reset):
 @main.command()
 @click.argument("instruction", required=False)
 @click.option("--prompt", default=None, help="Refinement instruction")
+@click.option("--prompt-file", default=None, type=click.Path(), help="Read prompt from a file")
 @click.option("--story", "-s", "story_ids", multiple=True, help="Story ID(s) to refine")
 @click.option("--pattern", "-p", "id_pattern", default=None, help="Glob pattern to match story IDs (e.g. 'I18N-*')")
 @click.pass_context
-def refine(ctx, instruction, prompt, story_ids, id_pattern):
+def refine(ctx, instruction, prompt, prompt_file, story_ids, id_pattern):
     """Refine existing stories: split, merge, or rewrite."""
     import fnmatch
 
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _get_state(ctx)
     all_stories = state.load_stories()
     stories_by_id = {s.id: s for s in all_stories}
 
@@ -323,18 +366,15 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
         if s.status not in (StoryStatus.pending, StoryStatus.rework, StoryStatus.error):
             click.echo(click.style(f"  Warning: {s.id} has status '{s.status.value}'", fg='yellow'))
 
-    # Resolve instruction: positional arg > --prompt > stdin > interactive
+    # Resolve instruction: positional arg > --prompt > --prompt-file > stdin > interactive
     if not instruction:
-        if prompt:
-            instruction = prompt
-        else:
-            instruction = _read_stdin() or click.prompt("Refinement instruction")
+        instruction = _resolve_prompt(prompt, "Refinement instruction", file_value=prompt_file)
     if not instruction.strip():
         click.echo(click.style("Error: instruction is empty", fg='red'))
         return
 
     click.echo(f"pralph refine")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  stories: {', '.join(s.id for s in selected)}")
     click.echo(f"  instruction: {instruction}")
@@ -363,37 +403,208 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
 
 
 @main.command()
-@click.option("--story-id", default=None, help="Implement a specific story")
+@click.argument("story_id")
+@click.option("--title", default=None, help="New title")
+@click.option("--content", default=None, help="New content/description")
+@click.option("--priority", type=int, default=None, help="New priority (1=highest)")
+@click.option("--category", default=None, help="New category")
+@click.option("--complexity", default=None, help="New complexity (e.g. trivial, simple, medium, complex, large, epic)")
+@click.option("--status", type=click.Choice([s.value for s in StoryStatus]), default=None, help="New status")
+@click.option("--add-dep", multiple=True, help="Add dependency (story ID)")
+@click.option("--remove-dep", multiple=True, help="Remove dependency (story ID)")
+@click.option("--set-deps", default=None, help="Replace all dependencies (comma-separated IDs, or 'none')")
+@click.option("--add-criteria", multiple=True, help="Add acceptance criterion")
+@click.option("--remove-criteria", type=int, multiple=True, help="Remove acceptance criterion by index (0-based)")
+@click.option("--set-criteria", default=None, help="Replace all criteria (semicolon-separated)")
+@click.option("--delete", "do_delete", is_flag=True, help="Delete the story entirely")
+@click.option("--show", is_flag=True, help="Show story details (no changes)")
+@click.pass_context
+def edit(ctx, story_id, title, content, priority, category, complexity, status,
+         add_dep, remove_dep, set_deps, add_criteria, remove_criteria, set_criteria,
+         do_delete, show):
+    """Edit a story's fields directly (no AI involved).
+
+    \b
+    Examples:
+      pralph edit STORY-001 --title "New title"
+      pralph edit STORY-001 --priority 1 --status pending
+      pralph edit STORY-001 --add-dep STORY-002 --add-criteria "Must handle errors"
+      pralph edit STORY-001 --set-deps "STORY-002,STORY-003"
+      pralph edit STORY-001 --set-criteria "Criterion 1;Criterion 2;Criterion 3"
+      pralph edit STORY-001 --delete
+      pralph edit STORY-001 --show
+    """
+    state = _get_state(ctx)
+    stories = state.load_stories()
+    stories_by_id = {s.id: s for s in stories}
+
+    if story_id not in stories_by_id:
+        click.echo(click.style(f"Error: story '{story_id}' not found", fg="red"))
+        available = sorted(stories_by_id.keys())
+        if available:
+            click.echo(f"  Available: {', '.join(available[:20])}")
+            if len(available) > 20:
+                click.echo(f"  ... and {len(available) - 20} more")
+        raise SystemExit(1)
+
+    story = stories_by_id[story_id]
+
+    # Show mode
+    if show:
+        click.echo(f"\n  {click.style(story.id, fg='blue', bold=True)}: {story.title}")
+        click.echo(f"  Status:     {story.status.value}")
+        click.echo(f"  Priority:   {story.priority}")
+        click.echo(f"  Category:   {story.category}")
+        click.echo(f"  Complexity: {story.complexity}")
+        click.echo(f"  Source:     {story.source}")
+        click.echo(f"  Deps:       {', '.join(story.dependencies) or 'none'}")
+        click.echo(f"  Criteria:   {len(story.acceptance_criteria)} items")
+        for i, ac in enumerate(story.acceptance_criteria):
+            click.echo(f"    [{i}] {ac}")
+        if story.content:
+            click.echo(f"  Content:")
+            for line in story.content.split("\n")[:10]:
+                click.echo(f"    {line}")
+            if story.content.count("\n") > 10:
+                click.echo(f"    ... ({story.content.count(chr(10)) + 1} lines total)")
+        click.echo()
+        return
+
+    # Delete mode
+    if do_delete:
+        confirm = click.confirm(f"  Delete story {story_id} ({story.title})?")
+        if not confirm:
+            click.echo("  Cancelled")
+            return
+        if state.delete_story(story_id):
+            click.echo(click.style(f"  Deleted {story_id}", fg="green"))
+        else:
+            click.echo(click.style(f"  Failed to delete {story_id}", fg="red"))
+        return
+
+    # Collect changes
+    changes = []
+
+    if title is not None:
+        story.title = title
+        changes.append(f"title -> {title}")
+
+    if content is not None:
+        story.content = content
+        changes.append(f"content -> ({len(content)} chars)")
+
+    if priority is not None:
+        story.priority = priority
+        changes.append(f"priority -> {priority}")
+
+    if category is not None:
+        story.category = category
+        changes.append(f"category -> {category}")
+
+    if complexity is not None:
+        story.complexity = complexity
+        changes.append(f"complexity -> {complexity}")
+
+    if status is not None:
+        story.status = StoryStatus(status)
+        changes.append(f"status -> {status}")
+
+    # Dependencies
+    if set_deps is not None:
+        if set_deps.lower() == "none":
+            story.dependencies = []
+        else:
+            story.dependencies = [d.strip() for d in set_deps.split(",") if d.strip()]
+        changes.append(f"dependencies -> {story.dependencies}")
+    else:
+        if add_dep:
+            for dep in add_dep:
+                if dep not in story.dependencies:
+                    story.dependencies.append(dep)
+            changes.append(f"added deps: {list(add_dep)}")
+        if remove_dep:
+            story.dependencies = [d for d in story.dependencies if d not in remove_dep]
+            changes.append(f"removed deps: {list(remove_dep)}")
+
+    # Acceptance criteria
+    if set_criteria is not None:
+        story.acceptance_criteria = [c.strip() for c in set_criteria.split(";") if c.strip()]
+        changes.append(f"criteria -> {len(story.acceptance_criteria)} items")
+    else:
+        if add_criteria:
+            story.acceptance_criteria.extend(add_criteria)
+            changes.append(f"added {len(add_criteria)} criteria")
+        if remove_criteria:
+            indices = sorted(set(remove_criteria), reverse=True)
+            removed = 0
+            for idx in indices:
+                if 0 <= idx < len(story.acceptance_criteria):
+                    story.acceptance_criteria.pop(idx)
+                    removed += 1
+            changes.append(f"removed {removed} criteria")
+
+    if not changes:
+        click.echo("  No changes specified. Use --show to view, or pass options like --title, --priority, etc.")
+        click.echo("  Run 'pralph edit --help' for all options.")
+        return
+
+    state.update_story(story)
+    click.echo(click.style(f"  Updated {story_id}:", fg="green"))
+    for change in changes:
+        click.echo(f"    {change}")
+
+
+@main.command()
+@click.option("--story-id", default=None, help="Implement specific stories (comma-separated IDs)")
+@click.option("--with-deps", is_flag=True, help="Also implement unfinished upstream dependencies of --story-id")
 @click.option("--phase1/--no-phase1", default=True, help="Architecture-first grouping")
 @click.option("--review/--no-review", default=True, help="Run reviewer after each implementation")
 @click.option("--compound/--no-compound", default=False, help="Capture learnings after each story (compound learning)")
 @click.option("--prompt", default=None, help="Guidance for implementation (e.g. 'use FastAPI', 'use MCP for DB access')")
+@click.option("--prompt-file", default=None, type=click.Path(), help="Read prompt from a file")
+@click.option("--parallel", default=1, type=click.IntRange(min=1), help="Max concurrent stories (default: 1 = sequential)")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def implement(ctx, story_id, phase1, review, compound, prompt, reset):
+def implement(ctx, story_id, with_deps, phase1, review, compound, prompt, prompt_file, parallel, reset):
     """Phase 3: Implement stories from backlog."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _get_state(ctx)
     if reset:
         _reset_phase(state, "implement")
+    if with_deps and not story_id:
+        raise click.UsageError("--with-deps requires --story-id")
+    if not prompt and prompt_file:
+        from pathlib import Path
+        p = Path(prompt_file)
+        if not p.exists():
+            raise click.BadParameter(f"File not found: {prompt_file}", param_hint="'--prompt-file'")
+        prompt = p.read_text().strip()
     prompt = prompt or _read_stdin() or ""
+    # Parse comma-separated story IDs
+    story_ids = [s.strip() for s in story_id.split(",") if s.strip()] if story_id else None
+
     save_global = state.global_compound
     click.echo(f"pralph implement — max {ctx.obj['max_iterations']} iterations")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     click.echo(f"  review: {'on' if review else 'off'}")
     click.echo(f"  compound: {'on' if compound else 'off'}")
     if compound and save_global:
         domains = state.detect_domains()
         click.echo(f"  global: on (domains: {', '.join(domains) or 'none detected'})")
-    if story_id:
-        click.echo(f"  story: {story_id}")
+    if parallel > 1:
+        click.echo(f"  parallel: {parallel}")
+    if story_ids:
+        click.echo(f"  stories: {', '.join(story_ids)}")
+        if with_deps:
+            click.echo(f"  with-deps: on")
 
     run_implement_loop(
         state,
         model=ctx.obj["model"],
         max_iterations=ctx.obj["max_iterations"],
         cooldown=ctx.obj["cooldown"],
-        story_id=story_id,
+        story_ids=story_ids,
+        with_deps=with_deps,
         phase1=phase1,
         review=review,
         compound=compound,
@@ -403,6 +614,7 @@ def implement(ctx, story_id, phase1, review, compound, prompt, reset):
         verbose=ctx.obj["verbose"],
         dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
         max_budget_usd=ctx.obj["max_budget_usd"],
+        parallel=parallel,
     )
 
 
@@ -412,7 +624,13 @@ def implement(ctx, story_id, phase1, review, compound, prompt, reset):
 @click.pass_context
 def justloop(ctx, prompt_args, prompt):
     """Run a prompt in a loop until complete."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    project_dir = ctx.obj["project_dir"]
+    config_path = os.path.join(project_dir, ".pralph", "project.json")
+    if not os.path.exists(config_path):
+        name = os.path.basename(project_dir)
+    else:
+        name = None
+    state = StateManager(project_dir, project_name=name, domains=ctx.obj.get("domains"))
 
     # Resolve prompt: positional args > --prompt > stdin > interactive
     if prompt_args:
@@ -446,14 +664,15 @@ def justloop(ctx, prompt_args, prompt):
 @main.command()
 @click.option("--story-id", default=None, help="Story ID to capture learnings from")
 @click.option("--prompt", default=None, help="Description of what was done")
+@click.option("--prompt-file", default=None, type=click.Path(), help="Read prompt from a file")
 @click.pass_context
-def compound(ctx, story_id, prompt):
+def compound(ctx, story_id, prompt, prompt_file):
     """Capture learnings from recent work (compound learning)."""
-    prompt = _resolve_prompt(prompt, "Description of work done")
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    prompt = _resolve_prompt(prompt, "Description of work done", file_value=prompt_file)
+    state = _get_state(ctx)
     save_global = state.global_compound
     click.echo(f"pralph compound")
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  model: {ctx.obj['model']}")
     if save_global:
         domains = state.detect_domains()
@@ -475,6 +694,56 @@ def compound(ctx, story_id, prompt):
     )
 
     click.echo(f"\n  Cost: ${cost:.4f}")
+
+
+@main.command("export-solutions")
+@click.option("--output", "-o", default=None, type=click.Path(), help="Write to file (default: stdout)")
+@click.option("--category", "-c", default=None, help="Filter by category")
+@click.option("--format", "fmt", default="markdown", type=click.Choice(["markdown", "json"]), help="Output format")
+@click.pass_context
+def export_solutions(ctx, output, category, fmt):
+    """Export compound learning solutions for reuse across projects."""
+    import json as json_mod
+
+    state = _get_state(ctx, readonly=True)
+    entries = state.load_solutions_index()
+    if not entries:
+        click.echo("No solutions found. Run 'pralph implement --compound' or 'pralph compound' first.")
+        return
+
+    if category:
+        entries = [e for e in entries if e.get("category", "").lower() == category.lower()]
+        if not entries:
+            click.echo(f"No solutions found in category '{category}'.")
+            return
+
+    if fmt == "json":
+        items = []
+        for entry in entries:
+            content = state.read_solution(entry.get("filename", ""))
+            items.append({**entry, "content": content})
+        text = json_mod.dumps(items, indent=2)
+    else:
+        parts = []
+        for entry in entries:
+            content = state.read_solution(entry.get("filename", ""))
+            title = entry.get("title", "Untitled")
+            cat = entry.get("category", "")
+            tags = ", ".join(entry.get("tags", []))
+            header = f"# [{cat}] {title}"
+            if tags:
+                header += f"\n\nTags: {tags}"
+            if content:
+                parts.append(f"{header}\n\n{content}")
+            else:
+                parts.append(header)
+        text = "\n\n---\n\n".join(parts) + "\n"
+
+    if output:
+        Path(output).write_text(text)
+        click.echo(f"Exported {len(entries)} solution(s) to {output}")
+    else:
+        click.echo(text)
 
 
 @main.command("compact-index")
@@ -552,7 +821,7 @@ def compact_index(ctx, global_only, local_only):
 @click.pass_context
 def reset_errors(ctx):
     """Reset error stories to pending and clear error state."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _get_state(ctx)
 
     # Show error details before resetting
     error_stories = [s for s in state.load_stories() if s.status == StoryStatus.error]
@@ -569,15 +838,9 @@ def reset_errors(ctx):
     # Reset error stories back to pending
     reset_stories = state.reset_error_stories()
 
-    # Clear error fields in whichever phase is currently stored
-    if state.phase_state_path.exists():
-        try:
-            import json
-            data = json.loads(state.phase_state_path.read_text())
-            phase = data.get("phase", "implement")
-        except (json.JSONDecodeError, KeyError):
-            phase = "implement"
-        ps = state.load_phase_state(phase)
+    # Clear error fields in all phase states that have errors
+    for phase_name in ("plan", "stories", "webgen", "ideate", "implement", "justloop"):
+        ps = state.load_phase_state(phase_name)
         if ps.consecutive_errors > 0 or ps.last_error or ps.completion_reason in ("consecutive_errors", "error"):
             ps.consecutive_errors = 0
             ps.last_error = ""
@@ -585,7 +848,7 @@ def reset_errors(ctx):
                 ps.completed = False
                 ps.completion_reason = ""
             state.save_phase_state(ps)
-            click.echo(f"  Cleared '{phase}' phase error state")
+            click.echo(f"  Cleared '{phase_name}' phase error state")
 
     if reset_stories:
         click.echo(click.style(f"  Reset {len(reset_stories)} stories to pending", fg='green'))
@@ -599,11 +862,140 @@ def reset_errors(ctx):
 @click.pass_context
 def viewer(ctx, port, no_open):
     """Browse and review user stories in a web UI."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _get_state(ctx)
     stories = state.load_stories()
     if not stories:
         click.echo("No stories found. Run 'pralph stories' first.")
         return
-    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  project: {state.project_id}")
     click.echo(f"  stories: {len(stories)}")
     run_viewer(state, port=port, open_browser=not no_open)
+
+
+# ── Built-in queries for pralph query ────────────────────────────────
+
+
+@main.command("query")
+@click.argument("sql", required=False)
+@click.option("--progress", is_flag=True, help="Story progress by status")
+@click.option("--cost", is_flag=True, help="Cost breakdown by phase")
+@click.option("--stories", "show_stories", is_flag=True, help="List all stories with status")
+@click.option("--cost-per-story", is_flag=True, help="Cost per story")
+@click.option("--errors", is_flag=True, help="Recent errors")
+@click.option("--timeline", is_flag=True, help="Implementation timeline")
+@click.option("--projects", is_flag=True, help="All registered projects")
+@click.option("--report", is_flag=True, help="Full progress report (phases, stories, costs, active work)")
+@click.option("--watch", type=int, default=0, metavar="SECONDS", help="Auto-refresh every N seconds (use with --report)")
+@click.option("--all-projects", is_flag=True, help="Include all projects in custom SQL")
+@click.option("--format", "fmt", type=click.Choice(["table", "csv", "json"]), default="table", help="Output format")
+@click.pass_context
+def query_cmd(ctx, sql, progress, cost, show_stories, cost_per_story, errors, timeline, projects, report, watch, all_projects, fmt):
+    """Query project data.
+
+    Run built-in queries with flags (--progress, --cost, --stories, etc.)
+    or pass arbitrary SQL as an argument (DuckDB backend only).
+
+    \b
+    Examples:
+      pralph query --progress
+      pralph query --report
+      pralph query --report --watch 10
+      pralph query --cost --format json
+      pralph query "SELECT * FROM stories WHERE priority = 1"
+      pralph query --projects
+    """
+    import time
+
+    def _output(columns: list[str], rows: list[tuple]) -> None:
+        if fmt == "table":
+            click.echo(format_table(columns, rows))
+        elif fmt == "csv":
+            click.echo(format_csv(columns, rows))
+        else:
+            click.echo(format_json(columns, rows))
+
+    # Handle --report mode — works with both backends
+    if report:
+        try:
+            state = StateManager(ctx.obj["project_dir"], readonly=True, domains=ctx.obj.get("domains"))
+        except ProjectNotInitializedError as e:
+            click.echo(click.style(str(e), fg="red"))
+            return
+
+        try:
+            while True:
+                state.refresh_readonly()
+                data = gather_report_data(state)
+                if watch and fmt != "json":
+                    click.echo("\033[2J\033[H", nl=False)
+                if fmt == "json":
+                    click.echo(build_report_json(data))
+                else:
+                    print_report(data)
+                if watch <= 0:
+                    break
+                time.sleep(watch)
+        except KeyboardInterrupt:
+            click.echo()
+        return
+
+    # Determine which query to run
+    builtin_flags = {
+        "progress": progress,
+        "cost": cost,
+        "stories": show_stories,
+        "cost-per-story": cost_per_story,
+        "errors": errors,
+        "timeline": timeline,
+        "projects": projects,
+    }
+
+    selected = [name for name, flag in builtin_flags.items() if flag]
+
+    if not selected and not sql:
+        selected = ["progress"]
+
+    # Run built-in queries via StateManager (works with both backends)
+    if selected:
+        try:
+            state = StateManager(ctx.obj["project_dir"], readonly=True, domains=ctx.obj.get("domains"))
+        except ProjectNotInitializedError as e:
+            click.echo(click.style(str(e), fg="red"))
+            return
+
+        for name in selected:
+            label = BUILTIN_QUERIES[name][0]
+            click.echo(click.style(f"\n  {label}", bold=True))
+            click.echo()
+            columns, rows = run_builtin_query(name, state)
+            _output(columns, rows)
+
+    # Run custom SQL (DuckDB only)
+    if sql:
+        backend = read_storage_backend(ctx.obj["project_dir"])
+        if backend != "duckdb":
+            click.echo(click.style(
+                "Custom SQL requires the DuckDB backend.\n"
+                "Set \"storage\": \"duckdb\" in .pralph/project.json to enable SQL queries.",
+                fg="yellow",
+            ))
+            return
+
+        from pralph import db
+        click.echo()
+        try:
+            columns, rows = db.execute_query(sql)
+            _output(columns, rows)
+        except Exception as e:
+            click.echo(click.style(f"Query error: {e}", fg="red"))
+            project_id = ""
+            try:
+                project_id = read_project_id(ctx.obj["project_dir"])
+            except (FileNotFoundError, ValueError):
+                pass
+            if not all_projects and project_id:
+                click.echo(click.style(
+                    f"\n  Hint: filter by project with WHERE project_id = '{project_id}'",
+                    dim=True,
+                ))
+    click.echo()

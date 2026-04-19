@@ -3,12 +3,13 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from pralph.models import IterationResult, PhaseState, Story, StoryStatus
+from pralph.file_state import FileStateMixin
 
 # Map file patterns to domain names for auto-detection.
 # Each entry: (glob_pattern, domain_name)
@@ -216,13 +217,47 @@ def _index_lock(index_path: Path):
         fd.close()
 
 
-class StateManager:
-    def __init__(self, project_dir: str, *, domains: list[str] | None = None) -> None:
-        self.project_dir = Path(project_dir)
+class ProjectNotInitializedError(Exception):
+    """Raised when a command is run in a directory without a project.json."""
+    pass
+
+
+class _BaseStateManager(FileStateMixin):
+    """Base class with shared init logic — no storage mixin yet."""
+
+    def __init__(self, project_dir: str, *, project_name: str | None = None, readonly: bool = False, domains: list[str] | None = None) -> None:
+        self.project_dir = Path(project_dir).resolve()
         self.state_dir = self.project_dir / ".pralph"
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._readonly = readonly
         self._domain_override = domains
         self._detected_domains: list[str] | None = None
+
+        # Resolve project_id from project.json or create it
+        self.project_id = self._resolve_project_id(project_name)
+
+        # Central data directory: ~/.pralph/<project-id>/
+        self.data_dir = Path.home() / ".pralph" / self.project_id
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def _project_config_path(self) -> Path:
+        return self.state_dir / "project.json"
+
+    @property
+    def storage_backend(self) -> str:
+        """Return the storage backend for this project."""
+        if self._project_config_path.exists():
+            try:
+                data = json.loads(self._project_config_path.read_text())
+                if "storage" in data:
+                    return data["storage"]
+                # Existing project without storage key — was using DuckDB
+                return "duckdb"
+            except (json.JSONDecodeError, OSError):
+                pass
+        return "jsonl"
 
     # -- config --
 
@@ -249,56 +284,11 @@ class StateManager:
         """Whether compound learnings should be saved globally."""
         return bool(self.get_config("global_compound", False))
 
-    # -- file paths --
-
-    @property
-    def design_doc_path(self) -> Path:
-        return self.state_dir / "design-doc.md"
-
-    @property
-    def guardrails_path(self) -> Path:
-        return self.state_dir / "guardrails.md"
-
-    @property
-    def stories_path(self) -> Path:
-        return self.state_dir / "stories.jsonl"
-
-    @property
-    def status_path(self) -> Path:
-        return self.state_dir / "status.jsonl"
-
-    @property
-    def run_log_path(self) -> Path:
-        return self.state_dir / "run-log.jsonl"
-
-    @property
-    def phase_state_path(self) -> Path:
-        return self.state_dir / "phase-state.json"
-
-    @property
-    def phase1_analysis_path(self) -> Path:
-        return self.state_dir / "phase1-analysis.json"
-
-    @property
-    def research_notes_path(self) -> Path:
-        return self.state_dir / "research-notes.md"
-
-    @property
-    def ideas_path(self) -> Path:
-        return self.state_dir / "ideas.md"
-
-    def phase_prompt_path(self, phase: str) -> Path:
-        return self.state_dir / f"{phase}-prompt.md"
-
-    @property
-    def home_dir(self) -> Path:
-        return Path.home() / ".pralph"
+    # -- domain detection --
 
     @property
     def domains_path(self) -> Path:
         return self.state_dir / "domains.txt"
-
-    # -- domain detection --
 
     def detect_domains(self) -> list[str]:
         """Return the active domains for this project.
@@ -367,320 +357,93 @@ class StateManager:
         self._detected_domains = sorted(found)
         return self._detected_domains
 
-    def read_phase_prompt(self, phase: str) -> str:
-        # Project-level overrides home-level
-        path = self.phase_prompt_path(phase)
-        if path.exists():
-            return path.read_text().strip()
-        home_path = self.home_dir / f"{phase}-prompt.md"
-        if home_path.exists():
-            return home_path.read_text().strip()
-        return ""
+    # -- project identity --
 
-    def resolve_prompt_template(self, name: str, default: str) -> str:
-        """Resolve a prompt template: project prompts/ > home prompts/ > built-in default."""
-        project_path = self.state_dir / "prompts" / f"{name}.md"
-        if project_path.exists():
-            return project_path.read_text()
-        home_path = self.home_dir / "prompts" / f"{name}.md"
-        if home_path.exists():
-            return home_path.read_text()
-        return default
-
-    @property
-    def extra_tools_path(self) -> Path:
-        return self.state_dir / "extra-tools.txt"
-
-    def read_extra_tools(self) -> str:
-        """Read project-level extra tools (one per line or comma-separated)."""
-        if not self.extra_tools_path.exists():
-            return ""
-        raw = self.extra_tools_path.read_text().strip()
-        # Normalize: support one-per-line or comma-separated
-        tools = [t.strip() for t in raw.replace("\n", ",").split(",") if t.strip()]
-        return ",".join(tools)
-
-    # -- review feedback --
-
-    @property
-    def review_feedback_dir(self) -> Path:
-        return self.state_dir / "review-feedback"
-
-    def review_feedback_path(self, story_id: str) -> Path:
-        return self.review_feedback_dir / f"{story_id}.md"
-
-    def write_review_feedback(self, story_id: str, feedback: str) -> None:
-        self.review_feedback_dir.mkdir(parents=True, exist_ok=True)
-        self.review_feedback_path(story_id).write_text(feedback)
-
-    def read_review_feedback(self, story_id: str) -> str:
-        path = self.review_feedback_path(story_id)
-        if path.exists():
-            return path.read_text().strip()
-        return ""
-
-    def clear_review_feedback(self, story_id: str) -> None:
-        self.review_feedback_path(story_id).unlink(missing_ok=True)
-
-    # -- claude session validation --
-
-    def claude_session_exists(self, session_id: str) -> bool:
-        """Check if a Claude session file exists on disk."""
-        encoded = str(self.project_dir).replace("/", "-")
-        path = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
-        return path.exists()
-
-    # -- design doc --
-
-    def read_design_doc(self) -> str:
-        if self.design_doc_path.exists():
-            return self.design_doc_path.read_text()
-        return ""
-
-    def write_design_doc(self, content: str) -> None:
-        self.design_doc_path.write_text(content)
-
-    def has_design_doc(self) -> bool:
-        return self.design_doc_path.exists() and self.design_doc_path.stat().st_size > 0
-
-    # -- guardrails --
-
-    def read_guardrails(self) -> str:
-        if self.guardrails_path.exists():
-            return self.guardrails_path.read_text()
-        return ""
-
-    # -- stories --
-
-    def load_stories(self) -> list[Story]:
-        stories: list[Story] = []
-        if not self.stories_path.exists():
-            return stories
-        for line in self.stories_path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
+    def _resolve_project_id(self, project_name: str | None) -> str:
+        """Resolve project_id: read from project.json, or create from project_name."""
+        if self._project_config_path.exists():
             try:
-                stories.append(Story.from_dict(json.loads(line)))
-            except (json.JSONDecodeError, KeyError):
-                continue
-        return stories
-
-    def append_stories(self, stories: list[Story]) -> None:
-        with open(self.stories_path, "a") as f:
-            for s in stories:
-                f.write(json.dumps(s.to_dict()) + "\n")
-
-    def get_pending_stories(self) -> list[Story]:
-        return [s for s in self.load_stories() if s.status == StoryStatus.pending]
-
-    def get_actionable_stories(self) -> list[Story]:
-        """Return stories that are pending or need rework (rework first)."""
-        stories = self.load_stories()
-        rework = [s for s in stories if s.status == StoryStatus.rework]
-        pending = [s for s in stories if s.status == StoryStatus.pending]
-        return rework + pending
-
-    def reset_error_stories(self) -> list[Story]:
-        """Find stories with error status and reset them to pending."""
-        stories = self.load_stories()
-        reset: list[Story] = []
-
-        for s in stories:
-            if s.status == StoryStatus.error:
-                s.status = StoryStatus.pending
-                s.metadata.pop("error_reason", None)
-                s.metadata.pop("error_output", None)
-                s.metadata.pop("error_at", None)
-                reset.append(s)
-
-        if reset:
-            self._rewrite_stories(stories)
-            with open(self.status_path, "a") as f:
-                for s in reset:
-                    entry = {
-                        "story_id": s.id,
-                        "status": "pending",
-                        "summary": "Reset from error status",
-                    }
-                    f.write(json.dumps(entry) + "\n")
-
-        return reset
-
-    def recover_orphaned_stories(self) -> list[Story]:
-        """Find in_progress stories (orphans from crashes) and reset to pending."""
-        stories = self.load_stories()
-        recovered: list[Story] = []
-
-        for s in stories:
-            if s.status == StoryStatus.in_progress:
-                s.status = StoryStatus.pending
-                s.metadata["previous_attempt"] = {
-                    "was_in_progress": True,
-                    "recovered_at": datetime.now().isoformat(),
-                }
-                recovered.append(s)
-
-        if recovered:
-            self._rewrite_stories(stories)
-            with open(self.status_path, "a") as f:
-                for s in recovered:
-                    entry = {
-                        "story_id": s.id,
-                        "status": "pending",
-                        "summary": "Recovered from crash (was in_progress)",
-                        "recovery": True,
-                    }
-                    f.write(json.dumps(entry) + "\n")
-
-        return recovered
-
-    def get_story_ids(self) -> set[str]:
-        return {s.id for s in self.load_stories()}
-
-    def get_category_stats(self) -> dict[str, dict[str, int]]:
-        stats: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "next_id": 1})
-        for story in self.load_stories():
-            cat = story.category.upper()
-            if not cat:
-                continue
-            stats[cat]["count"] += 1
-            # Parse numeric suffix from id like "AUTH-043"
-            parts = story.id.rsplit("-", 1)
-            if len(parts) == 2:
-                try:
-                    num = int(parts[1])
-                    stats[cat]["next_id"] = max(stats[cat]["next_id"], num + 1)
-                except ValueError:
-                    pass
-        return dict(stats)
-
-    def format_existing_stories_context(self) -> str:
-        stories = self.load_stories()
-        if not stories:
-            return "(none yet)"
-        lines: list[str] = []
-        for s in stories:
-            deps = ", ".join(s.dependencies) if s.dependencies else "none"
-            lines.append(f"- {s.id}: {s.title} [priority={s.priority}, status={s.status.value}, deps={deps}]")
-        return "\n".join(lines)
-
-    def format_category_stats(self) -> str:
-        stats = self.get_category_stats()
-        if not stats:
-            return "(no categories yet — start IDs at CATEGORY-001)"
-        lines: list[str] = []
-        for cat, info in sorted(stats.items()):
-            lines.append(f"- {cat}: count={info['count']}, next_id={info['next_id']:03d}")
-        return "\n".join(lines)
-
-    # -- story status --
-
-    def mark_story_status(
-        self,
-        story_id: str,
-        status: StoryStatus,
-        summary: str = "",
-        extra: dict | None = None,
-        error_reason: str = "",
-        error_output: str = "",
-    ) -> None:
-        entry = {
-            "story_id": story_id,
-            "status": status.value,
-            "summary": summary,
-            **(extra or {}),
-        }
-        if error_reason:
-            entry["error_reason"] = error_reason
-        with open(self.status_path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-
-        # Also rewrite stories.jsonl with updated status
-        stories = self.load_stories()
-        for s in stories:
-            if s.id == story_id:
-                s.status = status
-                if status == StoryStatus.error:
-                    s.metadata["error_reason"] = error_reason or summary
-                    if error_output:
-                        # Keep last 2000 chars of output for context
-                        s.metadata["error_output"] = error_output[-2000:]
-                    s.metadata["error_at"] = datetime.now().isoformat()
-                break
-        self._rewrite_stories(stories)
-
-    def _rewrite_stories(self, stories: list[Story]) -> None:
-        with open(self.stories_path, "w") as f:
-            for s in stories:
-                f.write(json.dumps(s.to_dict()) + "\n")
-
-    def get_implemented_summary(self) -> str:
-        if not self.status_path.exists():
-            return ""
-        count = 0
-        for raw in self.status_path.read_text().splitlines():
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                json.loads(raw)
-                count += 1
-            except json.JSONDecodeError:
-                continue
-        if count == 0:
-            return ""
-        return f"## Previously Implemented Stories\n\n{count} stories tracked in {self.status_path}"
-
-    # -- phase state --
-
-    def load_phase_state(self, phase: str) -> PhaseState:
-        if self.phase_state_path.exists():
-            try:
-                data = json.loads(self.phase_state_path.read_text())
-                if data.get("phase") == phase:
-                    return PhaseState.from_dict(data)
-            except (json.JSONDecodeError, KeyError):
+                data = json.loads(self._project_config_path.read_text())
+                stored_id = data.get("project_id", "")
+                if stored_id:
+                    return stored_id
+            except (json.JSONDecodeError, OSError):
                 pass
-        return PhaseState(phase=phase)
 
-    def save_phase_state(self, state: PhaseState) -> None:
-        self.phase_state_path.write_text(json.dumps(state.to_dict(), indent=2) + "\n")
+        if project_name:
+            self._save_project_config(project_name)
+            return project_name
 
-    # -- run log --
+        # Legacy project: has JSONL files but no project.json — auto-assign basename
+        if self._has_legacy_data():
+            legacy_name = self.project_dir.name
+            self._save_project_config(legacy_name)
+            return legacy_name
 
-    def log_iteration(self, result: IterationResult) -> None:
-        with open(self.run_log_path, "a") as f:
-            f.write(json.dumps(result.to_dict()) + "\n")
+        # No project.json and no name provided — not initialized yet
+        raise ProjectNotInitializedError(
+            f"Project not initialized. Run 'pralph plan --name <project-name>' first.\n"
+            f"  directory: {self.project_dir}"
+        )
 
-    def get_story_tokens(self) -> dict[str, dict[str, int]]:
-        """Aggregate tokens per story from run-log.jsonl."""
-        totals: dict[str, dict[str, int]] = {}
-        if not self.run_log_path.exists():
-            return totals
-        for line in self.run_log_path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
+    def _migrate_data_dir(self) -> None:
+        """Move data files from .pralph/ to ~/.pralph/<project-id>/ if needed."""
+        import shutil
+
+        moves = [
+            ("stories.jsonl", "stories.jsonl"),
+            ("status.jsonl", "status.jsonl"),
+            ("run-log.jsonl", "run-log.jsonl"),
+            ("phase1-analysis.json", "phase1-analysis.json"),
+        ]
+        for src_name, dst_name in moves:
+            src = self.state_dir / src_name
+            dst = self.data_dir / dst_name
+            if src.exists() and not dst.exists():
+                shutil.move(str(src), str(dst))
+
+        # Migrate phases/ directory
+        src_phases = self.state_dir / "phases"
+        dst_phases = self.data_dir / "phases"
+        if src_phases.is_dir() and not dst_phases.exists():
+            shutil.move(str(src_phases), str(dst_phases))
+
+        # Migrate solutions/ directory
+        src_solutions = self.state_dir / "solutions"
+        dst_solutions = self.data_dir / "solutions"
+        if src_solutions.is_dir() and not dst_solutions.exists():
+            shutil.move(str(src_solutions), str(dst_solutions))
+
+    def _has_legacy_data(self) -> bool:
+        """Check if this project has old-style JSONL files (pre-DuckDB)."""
+        return (
+            (self.state_dir / "stories.jsonl").exists()
+            or (self.state_dir / "phase-state.json").exists()
+            or (self.state_dir / "design-doc.md").exists()
+        )
+
+    def _save_project_config(self, project_id: str, storage: str | None = None) -> None:
+        data: dict = {"project_id": project_id}
+        # Preserve existing config fields
+        if self._project_config_path.exists():
             try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            story_id = entry.get("story_id")
-            if not story_id:
-                continue
-            if story_id not in totals:
-                totals[story_id] = {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                }
-            totals[story_id]["input_tokens"] += entry.get("input_tokens", 0)
-            totals[story_id]["output_tokens"] += entry.get("output_tokens", 0)
-            totals[story_id]["cache_read_input_tokens"] += entry.get("cache_read_input_tokens", 0)
-            totals[story_id]["cache_creation_input_tokens"] += entry.get("cache_creation_input_tokens", 0)
-        return totals
+                existing = json.loads(self._project_config_path.read_text())
+                if isinstance(existing, dict):
+                    data = existing
+                    data["project_id"] = project_id
+            except (json.JSONDecodeError, OSError):
+                pass
+        if storage is not None:
+            data["storage"] = storage
+        elif "storage" not in data:
+            data["storage"] = "jsonl"
+        self._project_config_path.write_text(
+            json.dumps(data, indent=2) + "\n"
+        )
+
+    def refresh_readonly(self) -> None:
+        """Override in subclasses if needed."""
+        pass
 
     # -- solutions (compound learning) --
 
@@ -1219,3 +982,133 @@ class StateManager:
             "removed": exact_dupes + pre_orphans + len(removed),
             "cost": cost,
         }
+
+
+# Lazy imports to avoid circular dependencies and allow duckdb to be optional.
+
+class _DuckDbStateManager(_BaseStateManager):
+    """StateManager backed by DuckDB. Mixin applied at class definition time below."""
+    pass
+
+
+class _JsonlStateManager(_BaseStateManager):
+    """StateManager backed by JSONL files. Mixin applied at class definition time below."""
+    pass
+
+
+def _build_duckdb_class():
+    """Build the DuckDB StateManager class with mixin and init logic."""
+    import duckdb
+    from pralph import db
+    from pralph.db_state import DbStateMixin
+    from pralph.migrate import migrate_project, needs_migration
+
+    class DuckDbStateManager(_BaseStateManager, DbStateMixin):
+
+        def __init__(self, project_dir: str, *, project_name: str | None = None, readonly: bool = False, domains: list[str] | None = None) -> None:
+            super().__init__(project_dir, project_name=project_name, readonly=readonly, domains=domains)
+            self.__conn: duckdb.DuckDBPyConnection | None = None
+
+            if readonly:
+                pass
+            else:
+                with db.connection() as conn:
+                    db.register_project(conn, self.project_id, self.project_dir.name)
+                    if needs_migration(self.state_dir, self.project_id, conn):
+                        migrate_project(self.state_dir, self.project_id, conn)
+                # Move solutions/ to data_dir after DuckDB migration
+                self._migrate_data_dir()
+
+        @property
+        def _conn(self):
+            if self.__conn is not None:
+                return self.__conn
+            if self._readonly:
+                self.__conn = db.get_readonly_connection()
+                return self.__conn
+            raise RuntimeError("No held connection — wrap operation in _hold_conn()")
+
+        def _hold_conn(self):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def _cm():
+                if self.__conn is not None:
+                    yield
+                    return
+                self.__conn = db.get_connection()
+                try:
+                    yield
+                finally:
+                    self.__conn.close()
+                    self.__conn = None
+
+            return _cm()
+
+        def refresh_readonly(self) -> None:
+            if not self._readonly:
+                return
+            if self.__conn is not None:
+                self.__conn.close()
+            self.__conn = db.get_readonly_connection()
+
+        def _transient_write(self, sql: str, params: list) -> None:
+            import time
+
+            last_err: Exception | None = None
+            for attempt in range(5):
+                try:
+                    with db.connection() as conn:
+                        conn.execute(sql, params)
+                    return
+                except duckdb.IOException as e:
+                    last_err = e
+                    time.sleep(0.5)
+            raise last_err  # type: ignore[misc]
+
+    return DuckDbStateManager
+
+
+def _build_jsonl_class():
+    """Build the JSONL StateManager class with mixin."""
+    from pralph.jsonl_state import JsonlStateMixin
+
+    class JsonlStateManager(_BaseStateManager, JsonlStateMixin):
+        def __init__(self, project_dir: str, *, project_name: str | None = None, readonly: bool = False, domains: list[str] | None = None) -> None:
+            super().__init__(project_dir, project_name=project_name, readonly=readonly, domains=domains)
+            if not readonly:
+                self._migrate_data_dir()
+
+    return JsonlStateManager
+
+
+# Cache built classes
+_duckdb_cls = None
+_jsonl_cls = None
+
+
+def StateManager(project_dir: str, *, project_name: str | None = None, readonly: bool = False, domains: list[str] | None = None) -> _BaseStateManager:
+    """Factory that returns the appropriate StateManager based on project.json storage setting."""
+    global _duckdb_cls, _jsonl_cls
+
+    config_path = Path(project_dir).resolve() / ".pralph" / "project.json"
+    storage = "jsonl"  # default for new projects
+    if config_path.exists():
+        try:
+            data = json.loads(config_path.read_text())
+            if "storage" in data:
+                storage = data["storage"]
+            else:
+                # Existing project without storage key — was using DuckDB before this change
+                storage = "duckdb"
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if storage == "duckdb":
+        if _duckdb_cls is None:
+            _duckdb_cls = _build_duckdb_class()
+        return _duckdb_cls(project_dir, project_name=project_name, readonly=readonly, domains=domains)
+
+    if _jsonl_cls is None:
+        _jsonl_cls = _build_jsonl_class()
+    return _jsonl_cls(project_dir, project_name=project_name, readonly=readonly, domains=domains)

@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import random
 import time
-import uuid
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
@@ -12,61 +10,64 @@ import click
 
 from pralph.assembler import (
     assemble_add_prompt,
-    assemble_compound_prompt,
     assemble_ideate_prompt,
     assemble_implement_prompt,
     assemble_justloop_prompt,
     assemble_phase1_analyze_prompt,
     assemble_plan_prompt,
     assemble_refine_prompt,
-    assemble_review_prompt,
     assemble_stories_prompt,
     build_guardrails_system_prompt,
 )
+from pralph.compound import run_compound_capture
 from pralph.models import IterationResult, PhaseState, Story, StoryStatus
+from pralph.parallel import FOUNDATION_CATEGORIES, sort_stories, run_parallel_implement
 from pralph.parser import (
     detect_completion_signal,
     detect_ideation_complete,
     detect_loop_complete,
     extract_json_from_text,
-    parse_compound_output,
     parse_implement_output,
     parse_plan_output,
-    parse_review_output,
     parse_stories_output,
 )
+from pralph.review import run_review
 from pralph.runner import (
     ADD_TOOLS,
-    COMPOUND_TOOLS,
     IDEATE_TOOLS,
     IMPLEMENT_TOOLS,
     JUSTLOOP_TOOLS,
     PLAN_TOOLS,
     REFINE_TOOLS,
-    REVIEW_TOOLS,
     STORIES_TOOLS_EXTRACT,
     STORIES_TOOLS_RESEARCH,
     ClaudeResult,
-    resume_interactive,
+    make_session_id,
     run_with_retry,
 )
+from pralph.terminal import resume_interactive
 from pralph.state import StateManager
-
-# Foundation categories to prioritize in implementation
-FOUNDATION_CATEGORIES = frozenset({
-    "FND", "DBM", "SEC", "ARC", "ADM", "DAT", "DEP", "SYS", "INF",
-    "INFRA", "ARCH", "DB", "AUTH", "SETUP", "FOUNDATION",
-})
 
 
 def _token_kwargs(cr: ClaudeResult) -> dict:
-    """Extract token fields from a ClaudeResult as keyword arguments for IterationResult."""
-    return {
+    """Extract token and session fields from a ClaudeResult as keyword arguments for IterationResult."""
+    d: dict = {
         "input_tokens": cr.input_tokens,
         "output_tokens": cr.output_tokens,
         "cache_read_input_tokens": cr.cache_read_input_tokens,
         "cache_creation_input_tokens": cr.cache_creation_input_tokens,
     }
+    if cr.session_id:
+        d["session_id"] = cr.session_id
+    return d
+
+
+def _stamp_session(stories: list[Story], session_id: str) -> None:
+    """Tag stories with the session_id that created them."""
+    if not session_id:
+        return
+    for s in stories:
+        s.metadata["session_id"] = session_id
 
 
 # ── session resume support ───────────────────────────────────────────
@@ -136,6 +137,8 @@ def _run_loop(
             choice = _session_resume_prompt(ps)
             if choice == "headless":
                 result = resume_fn(ps.active_session_id, ps)
+                if not result.session_id:
+                    result.session_id = ps.active_session_id
                 state.log_iteration(result)
                 ps.total_cost_usd += result.cost_usd
                 _clear_session_tracking(ps)
@@ -195,6 +198,8 @@ def _run_loop(
         t0 = time.time()
         result = iteration_fn(i, ps)
         result.duration = time.time() - t0
+        if not result.session_id and ps.active_session_id:
+            result.session_id = ps.active_session_id
 
         state.log_iteration(result)
         ps.total_cost_usd += result.cost_usd
@@ -261,7 +266,7 @@ def run_plan_loop(
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
         prompt = assemble_plan_prompt(state, iteration=i, total=total, user_prompt=user_prompt, phase_state=ps)
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "plan")
         ps.active_session_id = sid
         ps.active_session_started = datetime.now().isoformat()
         state.save_phase_state(ps)
@@ -369,7 +374,7 @@ def run_stories_loop(
         prompt = assemble_stories_prompt(state, mode=mode, phase_state=ps)
         tools = STORIES_TOOLS_RESEARCH if mode == "research" else STORIES_TOOLS_EXTRACT
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "stories")
         ps.active_session_id = sid
         ps.active_session_started = datetime.now().isoformat()
         state.save_phase_state(ps)
@@ -403,6 +408,7 @@ def run_stories_loop(
         new_stories = [s for s in stories if s.id not in existing_ids]
 
         if new_stories:
+            _stamp_session(new_stories, result.session_id)
             state.append_stories(new_stories)
             click.echo(click.style(f"  +{len(new_stories)} stories", fg='green', bold=True) + f" (mode={mode})")
             for s in new_stories:
@@ -431,6 +437,7 @@ def run_stories_loop(
         existing_ids = state.get_story_ids()
         new_stories = [s for s in stories if s.id not in existing_ids]
         if new_stories:
+            _stamp_session(new_stories, result.session_id)
             state.append_stories(new_stories)
             click.echo(click.style(f"  +{len(new_stories)} stories (resumed)", fg='green', bold=True))
             for s in new_stories:
@@ -538,6 +545,7 @@ def run_add(
                 story.id = candidate
                 break
 
+    _stamp_session([story], result.session_id)
     state.append_stories([story])
     state.log_iteration(IterationResult(
         iteration=1, phase="add", mode="add",
@@ -617,6 +625,7 @@ def run_refine(
         existing_ids.add(s.id)
 
     # Append new stories
+    _stamp_session(stories, result.session_id)
     state.append_stories(stories)
 
     # Mark originals as skipped
@@ -655,7 +664,7 @@ def run_ideate_loop(
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
         prompt = assemble_ideate_prompt(state, ideas_text=ideas_text, phase_state=ps)
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "ideate")
         ps.active_session_id = sid
         ps.active_session_started = datetime.now().isoformat()
         state.save_phase_state(ps)
@@ -693,6 +702,7 @@ def run_ideate_loop(
         new_stories = [s for s in stories if s.id not in existing_ids]
 
         if new_stories:
+            _stamp_session(new_stories, result.session_id)
             state.append_stories(new_stories)
             click.echo(click.style(f"  +{len(new_stories)} stories", fg='green', bold=True))
             for s in new_stories:
@@ -730,6 +740,7 @@ def run_ideate_loop(
         existing_ids = state.get_story_ids()
         new_stories = [s for s in stories if s.id not in existing_ids]
         if new_stories:
+            _stamp_session(new_stories, result.session_id)
             state.append_stories(new_stories)
             click.echo(click.style(f"  +{len(new_stories)} stories (resumed)", fg='green', bold=True))
             for s in new_stories:
@@ -778,12 +789,16 @@ def run_webgen_loop(
         click.echo("Error: No design document found. Run 'pralph plan' first.")
         return PhaseState(phase="webgen", completed=True, completion_reason="no_design_doc")
 
+    if not state.has_stories():
+        click.echo("Error: No stories found. Run 'pralph stories' before 'webgen'.")
+        return PhaseState(phase="webgen", completed=True, completion_reason="no_stories")
+
     system_prompt = build_guardrails_system_prompt("stories", state)
 
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
         prompt = assemble_stories_prompt(state, mode="webgen", phase_state=ps)
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "webgen")
         ps.active_session_id = sid
         ps.active_session_started = datetime.now().isoformat()
         state.save_phase_state(ps)
@@ -818,6 +833,7 @@ def run_webgen_loop(
         if new_stories:
             for s in new_stories:
                 s.source = "webgen"
+            _stamp_session(new_stories, result.session_id)
             state.append_stories(new_stories)
             click.echo(f"  +{len(new_stories)} webgen stories")
             for s in new_stories:
@@ -855,6 +871,7 @@ def run_webgen_loop(
         if new_stories:
             for s in new_stories:
                 s.source = "webgen"
+            _stamp_session(new_stories, result.session_id)
             state.append_stories(new_stories)
             click.echo(click.style(f"  +{len(new_stories)} webgen stories (resumed)", fg='green', bold=True))
             for s in new_stories:
@@ -888,13 +905,63 @@ def run_webgen_loop(
 # ── Phase 3: Implement ───────────────────────────────────────────────
 
 
+def _resolve_story_ids(
+    state: StateManager,
+    story_ids: list[str],
+    with_deps: bool,
+) -> list[str]:
+    """Resolve story IDs, optionally including upstream dependencies.
+
+    Returns IDs in dependency order (deps first), filtered to only
+    pending/rework stories.
+    """
+    all_stories = state.load_stories()
+    by_id = {s.id: s for s in all_stories}
+
+    # Validate requested IDs exist
+    missing = [sid for sid in story_ids if sid not in by_id]
+    if missing:
+        raise click.ClickException(f"Stories not found: {', '.join(missing)}")
+
+    target_ids = set(story_ids)
+
+    if with_deps:
+        # Walk upstream: for each target, collect all transitive dependencies
+        def collect_deps(sid: str, visited: set[str]) -> None:
+            if sid in visited:
+                return
+            visited.add(sid)
+            story = by_id.get(sid)
+            if story:
+                for dep_id in story.dependencies:
+                    collect_deps(dep_id, visited)
+
+        all_needed: set[str] = set()
+        for sid in story_ids:
+            collect_deps(sid, all_needed)
+        target_ids = all_needed
+
+    # Filter to only actionable stories (pending/rework)
+    done_statuses = {StoryStatus.implemented, StoryStatus.skipped,
+                     StoryStatus.duplicate, StoryStatus.external}
+    actionable = [
+        by_id[sid] for sid in target_ids
+        if sid in by_id and by_id[sid].status not in done_statuses
+    ]
+
+    # Sort in dependency order
+    ordered = sort_stories(actionable)
+    return [s.id for s in ordered]
+
+
 def run_implement_loop(
     state: StateManager,
     *,
     model: str = "sonnet",
     max_iterations: int = 50,
     cooldown: int = 5,
-    story_id: str | None = None,
+    story_ids: list[str] | None = None,
+    with_deps: bool = False,
     phase1: bool = True,
     review: bool = True,
     compound: bool = False,
@@ -904,9 +971,10 @@ def run_implement_loop(
     verbose: bool = False,
     dangerously_skip_permissions: bool = False,
     max_budget_usd: float | None = None,
+    parallel: int = 1,
 ) -> PhaseState:
     """Run the implementation loop."""
-    if not state.stories_path.exists():
+    if not state.has_stories():
         click.echo("Error: No stories found. Run 'pralph stories' first.")
         return PhaseState(phase="implement", completed=True, completion_reason="no_stories")
 
@@ -924,18 +992,55 @@ def run_implement_loop(
     if extra_tools:
         tools = tools + "," + extra_tools
 
-    # If specific story requested, just implement it
-    if story_id:
-        return _implement_single(state, story_id, model=model, system_prompt=system_prompt,
-                                 tools=tools, user_prompt=user_prompt, review=review,
-                                 compound=compound, save_global=save_global, verbose=verbose,
-                                 dangerously_skip_permissions=dangerously_skip_permissions,
-                                 max_budget_usd=max_budget_usd)
+    # If specific stories requested, resolve and implement them in order
+    if story_ids:
+        resolved = _resolve_story_ids(state, story_ids, with_deps)
+        if not resolved:
+            click.echo("  All requested stories (and dependencies) are already done.")
+            return PhaseState(phase="implement", completed=True, completion_reason="all_stories_done")
+        if with_deps and len(resolved) > len(story_ids):
+            dep_ids = [sid for sid in resolved if sid not in set(story_ids)]
+            click.echo(click.style(f"  Including {len(dep_ids)} dependencies:", fg='cyan'))
+            for sid in dep_ids:
+                click.echo(f"    {click.style(sid, fg='blue')}")
+        click.echo(f"  Implementation order: {', '.join(resolved)}")
+        last_ps = PhaseState(phase="implement")
+        for sid in resolved:
+            last_ps = _implement_single(
+                state, sid, model=model, system_prompt=system_prompt,
+                tools=tools, user_prompt=user_prompt, review=review,
+                compound=compound, save_global=save_global, verbose=verbose,
+                dangerously_skip_permissions=dangerously_skip_permissions,
+                max_budget_usd=max_budget_usd,
+            )
+            # Stop on user abort/interrupt or error
+            if last_ps.completion_reason in ("user_aborted", "user_interrupted", "error"):
+                break
+        last_ps.completion_reason = last_ps.completion_reason or "all_stories_done"
+        return last_ps
+
+    # Parallel mode: run up to N stories concurrently
+    if parallel > 1:
+        return run_parallel_implement(
+            state,
+            parallel=parallel,
+            model=model,
+            system_prompt=system_prompt,
+            tools=tools,
+            user_prompt=user_prompt,
+            phase1=phase1,
+            review=review,
+            compound=compound,
+            cooldown=cooldown,
+            verbose=verbose,
+            dangerously_skip_permissions=dangerously_skip_permissions,
+            max_budget_usd=max_budget_usd,
+        )
 
     # State-based mode selection (evaluated each iteration)
     def _pick_implement_mode() -> str:
         if phase1:
-            has_analysis = state.phase1_analysis_path.exists()
+            has_analysis = state.has_phase1_analysis()
             has_foundation = any(
                 s.category.upper() in FOUNDATION_CATEGORIES
                 for s in state.get_pending_stories()
@@ -952,16 +1057,15 @@ def run_implement_loop(
         rework = [s for s in actionable if s.status == StoryStatus.rework]
         pending = [s for s in actionable if s.status == StoryStatus.pending]
 
-        analysis_path = state.phase1_analysis_path
-        if analysis_path.exists():
-            data = json.loads(analysis_path.read_text())
-            impl_order = data.get("implementation_order", data.get("phase_1_group", []))
+        analysis_data = state.load_phase1_analysis()
+        if analysis_data is not None:
+            impl_order = analysis_data.get("implementation_order", analysis_data.get("phase_1_group", []))
             pending_ids = {s.id for s in pending}
             ordered_ids = [sid for sid in impl_order if sid in pending_ids]
             ordered = [s for sid in ordered_ids for s in pending if s.id == sid]
             remaining = [s for s in pending if s.id not in set(ordered_ids)]
-            return rework + ordered + _sort_stories(remaining)
-        return rework + _sort_stories(pending)
+            return rework + ordered + sort_stories(remaining)
+        return rework + sort_stories(pending)
 
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
         nonlocal story_queue
@@ -999,8 +1103,8 @@ def run_implement_loop(
                     **_token_kwargs(result),
                 )
 
-            # Save analysis to file for the implement step
-            state.phase1_analysis_path.write_text(json.dumps(data, indent=2) + "\n")
+            # Save analysis to DuckDB for the implement step
+            state.save_phase1_analysis(data)
 
             group = data["phase_1_group"]
             reasoning = data.get("reasoning", {})
@@ -1039,7 +1143,7 @@ def run_implement_loop(
 
         prompt = assemble_implement_prompt(state, story, phase_state=ps, user_prompt=user_prompt)
 
-        sid = str(uuid.uuid4())
+        sid = make_session_id(state.project_id, "implement", story.id, story.title)
         ps.active_session_id = sid
         ps.active_story_id = story.id
         ps.active_session_started = datetime.now().isoformat()
@@ -1108,7 +1212,7 @@ def run_implement_loop(
 
         # Review step: run on fresh Claude instance after successful implementation
         if new_status == StoryStatus.implemented and review:
-            review_result = _run_review(
+            review_result = run_review(
                 state, story,
                 model=model,
                 system_prompt=system_prompt,
@@ -1129,7 +1233,7 @@ def run_implement_loop(
 
         # Compound learning: capture solutions after successful implementation
         if new_status == StoryStatus.implemented and compound:
-            compound_result = _run_compound_capture(
+            compound_result = run_compound_capture(
                 state, story,
                 model=model,
                 system_prompt=system_prompt,
@@ -1144,13 +1248,13 @@ def run_implement_loop(
             total_cache_read += compound_result.cache_read_input_tokens
             total_cache_create += compound_result.cache_creation_input_tokens
 
-        # Clean up analysis file when all its stories are done
-        if new_status == StoryStatus.implemented and state.phase1_analysis_path.exists():
-            data = json.loads(state.phase1_analysis_path.read_text())
-            group_ids = set(data.get("implementation_order", data.get("phase_1_group", [])))
+        # Clean up analysis when all its stories are done
+        if new_status == StoryStatus.implemented and state.has_phase1_analysis():
+            p1_data = state.load_phase1_analysis()
+            group_ids = set(p1_data.get("implementation_order", p1_data.get("phase_1_group", [])))
             pending_ids = {s.id for s in state.get_pending_stories()}
             if not group_ids & pending_ids:
-                state.phase1_analysis_path.unlink(missing_ok=True)
+                state.delete_phase1_analysis()
                 story_queue.clear()
                 click.echo(click.style("  Phase 1 analysis complete — switching to normal ordering", fg='green'))
 
@@ -1219,7 +1323,7 @@ def run_implement_loop(
         total_cache_create = result.cache_creation_input_tokens
 
         if new_status == StoryStatus.implemented and review:
-            review_result = _run_review(
+            review_result = run_review(
                 state, story,
                 model=model,
                 system_prompt=system_prompt,
@@ -1258,85 +1362,6 @@ def run_implement_loop(
         return False
 
     return _run_loop("implement", state, max_iterations, cooldown, iteration_fn, completion_fn, resume_fn, verbose, dangerously_skip_permissions)
-
-
-@dataclass
-class _ReviewResult:
-    approved: bool
-    feedback: str
-    issues: list
-    cost_usd: float
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_input_tokens: int = 0
-    cache_creation_input_tokens: int = 0
-
-
-def _run_review(
-    state: StateManager,
-    story: Story,
-    *,
-    model: str,
-    system_prompt: str,
-    verbose: bool,
-    dangerously_skip_permissions: bool,
-    max_budget_usd: float | None,
-) -> _ReviewResult | None:
-    """Run a review on a freshly implemented story. Returns None on review error."""
-    click.echo(click.style(f"  🔍 Reviewing: {story.id}", fg='magenta', bold=True))
-
-    review_prompt = assemble_review_prompt(state, story)
-    result = run_with_retry(
-        review_prompt,
-        model=model,
-        allowed_tools=REVIEW_TOOLS,
-        system_prompt=system_prompt,
-        dangerously_skip_permissions=dangerously_skip_permissions,
-        max_budget_usd=max_budget_usd,
-        timeout=600,
-        verbose=verbose,
-        project_dir=str(state.project_dir),
-    )
-
-    if not result.success:
-        click.echo(click.style(f"  ⚠ Review failed (error): {result.error[:120]}", fg='yellow'))
-        click.echo(click.style("  → Auto-approving due to review error", fg='yellow'))
-        return None
-
-    parsed = parse_review_output(result.result)
-    approved = parsed["approved"]
-    feedback = parsed["feedback"]
-    issues = parsed.get("issues", [])
-
-    if approved:
-        state.clear_review_feedback(story.id)
-        click.echo(click.style(f"  ✓ Review approved", fg='green', bold=True) + f" — {feedback[:120]}")
-    else:
-        # Build feedback text for the rework file
-        feedback_lines = [f"# Review Feedback for {story.id}\n", f"**Summary:** {feedback}\n"]
-        for issue in issues:
-            sev = issue.get("severity", "?")
-            desc = issue.get("description", "")
-            feedback_lines.append(f"- **[{sev}]** {desc}")
-        feedback_text = "\n".join(feedback_lines)
-        state.write_review_feedback(story.id, feedback_text)
-        click.echo(click.style(f"  ✗ Review rejected", fg='red', bold=True) + f" — {feedback[:120]}")
-        for issue in issues:
-            sev = issue.get("severity", "?")
-            desc = issue.get("description", "")
-            color = 'red' if sev in ("critical", "major") else 'yellow'
-            click.echo(f"    {click.style(f'[{sev}]', fg=color)} {desc[:100]}")
-
-    return _ReviewResult(
-        approved=approved,
-        feedback=feedback,
-        issues=issues,
-        cost_usd=result.cost_usd,
-        input_tokens=result.input_tokens,
-        output_tokens=result.output_tokens,
-        cache_read_input_tokens=result.cache_read_input_tokens,
-        cache_creation_input_tokens=result.cache_creation_input_tokens,
-    )
 
 
 def _implement_single(
@@ -1409,7 +1434,7 @@ def _implement_single(
 
     # Review step for single story implementation
     if new_status == StoryStatus.implemented and review:
-        review_result = _run_review(
+        review_result = run_review(
             state, story,
             model=model,
             system_prompt=system_prompt,
@@ -1423,7 +1448,7 @@ def _implement_single(
 
     # Compound learning: capture solutions after successful implementation
     if new_status == StoryStatus.implemented and compound:
-        _run_compound_capture(
+        run_compound_capture(
             state, story,
             model=model,
             system_prompt=system_prompt,
@@ -1435,184 +1460,6 @@ def _implement_single(
 
     _suggest_compact(state)
     return PhaseState(phase="implement", completed=True, completion_reason="single_story_done")
-
-
-def _slugify(text: str) -> str:
-    """Generate a filename-safe slug from text."""
-    import re as _re
-    slug = text.lower().strip()
-    slug = _re.sub(r"[^\w\s-]", "", slug)
-    slug = _re.sub(r"[\s_]+", "-", slug)
-    slug = _re.sub(r"-+", "-", slug)
-    return slug[:80].strip("-")
-
-
-@dataclass
-class _CompoundResult:
-    cost_usd: float
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_input_tokens: int = 0
-    cache_creation_input_tokens: int = 0
-
-
-def _run_compound_capture(
-    state: StateManager,
-    story: Story,
-    *,
-    model: str,
-    system_prompt: str,
-    verbose: bool,
-    dangerously_skip_permissions: bool,
-    max_budget_usd: float | None,
-    save_global: bool = False,
-) -> _CompoundResult:
-    """Run compound learning capture after a successful implementation. Returns result with cost and tokens."""
-    click.echo(click.style(f"  Capturing learnings: {story.id}", fg='magenta', bold=True))
-
-    prompt = assemble_compound_prompt(state, story)
-    result = run_with_retry(
-        prompt,
-        model=model,
-        allowed_tools=COMPOUND_TOOLS,
-        system_prompt=system_prompt,
-        dangerously_skip_permissions=dangerously_skip_permissions,
-        max_budget_usd=max_budget_usd,
-        timeout=300,
-        verbose=verbose,
-        project_dir=str(state.project_dir),
-    )
-
-    if not result.success:
-        click.echo(click.style(f"  Compound capture failed: {result.error[:120]}", fg='yellow'))
-        return _CompoundResult(cost_usd=result.cost_usd, **_token_kwargs(result))
-
-    parsed = parse_compound_output(result.result)
-
-    if not parsed["captured"]:
-        click.echo(click.style(f"  Nothing notable: {parsed['reason'][:120]}", fg='yellow'))
-        return _CompoundResult(cost_usd=result.cost_usd, **_token_kwargs(result))
-
-    solutions = parsed.get("solutions", [])
-    for sol in solutions:
-        title = sol.get("title", "Untitled")
-        category = sol.get("category", "logic-errors")
-        tags = sol.get("tags", [])
-        error_sig = sol.get("error_signature", "")
-        content = sol.get("content", "")
-
-        if not content:
-            # Build content from fields if not provided as full doc
-            parts = [f"# {title}\n"]
-            if sol.get("problem"):
-                parts.append(f"## Problem\n\n{sol['problem']}\n")
-            if error_sig:
-                parts.append(f"## Error Signature\n\n`{error_sig}`\n")
-            if sol.get("solution"):
-                parts.append(f"## Solution\n\n{sol['solution']}\n")
-            if sol.get("prevention"):
-                parts.append(f"## Prevention\n\n{sol['prevention']}\n")
-            if sol.get("related_files"):
-                files = "\n".join(f"- {f}" for f in sol["related_files"])
-                parts.append(f"## Related Files\n\n{files}\n")
-            content = "\n".join(parts)
-
-        filename_slug = _slugify(title) + ".md"
-        index_entry = {
-            "filename": f"{category}/{filename_slug}",
-            "category": category,
-            "title": title,
-            "tags": tags,
-            "story_id": story.id,
-            "created": datetime.now().isoformat(),
-            "error_signature": error_sig,
-            "related_files": sol.get("related_files", []),
-        }
-
-        path = state.save_solution(category, filename_slug, content, index_entry)
-        click.echo(click.style(f"  + {title}", fg='green') + f" → {path}")
-
-        # Optionally save to global domain-scoped store
-        if save_global:
-            global_paths = state.save_solution_global(category, filename_slug, content, index_entry)
-            if global_paths:
-                saved_domains = [p.parts[-3] for p in global_paths]
-                click.echo(click.style(f"    ↑ global", fg='cyan') + f" [{', '.join(saved_domains)}]")
-
-    click.echo(click.style(f"  Captured {len(solutions)} solution(s)", fg='green', bold=True))
-    return _CompoundResult(cost_usd=result.cost_usd, **_token_kwargs(result))
-
-
-def run_compound(
-    state: StateManager,
-    *,
-    story_id: str | None = None,
-    description: str = "",
-    model: str = "sonnet",
-    verbose: bool = False,
-    dangerously_skip_permissions: bool = False,
-    max_budget_usd: float | None = None,
-    save_global: bool = False,
-) -> float:
-    """Standalone compound capture. Returns cost."""
-    from pralph.assembler import build_guardrails_system_prompt
-
-    system_prompt = build_guardrails_system_prompt("implement", state)
-
-    if story_id:
-        stories = state.load_stories()
-        story = next((s for s in stories if s.id == story_id), None)
-        if not story:
-            click.echo(f"Error: Story '{story_id}' not found")
-            return 0.0
-    else:
-        # Create a synthetic story for ad-hoc capture
-        story = Story(
-            id="COMPOUND",
-            title=description or "Ad-hoc compound capture",
-            content=description,
-        )
-
-    cr = _run_compound_capture(
-        state, story,
-        model=model,
-        system_prompt=system_prompt,
-        verbose=verbose,
-        dangerously_skip_permissions=dangerously_skip_permissions,
-        max_budget_usd=max_budget_usd,
-        save_global=save_global,
-    )
-    return cr.cost_usd
-
-
-def _sort_stories(stories: list[Story]) -> list[Story]:
-    """Sort stories: foundation categories first → priority → dependency order."""
-
-    def sort_key(s: Story) -> tuple[int, int, str]:
-        is_foundation = 0 if s.category.upper() in FOUNDATION_CATEGORIES else 1
-        return (is_foundation, s.priority, s.id)
-
-    sorted_stories = sorted(stories, key=sort_key)
-
-    # Simple topological adjustment: if A depends on B, B comes first
-    id_to_idx = {s.id: i for i, s in enumerate(sorted_stories)}
-    result: list[Story] = []
-    visited: set[str] = set()
-
-    def visit(story: Story) -> None:
-        if story.id in visited:
-            return
-        visited.add(story.id)
-        for dep_id in story.dependencies:
-            if dep_id in id_to_idx and dep_id not in visited:
-                dep_story = sorted_stories[id_to_idx[dep_id]]
-                visit(dep_story)
-        result.append(story)
-
-    for s in sorted_stories:
-        visit(s)
-
-    return result
 
 
 # ── Justloop ─────────────────────────────────────────────────────────
@@ -1631,6 +1478,8 @@ def run_justloop(
     max_budget_usd: float | None = None,
 ) -> PhaseState:
     """Run a simple prompt loop until completion."""
+    import uuid
+
     system_prompt = build_guardrails_system_prompt("implement", state)
     tools = JUSTLOOP_TOOLS
     if extra_tools:
