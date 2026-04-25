@@ -517,27 +517,23 @@ def compact_index(ctx, global_only, local_only):
         else:
             click.echo("  local: no index")
 
-    # Global indexes
+    # Global indexes — independent of current project's detected domains
     if not local_only:
-        domains = state.detect_domains()
-        if domains:
-            results = state.compact_global_indexes(**compact_kwargs)
-            if results:
-                for stats in results:
-                    domain = stats["domain"]
-                    total_merged += stats["merged"]
-                    total_removed += stats["removed"]
-                    total_cost += stats.get("cost", 0.0)
-                    changed = stats["merged"] + stats["removed"]
-                    if changed:
-                        click.echo(click.style(f"  global/{domain}: {stats['original']} → {stats['kept']}", fg='green')
-                                   + f" ({stats['merged']} merged, {stats['removed']} removed)")
-                    else:
-                        click.echo(f"  global/{domain}: {stats['kept']} entries (clean)")
-            else:
-                click.echo("  global: no indexes found")
+        results = state.compact_global_indexes(**compact_kwargs)
+        if results:
+            for stats in results:
+                domain = stats["domain"]
+                total_merged += stats["merged"]
+                total_removed += stats["removed"]
+                total_cost += stats.get("cost", 0.0)
+                changed = stats["merged"] + stats["removed"]
+                if changed:
+                    click.echo(click.style(f"  global/{domain}: {stats['original']} → {stats['kept']}", fg='green')
+                               + f" ({stats['merged']} merged, {stats['removed']} removed)")
+                else:
+                    click.echo(f"  global/{domain}: {stats['kept']} entries (clean)")
         else:
-            click.echo("  global: no domains detected")
+            click.echo("  global: no indexes found")
 
     total = total_merged + total_removed
     if total:

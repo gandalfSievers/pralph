@@ -983,23 +983,30 @@ class StateManager:
         verbose: bool = False,
         dangerously_skip_permissions: bool = False,
     ) -> list[dict]:
-        """Compact global solution indexes for all detected domains.
+        """Compact every global solution index that exists under ~/.pralph/solutions/.
 
+        Global compaction is independent of the current project's detected
+        domains — `--global-only` from any cwd compacts all global domains.
         Returns a list of stats dicts, one per domain.
         """
         results = []
-        for domain in self.detect_domains():
-            idx_path = self._global_domain_index_path(domain)
+        solutions_root = self.home_dir / "solutions"
+        if not solutions_root.exists():
+            return results
+        for domain_dir in sorted(solutions_root.iterdir()):
+            if not domain_dir.is_dir():
+                continue
+            idx_path = domain_dir / "index.jsonl"
             if not idx_path.exists():
                 continue
             stats = self._compact_index(
                 idx_path,
-                self._global_domain_solutions_dir(domain),
+                domain_dir,
                 model=model,
                 verbose=verbose,
                 dangerously_skip_permissions=dangerously_skip_permissions,
             )
-            stats["domain"] = domain
+            stats["domain"] = domain_dir.name
             results.append(stats)
         return results
 

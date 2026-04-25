@@ -1529,15 +1529,22 @@ def _run_compound_capture(
             "related_files": sol.get("related_files", []),
         }
 
-        path = state.save_solution(category, filename_slug, content, index_entry)
-        click.echo(click.style(f"  + {title}", fg='green') + f" → {path}")
-
-        # Optionally save to global domain-scoped store
         if save_global:
+            # Global learning on → write only to ~/.pralph/solutions/{domain}/,
+            # not the project-local store. Fall back to local only if global
+            # save produced nothing (no domains could be inferred), so the
+            # solution isn't lost.
             global_paths = state.save_solution_global(category, filename_slug, content, index_entry)
             if global_paths:
                 saved_domains = [p.parts[-3] for p in global_paths]
-                click.echo(click.style(f"    ↑ global", fg='cyan') + f" [{', '.join(saved_domains)}]")
+                click.echo(click.style(f"  ↑ {title}", fg='cyan') + f" [global: {', '.join(saved_domains)}]")
+            else:
+                path = state.save_solution(category, filename_slug, content, index_entry)
+                click.echo(click.style(f"  ! {title}", fg='yellow')
+                           + f" (no global domain inferred, saved local) → {path}")
+        else:
+            path = state.save_solution(category, filename_slug, content, index_entry)
+            click.echo(click.style(f"  + {title}", fg='green') + f" → {path}")
 
     click.echo(click.style(f"  Captured {len(solutions)} solution(s)", fg='green', bold=True))
     return _CompoundResult(cost_usd=result.cost_usd, **_token_kwargs(result))
