@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 try:
@@ -99,6 +100,90 @@ def _stop_elapsed_timer(stop: threading.Event):
     stop.set()
     with _timer_lock:
         _clear_timer_line()
+
+
+# ── Loop control: shrink max-iterations from the ESC menu ─────────────
+#
+# The ESC interrupt menu offers "set max iterations to current", which
+# tells _run_loop to exit cleanly after the current iteration finishes.
+# Implemented as a module-level flag so the interrupt handler (called
+# from inside run_claude) can signal _run_loop in loop.py without
+# threading state through every iteration_fn.
+
+_max_iter_truncate = threading.Event()
+_loop_context: dict = {}
+
+
+def request_truncate_max_iter() -> None:
+    _max_iter_truncate.set()
+
+
+def cancel_truncate_max_iter() -> None:
+    _max_iter_truncate.clear()
+
+
+def consume_truncate_request() -> bool:
+    """Return True (and clear) if a max-iter truncate request is pending."""
+    if _max_iter_truncate.is_set():
+        _max_iter_truncate.clear()
+        return True
+    return False
+
+
+def is_truncate_requested() -> bool:
+    return _max_iter_truncate.is_set()
+
+
+def set_loop_context(phase: str, current: int, last: int) -> None:
+    """Record loop position so the interrupt menu can show it.
+
+    *last* is the last iteration number planned for this loop session
+    (inclusive), i.e. start_iter + max_iterations - 1.
+    """
+    _loop_context["phase"] = phase
+    _loop_context["current"] = current
+    _loop_context["last"] = last
+
+
+def clear_loop_context() -> None:
+    _loop_context.clear()
+
+
+def get_loop_context() -> dict:
+    return dict(_loop_context)
+
+
+@contextmanager
+def _stdin_from_tty():
+    """Temporarily point ``sys.stdin`` at /dev/tty when stdin isn't a TTY.
+
+    When the user pipes a prompt at startup (``echo "..." | pralph justloop``),
+    ``sys.stdin`` is the now-exhausted pipe and ``click.prompt`` can't read
+    keystrokes. This re-opens /dev/tty for the duration of the block so any
+    Python-level reads (click, input(), etc.) get the keyboard. No-op when
+    stdin is already a TTY or /dev/tty is unavailable.
+
+    Note: this only affects Python-level ``sys.stdin``. Subprocesses inherit
+    file descriptor 0 directly and need ``stdin=...`` passed to ``Popen``.
+    """
+    if sys.stdin.isatty():
+        yield
+        return
+    try:
+        tty_fh = open("/dev/tty", "r")  # noqa: SIM115
+    except OSError:
+        yield
+        return
+    saved = sys.stdin
+    sys.stdin = tty_fh
+    try:
+        yield
+    finally:
+        try:
+            tty_fh.close()
+        except OSError:
+            pass
+        sys.stdin = saved
 
 
 def run_claude(
@@ -478,39 +563,45 @@ def _handle_interrupt(
     except (OSError, ValueError):
         pass
 
-    # When stdin is piped, redirect stdin to /dev/tty so click.prompt reads
-    # from the terminal instead of the exhausted pipe.
-    restore_stdin = None
-    if not sys.stdin.isatty():
-        try:
-            restore_stdin = sys.stdin
-            sys.stdin = open("/dev/tty", "r")  # noqa: SIM115
-        except OSError:
-            sys.stdin = restore_stdin
-            restore_stdin = None
-
     verbose_label = "Off" if verbose else "On"
 
-    click.echo()
-    click.echo(click.style("  ⏸  Interrupted", fg="yellow", bold=True))
-    click.echo()
-    click.echo("  [1] Continue  — resume where it left off")
-    click.echo("  [2] Take over — open interactive session")
-    click.echo("  [3] Skip      — continue to next iteration")
-    click.echo("  [4] Abort     — stop the loop")
-    click.echo()
-    click.echo(f"  [5] Toggle verbose ({verbose_label})")
-    click.echo()
-    try:
-        choice = click.prompt(
-            "  Choice", type=click.Choice(["1", "2", "3", "4", "5"]), default="1",
-        )
-    finally:
-        if restore_stdin is not None:
-            sys.stdin.close()
-            sys.stdin = restore_stdin
+    ctx = get_loop_context()
+    truncate_pending = is_truncate_requested()
 
-    if choice == "5":
+    with _stdin_from_tty():
+        click.echo()
+        click.echo(click.style("  ⏸  Interrupted", fg="yellow", bold=True))
+        if ctx:
+            cur = ctx.get("current", 0)
+            last = ctx.get("last", 0)
+            remaining_after = max(0, last - cur)
+            phase = ctx.get("phase", "")
+            click.echo(click.style(
+                f"  Phase '{phase}': iteration {cur} (last planned: {last}, "
+                f"{remaining_after} more after this)", dim=True,
+            ))
+        if truncate_pending:
+            click.echo(click.style(
+                "  ⓘ Pending: this is the last iteration (max-iterations truncated)",
+                fg="cyan",
+            ))
+        click.echo()
+        click.echo("  [1] Continue  — resume where it left off")
+        click.echo("  [2] Take over — open interactive session")
+        click.echo("  [3] Skip      — continue to next iteration")
+        if truncate_pending:
+            click.echo("  [4] Cancel finish — keep running remaining iterations")
+        else:
+            click.echo("  [4] Finish    — set max-iterations to current, exit cleanly after this one")
+        click.echo("  [5] Abort     — stop the loop now")
+        click.echo()
+        click.echo(f"  [6] Toggle verbose ({verbose_label})")
+        click.echo()
+        choice = click.prompt(
+            "  Choice", type=click.Choice(["1", "2", "3", "4", "5", "6"]), default="1",
+        )
+
+    if choice == "6":
         verbose = not verbose
         state = "on" if verbose else "off"
         click.echo(click.style(f"  Verbose {state}", fg="cyan"))
@@ -521,6 +612,17 @@ def _handle_interrupt(
         return "takeover", verbose
     elif choice == "3":
         return "skip", verbose
+    elif choice == "4":
+        if truncate_pending:
+            cancel_truncate_max_iter()
+            click.echo(click.style("  Loop will continue normally", fg="cyan"))
+        else:
+            request_truncate_max_iter()
+            click.echo(click.style(
+                "  Loop will exit cleanly after this iteration finishes",
+                fg="cyan",
+            ))
+        return "continue", verbose
     else:
         return "abort", verbose
 
@@ -532,17 +634,18 @@ def _post_takeover_menu(session_id: str) -> str:
     """
     import click
 
-    click.echo()
-    click.echo(click.style("  Interactive session ended", fg="cyan", bold=True))
-    click.echo()
-    click.echo("  [1] Resume              — continue automated session")
-    click.echo("  [2] Mark as implemented — story complete")
-    click.echo("  [3] Continue loop       — story resets to pending")
-    click.echo("  [4] Abort loop")
-    click.echo()
-    choice = click.prompt(
-        "  Choice", type=click.Choice(["1", "2", "3", "4"]), default="1",
-    )
+    with _stdin_from_tty():
+        click.echo()
+        click.echo(click.style("  Interactive session ended", fg="cyan", bold=True))
+        click.echo()
+        click.echo("  [1] Resume              — continue automated session")
+        click.echo("  [2] Mark as implemented — story complete")
+        click.echo("  [3] Continue loop       — story resets to pending")
+        click.echo("  [4] Abort loop")
+        click.echo()
+        choice = click.prompt(
+            "  Choice", type=click.Choice(["1", "2", "3", "4"]), default="1",
+        )
 
     if choice == "1":
         return "resume"
@@ -559,11 +662,31 @@ def resume_interactive(
     project_dir: str | None = None,
     dangerously_skip_permissions: bool = False,
 ) -> int:
-    """Resume a claude session interactively, inheriting the terminal."""
+    """Resume a claude session interactively, inheriting the terminal.
+
+    When pralph was invoked with a piped prompt (``echo "..." | pralph ...``)
+    fd 0 is a closed pipe. Inherited as-is, the interactive ``claude`` would
+    receive immediate EOF and the user couldn't type anything. Open /dev/tty
+    explicitly in that case so the interactive session works.
+    """
     cmd = ["claude", "--resume", session_id]
     if dangerously_skip_permissions:
         cmd.append("--dangerously-skip-permissions")
-    return subprocess.call(cmd, cwd=project_dir)
+
+    tty_fd: int | None = None
+    if not os.isatty(0):
+        try:
+            tty_fd = os.open("/dev/tty", os.O_RDONLY)
+        except OSError:
+            tty_fd = None
+    try:
+        return subprocess.call(cmd, cwd=project_dir, stdin=tty_fd)
+    finally:
+        if tty_fd is not None:
+            try:
+                os.close(tty_fd)
+            except OSError:
+                pass
 
 
 def _parse_result_event(data: dict) -> ClaudeResult:

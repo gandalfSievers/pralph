@@ -47,8 +47,12 @@ from pralph.runner import (
     STORIES_TOOLS_EXTRACT,
     STORIES_TOOLS_RESEARCH,
     ClaudeResult,
+    _stdin_from_tty,
+    clear_loop_context,
+    consume_truncate_request,
     resume_interactive,
     run_with_retry,
+    set_loop_context,
 )
 from pralph.state import StateManager
 
@@ -74,23 +78,24 @@ def _token_kwargs(cr: ClaudeResult) -> dict:
 
 def _session_resume_prompt(ps: PhaseState) -> str:
     """Show resume prompt for interrupted session. Returns choice string."""
-    click.echo()
-    click.echo(click.style("  \U0001f504 Found interrupted session", fg="yellow", bold=True))
-    click.echo(f"   Phase: {ps.phase}", nl=False)
-    if ps.active_story_id:
-        click.echo(f", Story: {ps.active_story_id}", nl=False)
-    click.echo()
-    if ps.active_session_started:
-        click.echo(f"   Started: {ps.active_session_started}")
-    click.echo()
-    click.echo("   [1] Resume headlessly  \u2014 continue automated session")
-    click.echo("   [2] Resume interactive \u2014 open interactive Claude session")
-    click.echo("   [3] Start fresh        \u2014 start a new session")
-    click.echo("   [4] Abort")
-    click.echo()
-    choice = click.prompt(
-        "   Choice", type=click.Choice(["1", "2", "3", "4"]), default="1",
-    )
+    with _stdin_from_tty():
+        click.echo()
+        click.echo(click.style("  \U0001f504 Found interrupted session", fg="yellow", bold=True))
+        click.echo(f"   Phase: {ps.phase}", nl=False)
+        if ps.active_story_id:
+            click.echo(f", Story: {ps.active_story_id}", nl=False)
+        click.echo()
+        if ps.active_session_started:
+            click.echo(f"   Started: {ps.active_session_started}")
+        click.echo()
+        click.echo("   [1] Resume headlessly  \u2014 continue automated session")
+        click.echo("   [2] Resume interactive \u2014 open interactive Claude session")
+        click.echo("   [3] Start fresh        \u2014 start a new session")
+        click.echo("   [4] Abort")
+        click.echo()
+        choice = click.prompt(
+            "   Choice", type=click.Choice(["1", "2", "3", "4"]), default="1",
+        )
     return {"1": "headless", "2": "interactive", "3": "fresh", "4": "abort"}[choice]
 
 
@@ -184,60 +189,80 @@ def _run_loop(
             ps.completion_reason = ""
 
     start_iter = ps.current_iteration + 1 if ps.current_iteration > 0 else 1
+    last_iter = start_iter + max_iterations - 1
 
-    for i in range(start_iter, start_iter + max_iterations):
-        ps.current_iteration = i
-        header = f"  [{phase}] iteration {i}"
-        click.echo(f"\n{click.style('='*60, fg='cyan')}")
-        click.echo(click.style(header, fg='cyan', bold=True))
-        click.echo(click.style('='*60, fg='cyan'))
+    # Clear any stale truncate flag from a previous run.
+    consume_truncate_request()
 
-        t0 = time.time()
-        result = iteration_fn(i, ps)
-        result.duration = time.time() - t0
+    try:
+        for i in range(start_iter, start_iter + max_iterations):
+            ps.current_iteration = i
+            set_loop_context(phase, i, last_iter)
+            header = f"  [{phase}] iteration {i}"
+            click.echo(f"\n{click.style('='*60, fg='cyan')}")
+            click.echo(click.style(header, fg='cyan', bold=True))
+            click.echo(click.style('='*60, fg='cyan'))
 
-        state.log_iteration(result)
-        ps.total_cost_usd += result.cost_usd
+            t0 = time.time()
+            result = iteration_fn(i, ps)
+            result.duration = time.time() - t0
 
-        # User abort — stop immediately
-        if result.error == "aborted":
-            ps.completed = True
-            ps.completion_reason = "user_aborted"
+            state.log_iteration(result)
+            ps.total_cost_usd += result.cost_usd
+
+            # User abort — stop immediately
+            if result.error == "aborted":
+                ps.completed = True
+                ps.completion_reason = "user_aborted"
+                state.save_phase_state(ps)
+                click.echo(click.style(f"\n  Phase '{phase}' aborted by user", fg='yellow'))
+                return ps
+
+            if result.success:
+                ps.consecutive_errors = 0
+                ps.last_error = ""
+                ps.last_summary = result.raw_output[:500] if result.raw_output else result.impl_status
+                click.echo(click.style(f"  ✓ success", fg='green', bold=True) + f" (${result.cost_usd:.4f}, {result.duration:.1f}s)")
+            elif result.error == "interrupted":
+                # User interrupted but chose to continue — don't count as error
+                click.echo(click.style(f"  ⏭ skipped (interrupted)", fg='yellow'))
+            else:
+                ps.consecutive_errors += 1
+                ps.last_error = result.error[:500]
+                click.echo(click.style(f"  ✗ error:", fg='red', bold=True) + f" {result.error[:120]}")
+
+            if completion_fn(result, ps):
+                ps.completed = True
+                state.save_phase_state(ps)
+                click.echo(click.style(f"\n  Phase '{phase}' complete: {ps.completion_reason}", fg='green'))
+                _suggest_compact(state)
+                return ps
+
+            # User asked to truncate max-iterations to current — exit cleanly.
+            if consume_truncate_request():
+                ps.completed = True
+                ps.completion_reason = "user_stopped"
+                state.save_phase_state(ps)
+                click.echo(click.style(
+                    f"\n  Phase '{phase}' stopped by user after iteration {i} "
+                    f"(max-iterations truncated)", fg='yellow',
+                ))
+                _suggest_compact(state)
+                return ps
+
             state.save_phase_state(ps)
-            click.echo(click.style(f"\n  Phase '{phase}' aborted by user", fg='yellow'))
-            return ps
 
-        if result.success:
-            ps.consecutive_errors = 0
-            ps.last_error = ""
-            ps.last_summary = result.raw_output[:500] if result.raw_output else result.impl_status
-            click.echo(click.style(f"  ✓ success", fg='green', bold=True) + f" (${result.cost_usd:.4f}, {result.duration:.1f}s)")
-        elif result.error == "interrupted":
-            # User interrupted but chose to continue — don't count as error
-            click.echo(click.style(f"  ⏭ skipped (interrupted)", fg='yellow'))
-        else:
-            ps.consecutive_errors += 1
-            ps.last_error = result.error[:500]
-            click.echo(click.style(f"  ✗ error:", fg='red', bold=True) + f" {result.error[:120]}")
+            if i < last_iter:
+                time.sleep(cooldown)
 
-        if completion_fn(result, ps):
-            ps.completed = True
-            state.save_phase_state(ps)
-            click.echo(click.style(f"\n  Phase '{phase}' complete: {ps.completion_reason}", fg='green'))
-            _suggest_compact(state)
-            return ps
-
+        ps.completed = True
+        ps.completion_reason = "max_iterations"
         state.save_phase_state(ps)
-
-        if i < start_iter + max_iterations - 1:
-            time.sleep(cooldown)
-
-    ps.completed = True
-    ps.completion_reason = "max_iterations"
-    state.save_phase_state(ps)
-    click.echo(click.style(f"\n  Phase '{phase}' complete: max iterations reached", fg='yellow'))
-    _suggest_compact(state)
-    return ps
+        click.echo(click.style(f"\n  Phase '{phase}' complete: max iterations reached", fg='yellow'))
+        _suggest_compact(state)
+        return ps
+    finally:
+        clear_loop_context()
 
 
 # ── Phase 1: Plan ────────────────────────────────────────────────────
