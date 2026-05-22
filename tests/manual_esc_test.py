@@ -16,7 +16,7 @@ import time
 # Add project root to path
 sys.path.insert(0, ".")
 
-from pralph.runner import _handle_interrupt, _start_esc_monitor, _stop_esc_monitor
+from pralph.terminal import handle_interrupt, start_esc_monitor, stop_esc_monitor
 
 
 def main() -> None:
@@ -34,7 +34,7 @@ def main() -> None:
         stderr=subprocess.PIPE,
     )
 
-    monitor_state = _start_esc_monitor(proc)
+    monitor_state = start_esc_monitor(proc)
     if monitor_state is None:
         print("WARNING: ESC monitor could not be started!")
         print("This means the fix is not working for piped stdin.")
@@ -58,8 +58,8 @@ def main() -> None:
         assert proc.stdout is not None
         while proc.poll() is None:
             if interrupted.is_set():
-                _stop_esc_monitor(monitor_state)
-                choice, _ = _handle_interrupt("test-session", None, tty_file=tty_file)
+                stop_esc_monitor(monitor_state)
+                choice, _ = handle_interrupt("test-session", None, tty_file=tty_file)
                 if tty_file is not None:
                     try:
                         tty_file.close()
@@ -72,7 +72,7 @@ def main() -> None:
                         proc.send_signal(signal.SIGCONT)
                     except OSError:
                         pass
-                    monitor_state = _start_esc_monitor(proc)
+                    monitor_state = start_esc_monitor(proc)
                     if monitor_state:
                         interrupted = monitor_state[0]
                         tty_file = monitor_state[3]
@@ -91,7 +91,7 @@ def main() -> None:
                     sys.stdout.buffer.write(line)
                     sys.stdout.buffer.flush()
     finally:
-        _stop_esc_monitor(monitor_state)
+        stop_esc_monitor(monitor_state)
         if monitor_state is not None and monitor_state[3] is not None:
             try:
                 monitor_state[3].close()
