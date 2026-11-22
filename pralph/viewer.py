@@ -752,7 +752,9 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 else:
                     setattr(story, field, body[field])
 
-        self.state._rewrite_stories(stories)
+        # replace_stories (not _rewrite_stories) so integrations see the edit:
+        # tasks.md is regenerated, and Linear picks the change up on its next sync.
+        self.state.replace_stories(stories)
 
         resp = json.dumps(story.to_dict()).encode()
         self.send_response(HTTPStatus.OK)

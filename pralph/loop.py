@@ -10,6 +10,7 @@ from typing import Callable
 
 import click
 
+from pralph import spec as spec_lib
 from pralph.assembler import (
     assemble_add_prompt,
     assemble_compound_prompt,
@@ -20,6 +21,7 @@ from pralph.assembler import (
     assemble_plan_prompt,
     assemble_refine_prompt,
     assemble_review_prompt,
+    assemble_spec_prompt,
     assemble_stories_prompt,
     build_guardrails_system_prompt,
 )
@@ -268,23 +270,27 @@ def _run_loop(
 # ── Phase 1: Plan ────────────────────────────────────────────────────
 
 
-def run_plan_loop(
+def _run_authoring_loop(
+    phase: str,
     state: StateManager,
     *,
-    model: str = "sonnet",
-    max_iterations: int = 5,
-    cooldown: int = 5,
-    user_prompt: str = "",
-    verbose: bool = False,
-    dangerously_skip_permissions: bool = False,
-    max_budget_usd: float | None = None,
+    prompt_fn: Callable[[int, PhaseState], str],
+    resume_prompt: str,
+    model: str,
+    max_iterations: int,
+    cooldown: int,
+    verbose: bool,
+    dangerously_skip_permissions: bool,
+    max_budget_usd: float | None,
 ) -> PhaseState:
-    """Run the plan refinement loop."""
-    total = max_iterations
+    """Create-then-refine loop for a planning document (design doc or spec).
+
+    Runs until Claude signals ``[PLANNING_COMPLETE]``.
+    """
     system_prompt = build_guardrails_system_prompt("plan", state)
 
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
-        prompt = assemble_plan_prompt(state, iteration=i, total=total, user_prompt=user_prompt, phase_state=ps)
+        prompt = prompt_fn(i, ps)
 
         sid = str(uuid.uuid4())
         ps.active_session_id = sid
@@ -308,7 +314,7 @@ def run_plan_loop(
 
         if not result.success:
             return IterationResult(
-                iteration=i, phase="plan", mode="refine",
+                iteration=i, phase=phase, mode="refine",
                 success=False, error=result.error, cost_usd=result.cost_usd,
                 **_token_kwargs(result),
             )
@@ -319,7 +325,7 @@ def run_plan_loop(
             click.echo(click.style("  Changes:", fg='blue') + f" {summary[:200]}")
 
         return IterationResult(
-            iteration=i, phase="plan", mode="create" if i == 1 else "refine",
+            iteration=i, phase=phase, mode="create" if i == 1 else "refine",
             success=True, raw_output=result.result,
             cost_usd=result.cost_usd,
             **_token_kwargs(result),
@@ -327,7 +333,7 @@ def run_plan_loop(
 
     def resume_fn(session_id: str, ps: PhaseState) -> IterationResult:
         result = run_with_retry(
-            "Continue refining the design document.",
+            resume_prompt,
             resume_session_id=session_id,
             timeout=900,
             project_dir=str(state.project_dir),
@@ -336,7 +342,7 @@ def run_plan_loop(
         )
         if not result.success:
             return IterationResult(
-                iteration=ps.current_iteration, phase="plan", mode="resume",
+                iteration=ps.current_iteration, phase=phase, mode="resume",
                 success=False, error=result.error, cost_usd=result.cost_usd,
                 **_token_kwargs(result),
             )
@@ -345,7 +351,7 @@ def run_plan_loop(
         if summary:
             click.echo(click.style("  Changes:", fg='blue') + f" {summary[:200]}")
         return IterationResult(
-            iteration=ps.current_iteration, phase="plan", mode="resume",
+            iteration=ps.current_iteration, phase=phase, mode="resume",
             success=True, raw_output=result.result,
             cost_usd=result.cost_usd,
             **_token_kwargs(result),
@@ -362,7 +368,100 @@ def run_plan_loop(
             return True
         return False
 
-    return _run_loop("plan", state, max_iterations, cooldown, iteration_fn, completion_fn, resume_fn, verbose, dangerously_skip_permissions)
+    return _run_loop(phase, state, max_iterations, cooldown, iteration_fn, completion_fn, resume_fn, verbose, dangerously_skip_permissions)
+
+
+def run_plan_loop(
+    state: StateManager,
+    *,
+    model: str = "sonnet",
+    max_iterations: int = 5,
+    cooldown: int = 5,
+    user_prompt: str = "",
+    verbose: bool = False,
+    dangerously_skip_permissions: bool = False,
+    max_budget_usd: float | None = None,
+) -> PhaseState:
+    """Run the plan refinement loop."""
+    total = max_iterations
+
+    def prompt_fn(i: int, ps: PhaseState) -> str:
+        return assemble_plan_prompt(state, iteration=i, total=total, user_prompt=user_prompt, phase_state=ps)
+
+    return _run_authoring_loop(
+        "plan", state,
+        prompt_fn=prompt_fn,
+        resume_prompt="Continue refining the design document.",
+        model=model, max_iterations=max_iterations, cooldown=cooldown, verbose=verbose,
+        dangerously_skip_permissions=dangerously_skip_permissions, max_budget_usd=max_budget_usd,
+    )
+
+
+# ── Phase 1 (spec-driven): Spec ──────────────────────────────────────
+
+
+def run_spec_loop(
+    state: StateManager,
+    *,
+    spec_name: str,
+    model: str = "sonnet",
+    max_iterations: int = 5,
+    cooldown: int = 5,
+    user_prompt: str = "",
+    verbose: bool = False,
+    dangerously_skip_permissions: bool = False,
+    max_budget_usd: float | None = None,
+) -> PhaseState:
+    """Create, refine or amend an in-repo spec (``<spec_dir>/<name>/spec.md`` + ``design.md``)."""
+    spec = spec_lib.get_spec(state, spec_name)
+    spec.path.mkdir(parents=True, exist_ok=True)
+    total = max_iterations
+
+    # A finished spec run is not the end of the spec: every new invocation is a
+    # new change request against it, so start a fresh round of iterations.
+    previous = state.load_phase_state("spec")
+    if previous.completed and previous.completion_reason == "planning_complete":
+        state.save_phase_state(PhaseState(phase="spec"))
+
+    def prompt_fn(i: int, ps: PhaseState) -> str:
+        return assemble_spec_prompt(state, spec, iteration=i, total=total, user_prompt=user_prompt, phase_state=ps)
+
+    ps = _run_authoring_loop(
+        "spec", state,
+        prompt_fn=prompt_fn,
+        resume_prompt="Continue working on the specification.",
+        model=model, max_iterations=max_iterations, cooldown=cooldown, verbose=verbose,
+        dangerously_skip_permissions=dangerously_skip_permissions, max_budget_usd=max_budget_usd,
+    )
+
+    _report_spec(state, spec)
+    return ps
+
+
+def _report_spec(state: StateManager, spec: spec_lib.Spec) -> None:
+    """Summarize the spec after authoring and point at the next step."""
+    if not spec.exists():
+        click.echo(click.style(f"\n  No spec was written to {spec_lib.rel_path(state, spec.spec_path)}", fg='red'))
+        return
+    requirements = spec.requirements()
+    click.echo(f"\n  Spec: {click.style(spec_lib.rel_path(state, spec.spec_path), fg='blue')}"
+               f" — {len(requirements)} requirements")
+    if not requirements:
+        click.echo(click.style(
+            "  Warning: no requirement IDs found. Requirements need headings like "
+            "'### REQ-001: Title' for stories to trace back to them.", fg='yellow',
+        ))
+        return
+    work = spec_lib.pending_work(state)
+    mine_new = [r for r in work.uncovered if r.spec == spec.name]
+    mine_changed = [c for c in work.changed if c.requirement.spec == spec.name]
+    if mine_new or mine_changed:
+        click.echo(f"  {len(mine_new)} without stories, {len(mine_changed)} changed since their stories were written")
+    # pralph leaves the commit to you: a spec change is worth a look before it
+    # becomes the source of truth.
+    click.echo(click.style("  Next:", dim=True) + " review and commit "
+               + click.style(spec_lib.rel_path(state, spec.path) + "/", fg='blue')
+               + (", then " + click.style("pralph stories", fg='cyan') if mine_new or mine_changed else ""))
 
 
 # ── Phase 2: Stories ──────────────────────────────────────────────────
@@ -379,15 +478,37 @@ def run_stories_loop(
     dangerously_skip_permissions: bool = False,
     max_budget_usd: float | None = None,
 ) -> PhaseState:
-    """Run the story extraction loop."""
-    if not state.has_design_doc():
-        click.echo("Error: No design document found. Run 'pralph plan' first.")
+    """Run the story extraction loop.
+
+    In spec mode stories are derived from the in-repo specs only (no research
+    mode — everything has to trace back to a requirement), and a finished
+    extraction resumes by itself when the spec has gained or changed requirements.
+    """
+    spec_mode = state.spec_mode
+    if spec_mode:
+        if not spec_lib.list_specs(state):
+            click.echo(f"Error: No spec found in {state.spec_dir}. Run 'pralph spec' first.")
+            return PhaseState(phase="stories", completed=True, completion_reason="no_spec")
+        _prepare_spec_extraction(state)
+    elif not state.has_design_doc():
+        click.echo("Error: No design document found. Run 'pralph plan' (or 'pralph spec') first.")
         return PhaseState(phase="stories", completed=True, completion_reason="no_design_doc")
 
     system_prompt = build_guardrails_system_prompt("stories", state)
 
     def _pick_mode() -> str:
+        if spec_mode:
+            return "spec"
         return "extract" if random.randint(1, 100) <= extract_weight else "research"
+
+    def _accept(stories: list[Story]) -> list[Story]:
+        """Drop stories we already have; in spec mode also tidy up requirement tracing."""
+        existing_ids = state.get_story_ids()
+        new_stories = [s for s in stories if s.id not in existing_ids]
+        if spec_mode and new_stories:
+            for s in spec_lib.normalize_trace(state, new_stories):
+                click.echo(click.style(f"    Warning: {s.id} does not trace to a spec requirement", fg='yellow'))
+        return new_stories
 
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
         mode = _pick_mode()
@@ -424,8 +545,7 @@ def run_stories_loop(
         stories, is_complete = parse_stories_output(result.result)
 
         # Deduplicate against existing
-        existing_ids = state.get_story_ids()
-        new_stories = [s for s in stories if s.id not in existing_ids]
+        new_stories = _accept(stories)
 
         if new_stories:
             state.append_stories(new_stories)
@@ -453,8 +573,7 @@ def run_stories_loop(
                 **_token_kwargs(result),
             )
         stories, _ = parse_stories_output(result.result)
-        existing_ids = state.get_story_ids()
-        new_stories = [s for s in stories if s.id not in existing_ids]
+        new_stories = _accept(stories)
         if new_stories:
             state.append_stories(new_stories)
             click.echo(click.style(f"  +{len(new_stories)} stories (resumed)", fg='green', bold=True))
@@ -494,9 +613,34 @@ def run_stories_loop(
 
     ps = _run_loop("stories", state, max_iterations, cooldown, iteration_fn, completion_fn, resume_fn, verbose, dangerously_skip_permissions)
 
+    if spec_mode and ps.completion_reason in ("generation_complete", "consecutive_empty"):
+        # The backlog now reflects the spec as it is today; only later edits are drift.
+        spec_lib.acknowledge(state)
+        spec_lib.sync_tasks(state)
+
     total = len(state.load_stories())
     click.echo(f"\n  Total stories: {total}")
     return ps
+
+
+def _prepare_spec_extraction(state: StateManager) -> None:
+    """Report what the spec asks for and reopen a finished extraction if it changed."""
+    work = spec_lib.pending_work(state)
+    specs = spec_lib.list_specs(state)
+    total_reqs = sum(len(s.requirements()) for s in specs)
+    click.echo(f"  spec-driven: {len(specs)} spec(s), {total_reqs} requirements — "
+               f"{len(work.uncovered)} without stories, {len(work.changed)} changed")
+    for story, gone in work.orphaned:
+        click.echo(click.style(
+            f"  Warning: {story.id} implements {', '.join(gone)} which no longer exists in the spec "
+            f"— refine or skip it", fg='yellow',
+        ))
+
+    previous = state.load_phase_state("stories")
+    finished = previous.completed and previous.completion_reason in ("generation_complete", "consecutive_empty")
+    if finished and work.has_work:
+        click.echo("  Spec changed since the last extraction — deriving stories for the difference")
+        state.save_phase_state(PhaseState(phase="stories"))
 
 
 # ── Add (single story) ────────────────────────────────────────────────
@@ -628,6 +772,7 @@ def run_refine(
     for s in stories:
         s.source = "refine"
         s.metadata["refined_from"] = original_ids
+    spec_lib.inherit_trace(stories, original_stories)
 
     # Dedup IDs against existing
     existing_ids = state.get_story_ids()
@@ -799,8 +944,8 @@ def run_webgen_loop(
     max_budget_usd: float | None = None,
 ) -> PhaseState:
     """Run the web-gen requirements discovery loop."""
-    if not state.has_design_doc():
-        click.echo("Error: No design document found. Run 'pralph plan' first.")
+    if not state.has_design_doc() and not (state.spec_mode and spec_lib.list_specs(state)):
+        click.echo("Error: No design document found. Run 'pralph plan' (or 'pralph spec') first.")
         return PhaseState(phase="webgen", completed=True, completion_reason="no_design_doc")
 
     system_prompt = build_guardrails_system_prompt("stories", state)
@@ -931,16 +1076,16 @@ def run_implement_loop(
     max_budget_usd: float | None = None,
 ) -> PhaseState:
     """Run the implementation loop."""
-    if not state.stories_path.exists():
-        click.echo("Error: No stories found. Run 'pralph stories' first.")
-        return PhaseState(phase="implement", completed=True, completion_reason="no_stories")
-
     # Recover any stories orphaned by a previous crash
     recovered = state.recover_orphaned_stories()
     if recovered:
         click.echo(click.style(f"  Recovered {len(recovered)} orphaned stories from previous crash:", fg='yellow', bold=True))
         for s in recovered:
             click.echo(f"    {click.style(s.id, fg='blue')}: {s.title}")
+
+    if not state.stories_path.exists():
+        click.echo("Error: No stories found. Run 'pralph stories' first.")
+        return PhaseState(phase="implement", completed=True, completion_reason="no_stories")
 
     system_prompt = build_guardrails_system_prompt("implement", state)
 
@@ -1121,6 +1266,7 @@ def run_implement_loop(
             story.id, new_status, summary=summary, extra=parsed,
             error_reason=parsed.get("reason", "") if new_status == StoryStatus.error else "",
             error_output=result.result if new_status == StoryStatus.error else "",
+            review_pending=review and new_status == StoryStatus.implemented,
         )
         status_color = 'green' if new_status == StoryStatus.implemented else 'yellow'
         click.echo(f"  → {story.id}: {click.style(new_status.value, fg=status_color)} — {summary[:120]}")
@@ -1233,6 +1379,7 @@ def run_implement_loop(
             story.id, new_status, summary=summary, extra=parsed,
             error_reason=parsed.get("reason", "") if new_status == StoryStatus.error else "",
             error_output=result.result if new_status == StoryStatus.error else "",
+            review_pending=review and new_status == StoryStatus.implemented,
         )
         status_color = 'green' if new_status == StoryStatus.implemented else 'yellow'
         click.echo(f"  \u2192 {story.id}: {click.style(new_status.value, fg=status_color)} \u2014 {summary[:120]}")
@@ -1326,6 +1473,7 @@ def _run_review(
     if not result.success:
         click.echo(click.style(f"  ⚠ Review failed (error): {result.error[:120]}", fg='yellow'))
         click.echo(click.style("  → Auto-approving due to review error", fg='yellow'))
+        state.notify_review_passed(story.id)
         return None
 
     parsed = parse_review_output(result.result)
@@ -1335,6 +1483,7 @@ def _run_review(
 
     if approved:
         state.clear_review_feedback(story.id)
+        state.notify_review_passed(story.id, feedback)
         click.echo(click.style(f"  ✓ Review approved", fg='green', bold=True) + f" — {feedback[:120]}")
     else:
         # Build feedback text for the rework file
@@ -1429,7 +1578,10 @@ def _implement_single(
     except ValueError:
         new_status = StoryStatus.implemented
 
-    state.mark_story_status(story.id, new_status, summary=summary, extra=parsed)
+    state.mark_story_status(
+        story.id, new_status, summary=summary, extra=parsed,
+        review_pending=review and new_status == StoryStatus.implemented,
+    )
     click.echo(f"  → {story.id}: {new_status.value} — {summary[:120]}")
 
     # Review step for single story implementation

@@ -8,6 +8,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from pralph.models import IterationResult, PhaseState, Story, StoryStatus
 
@@ -762,6 +763,8 @@ class StateManager:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._domain_override = domains
         self._detected_domains: list[str] | None = None
+        # Callbacks fired when the backlog changes — see add_story_listener().
+        self._story_listeners: list[Callable[[str, Story | None, dict], None]] = []
 
     # -- config --
 
@@ -828,6 +831,34 @@ class StateManager:
 
     def phase_prompt_path(self, phase: str) -> Path:
         return self.state_dir / f"{phase}-prompt.md"
+
+    # -- spec-driven development --
+
+    @property
+    def spec_dir(self) -> Path:
+        """Directory inside the repo that holds the specs (config ``spec_dir``, default ``specs/``)."""
+        rel = self.get_config("spec_dir", "specs")
+        if not isinstance(rel, str) or not rel.strip():
+            rel = "specs"
+        # The spec must live inside the project — ignore paths that escape it.
+        return _safe_resolve(self.project_dir, rel) or (self.project_dir / "specs")
+
+    @property
+    def spec_baseline_path(self) -> Path:
+        return self.state_dir / "spec-baseline.json"
+
+    @property
+    def spec_mode(self) -> bool:
+        """Whether the project is spec-driven.
+
+        Config ``spec_driven`` wins when set; otherwise the mode is on as soon
+        as the repo contains a spec (``<spec_dir>/<name>/spec.md``).
+        """
+        configured = self.get_config("spec_driven", None)
+        if configured is not None:
+            return bool(configured)
+        spec_dir = self.spec_dir
+        return spec_dir.is_dir() and any(p.is_file() for p in spec_dir.glob("*/spec.md"))
 
     @property
     def home_dir(self) -> Path:
@@ -1009,6 +1040,67 @@ class StateManager:
         with open(self.stories_path, "a") as f:
             for s in stories:
                 f.write(json.dumps(s.to_dict()) + "\n")
+        for s in stories:
+            self._notify("added", s)
+
+    # -- story listeners --
+
+    def add_story_listener(self, fn: Callable[[str, Story | None, dict], None]) -> None:
+        """Register ``fn(event, story, info)`` to be called when the backlog changes.
+
+        Events:
+          - ``added``   — a story was appended to the backlog
+          - ``status``  — a story changed status; info has ``previous``, ``summary``,
+                          ``extra``, ``error_reason`` and ``review_pending``
+          - ``reviewed`` — an implemented story passed review
+          - ``updated`` — story fields/metadata were changed via update_story()
+          - ``synced``  — the backlog was replaced wholesale (story is None)
+
+        Integrations (tasks.md in spec mode, Linear) hang off this. Listener
+        failures are reported but never propagate: a broken integration must
+        not take the implementation loop down with it.
+        """
+        if fn not in self._story_listeners:
+            self._story_listeners.append(fn)
+
+    def _notify(self, event: str, story: Story | None, info: dict | None = None) -> None:
+        for fn in list(self._story_listeners):
+            try:
+                fn(event, story, info or {})
+            except Exception as e:  # noqa: BLE001 — see add_story_listener
+                target = story.id if story is not None else "backlog"
+                print(f"  [warn] {event} hook failed for {target}: {e}", file=sys.stderr)
+
+    def update_story(
+        self,
+        story_id: str,
+        mutate: Callable[[Story], None],
+        *,
+        notify: bool = True,
+    ) -> Story | None:
+        """Apply ``mutate`` to one story and persist it. Returns the story, or None if unknown."""
+        stories = self.load_stories()
+        target = next((s for s in stories if s.id == story_id), None)
+        if target is None:
+            return None
+        mutate(target)
+        self._rewrite_stories(stories)
+        if notify:
+            self._notify("updated", target)
+        return target
+
+    def replace_stories(self, stories: list[Story], status_entries: list[dict] | None = None) -> None:
+        """Replace the whole backlog (used when syncing from an external tracker).
+
+        ``status_entries`` are appended to the status history so externally
+        driven status changes show up in the timeline like any other.
+        """
+        self._rewrite_stories(stories)
+        if status_entries:
+            with open(self.status_path, "a") as f:
+                for entry in status_entries:
+                    f.write(json.dumps(entry) + "\n")
+        self._notify("synced", None)
 
     def get_pending_stories(self) -> list[Story]:
         return [s for s in self.load_stories() if s.status == StoryStatus.pending]
@@ -1043,6 +1135,11 @@ class StateManager:
                         "summary": "Reset from error status",
                     }
                     f.write(json.dumps(entry) + "\n")
+            for s in reset:
+                self._notify("status", s, {
+                    "previous": StoryStatus.error,
+                    "summary": "Reset from error status",
+                })
 
         return reset
 
@@ -1071,6 +1168,11 @@ class StateManager:
                         "recovery": True,
                     }
                     f.write(json.dumps(entry) + "\n")
+            for s in recovered:
+                self._notify("status", s, {
+                    "previous": StoryStatus.in_progress,
+                    "summary": "Recovered from crash (was in_progress)",
+                })
 
         return recovered
 
@@ -1123,7 +1225,13 @@ class StateManager:
         extra: dict | None = None,
         error_reason: str = "",
         error_output: str = "",
+        review_pending: bool = False,
     ) -> None:
+        """Record a status change.
+
+        ``review_pending`` tells listeners that an ``implemented`` status is
+        still subject to review — see notify_review_passed().
+        """
         entry = {
             "story_id": story_id,
             "status": status.value,
@@ -1137,8 +1245,11 @@ class StateManager:
 
         # Also rewrite stories.jsonl with updated status
         stories = self.load_stories()
+        target: Story | None = None
+        previous: StoryStatus | None = None
         for s in stories:
             if s.id == story_id:
+                previous = s.status
                 s.status = status
                 if status == StoryStatus.error:
                     s.metadata["error_reason"] = error_reason or summary
@@ -1146,8 +1257,23 @@ class StateManager:
                         # Keep last 2000 chars of output for context
                         s.metadata["error_output"] = error_output[-2000:]
                     s.metadata["error_at"] = datetime.now().isoformat()
+                target = s
                 break
         self._rewrite_stories(stories)
+        if target is not None:
+            self._notify("status", target, {
+                "previous": previous,
+                "summary": summary,
+                "extra": extra or {},
+                "error_reason": error_reason,
+                "review_pending": review_pending,
+            })
+
+    def notify_review_passed(self, story_id: str, feedback: str = "") -> None:
+        """Tell listeners a story passed review, i.e. its ``implemented`` status is final."""
+        story = next((s for s in self.load_stories() if s.id == story_id), None)
+        if story is not None:
+            self._notify("reviewed", story, {"feedback": feedback})
 
     def _rewrite_stories(self, stories: list[Story]) -> None:
         with open(self.stories_path, "w") as f:

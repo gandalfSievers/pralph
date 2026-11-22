@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
+from pralph import spec as spec_lib
 from pralph.models import PhaseState, Story
 from pralph.prompts.compound import COMPOUND_CAPTURE_PROMPT, COMPOUND_RECALL_SECTION
 from pralph.prompts.guardrails import CODE_GUARDRAILS, DEFAULT_GUARDRAILS, STORY_GUARDRAILS
@@ -15,6 +16,13 @@ from pralph.prompts.review import REVIEW_PROMPT
 from pralph.prompts.plan import INITIAL_PLAN_PROMPT, ITERATION_PROMPT_TEMPLATE
 from pralph.prompts.ideate import ADD_STORY_PROMPT, IDEATE_PROMPT, REFINE_PROMPT
 from pralph.prompts.justloop import JUSTLOOP_PROMPT
+from pralph.prompts.spec import (
+    SPEC_EXTRACT_PROMPT,
+    SPEC_IMPLEMENT_SECTION,
+    SPEC_INITIAL_PROMPT,
+    SPEC_ITERATION_PROMPT,
+    SPEC_REVIEW_SECTION,
+)
 from pralph.prompts.stories import (
     PLANNING_EXTRACT_PROMPT,
     PLANNING_RESEARCH_PROMPT,
@@ -70,6 +78,28 @@ def _build_resume_context(ps: PhaseState | None) -> str:
     return "\n## Resume Context\n\n" + "\n".join(parts) + "\n"
 
 
+def _planning_doc(state: StateManager) -> tuple[str, str]:
+    """The document the backlog is planned from, and where it can be read.
+
+    In spec mode that is the in-repo specs; otherwise the design document.
+    """
+    if state.spec_mode:
+        content, sources = spec_lib.planning_context(state)
+        if content:
+            return content, sources
+    return state.read_design_doc(), str(state.design_doc_path)
+
+
+def _planning_doc_for_prompt(state: StateManager, *, empty: str = "(no design document)") -> str:
+    """Planning document inlined for a prompt, or a pointer when it is too large."""
+    content, sources = _planning_doc(state)
+    if not content:
+        return empty
+    if len(content) > LARGE_DOC_THRESHOLD:
+        return f"(Design doc too large to inline — read it from: {sources})"
+    return _escape_template_vars(content)
+
+
 # -- Plan prompts --
 
 
@@ -118,6 +148,168 @@ def assemble_plan_prompt(
     ) + solutions_recall + resume
 
 
+# -- Spec prompts --
+
+
+def assemble_spec_prompt(
+    state: StateManager,
+    spec: spec_lib.Spec,
+    *,
+    iteration: int,
+    total: int,
+    user_prompt: str,
+    phase_state: PhaseState | None = None,
+) -> str:
+    """Build the prompt for a spec authoring iteration (create, refine or amend)."""
+    resume = _build_resume_context(phase_state)
+    spec_file = spec_lib.rel_path(state, spec.spec_path)
+    design_file = spec_lib.rel_path(state, spec.design_path)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    project_prompt = state.read_phase_prompt("spec")
+    combined_prompt = "\n\n".join(p for p in [project_prompt, user_prompt] if p)
+
+    solutions_recall = ""
+    if state.has_solutions() or state.has_global_solutions():
+        solutions_ctx = _build_solutions_context(state)
+        if solutions_ctx:
+            recall = _safe_sub(COMPOUND_RECALL_SECTION, "solutions_context", _escape_template_vars(solutions_ctx))
+            solutions_recall = "\n" + recall
+
+    if iteration == 1 and not spec.exists():
+        guardrails_instruction = ""
+        if not state.guardrails_path.exists():
+            guardrails_instruction = (
+                f"- `{state.guardrails_path}` — guardrails: coding standards, testing "
+                "requirements, git practices, security requirements.\n"
+            )
+        existing_inputs = ""
+        if state.has_design_doc():
+            existing_inputs = (
+                "\n## Existing design document\n\n"
+                f"An earlier design document exists at `{state.design_doc_path}`. Read it and carry "
+                "its content over into the spec and the design — nothing in it should get lost.\n"
+            )
+        prompt = state.resolve_prompt_template("spec-initial", SPEC_INITIAL_PROMPT)
+        prompt = _safe_sub(prompt, "spec_file", spec_file)
+        prompt = _safe_sub(prompt, "design_file", design_file)
+        prompt = _safe_sub(prompt, "guardrails_instruction", guardrails_instruction)
+        prompt = _safe_sub(prompt, "existing_inputs", existing_inputs)
+        prompt = _safe_sub(prompt, "research_notes_file", str(state.research_notes_path))
+        prompt = _safe_sub(prompt, "today", today)
+        prompt = _safe_sub(
+            prompt, "user_prompt",
+            _escape_template_vars(combined_prompt or "Write a comprehensive specification for this project."),
+        )
+        return prompt + solutions_recall + resume
+
+    others = [s for s in spec_lib.list_specs(state) if s.name != spec.name]
+    other_specs = ""
+    if others:
+        listed = "\n".join(f"  - `{spec_lib.rel_path(state, o.spec_path)}`" for o in others)
+        other_specs = (
+            "- Other specs in this repository (keep this one consistent with them, "
+            f"do not edit them):\n{listed}\n"
+        )
+
+    prompt = state.resolve_prompt_template("spec-iteration", SPEC_ITERATION_PROMPT)
+    prompt = _safe_sub(prompt, "current", str(iteration))
+    prompt = _safe_sub(prompt, "total", str(total))
+    prompt = _safe_sub(prompt, "spec_file", spec_file)
+    prompt = _safe_sub(prompt, "design_file", design_file)
+    prompt = _safe_sub(prompt, "research_notes_file", str(state.research_notes_path))
+    prompt = _safe_sub(prompt, "other_specs", other_specs)
+    prompt = _safe_sub(prompt, "today", today)
+    prompt = _safe_sub(
+        prompt, "user_prompt",
+        _escape_template_vars(combined_prompt or "Review the specification and improve its completeness and quality."),
+    )
+    return prompt + solutions_recall + resume
+
+
+def _spec_files_list(state: StateManager, specs: list[spec_lib.Spec]) -> str:
+    """Bullet list of spec documents with what each one is for."""
+    roles = {
+        spec_lib.SPEC_FILE: "requirements (WHAT / WHY)",
+        spec_lib.DESIGN_FILE: "technical design (HOW)",
+        spec_lib.TASKS_FILE: "task list",
+    }
+    lines: list[str] = []
+    for spec in specs:
+        for path in spec.documents():
+            role = roles.get(path.name, "supporting document")
+            lines.append(f"- `{spec_lib.rel_path(state, path)}` — {role}")
+    return "\n".join(lines)
+
+
+_REQUIREMENT_BODY_LIMIT = 4000
+
+
+def _spec_story_context(state: StateManager, story: Story) -> tuple[str, str, spec_lib.Spec | None]:
+    """(spec files list, requirement text block, spec) for a story in spec mode."""
+    all_specs = spec_lib.list_specs(state)
+    spec, requirements = spec_lib.story_requirements(state, story)
+    spec_files = _spec_files_list(state, [spec] if spec else all_specs)
+
+    _, traced_ids = spec_lib.story_trace(story, all_specs)
+    found_ids = {r.id for r in requirements}
+    missing = [rid for rid in traced_ids if rid not in found_ids]
+
+    if requirements and spec is not None:
+        bodies = []
+        for r in requirements:
+            body = r.body
+            if len(body) > _REQUIREMENT_BODY_LIMIT:
+                body = body[:_REQUIREMENT_BODY_LIMIT] + "\n\n(... truncated — read the full text in the spec)"
+            bodies.append(body)
+        ids = ", ".join(r.id for r in requirements)
+        block = (
+            f"This story implements {ids} of spec `{spec.name}`. Current text of the requirement(s):\n\n"
+            + "\n\n".join(bodies)
+        )
+    else:
+        block = (
+            "This story is not traced to a specific requirement. Find the requirement(s) it "
+            "relates to in the spec before you start. If the spec does not cover it, keep the "
+            "change minimal and record the gap under \"Open questions\" in spec.md."
+        )
+    if missing:
+        block += (
+            f"\n\n**Note:** {', '.join(missing)} is referenced by this story but no longer exists "
+            "in the spec. If that makes the story obsolete, do not implement it — return status "
+            "`skipped` with the reason."
+        )
+    return spec_files, _escape_template_vars(block), spec if traced_ids else None
+
+
+def _build_spec_implement_context(state: StateManager, story: Story) -> str:
+    if not state.spec_mode or not spec_lib.list_specs(state):
+        return ""
+    spec_files, requirements_block, spec = _spec_story_context(state, story)
+    tasks_rule = ""
+    if spec is not None and spec_lib.tasks_managed(spec):
+        tasks_file = spec_lib.rel_path(state, spec.tasks_path)
+        tasks_rule = (
+            f"6. Tick this task in `{tasks_file}` as part of your commit: change "
+            f"`- [ ] **{story.id}**` to `- [x] **{story.id}**` and nothing else in that file"
+        )
+    section = state.resolve_prompt_template("spec-implement", SPEC_IMPLEMENT_SECTION)
+    section = _safe_sub(section, "spec_files", spec_files)
+    section = _safe_sub(section, "story_requirements", requirements_block)
+    section = _safe_sub(section, "tasks_rule", _escape_template_vars(tasks_rule))
+    return section
+
+
+def _build_spec_review_context(state: StateManager, story: Story) -> str:
+    if not state.spec_mode or not spec_lib.list_specs(state):
+        return ""
+    spec_files, requirements_block, _ = _spec_story_context(state, story)
+    section = state.resolve_prompt_template("spec-review", SPEC_REVIEW_SECTION)
+    section = _safe_sub(section, "spec_files", spec_files)
+    section = _safe_sub(section, "story_requirements", requirements_block)
+    return section
+
+
 # -- Stories prompts --
 
 
@@ -129,6 +321,8 @@ def assemble_stories_prompt(
 ) -> str:
     """Build the prompt for a stories iteration."""
     resume = _build_resume_context(phase_state)
+    if mode == "spec":
+        return _assemble_spec_extract_prompt(state) + resume
     if mode == "research":
         return _assemble_research_prompt(state) + resume
     if mode == "webgen":
@@ -160,12 +354,73 @@ def _assemble_extract_prompt(state: StateManager) -> str:
     return prompt
 
 
+def _assemble_spec_extract_prompt(state: StateManager) -> str:
+    """Story extraction from the in-repo specs, with requirement tracing."""
+    specs = spec_lib.list_specs(state)
+    coverage = spec_lib.build_coverage(state)
+    work = spec_lib.pending_work(state)
+
+    overview: list[str] = []
+    for spec in specs:
+        overview.append(f"### Spec `{spec.name}`\n")
+        overview.append(_spec_files_list(state, [spec]))
+        rows = coverage.get(spec.name, [])
+        if rows:
+            overview.append("\nRequirements:")
+            for row in rows:
+                n = len(row.stories)
+                covered = f"{n} stor{'y' if n == 1 else 'ies'}, {row.state}" if n else "no stories"
+                overview.append(f"- {row.requirement.id}: {row.requirement.title} ({covered})")
+        else:
+            overview.append(
+                "\n(No requirement IDs found in this spec — requirements need headings "
+                "like `### REQ-001: Title`.)"
+            )
+        overview.append("")
+
+    inline = "\n\n---\n\n".join(
+        f"<!-- {spec_lib.rel_path(state, spec.spec_path)} -->\n\n{spec.read().strip()}" for spec in specs
+    )
+    if len(inline) > LARGE_DOC_THRESHOLD:
+        spec_content = "(Specs too large to inline — read them from the files listed above.)"
+    else:
+        spec_content = inline
+
+    pending: list[str] = []
+    if work.uncovered:
+        pending.append("### New — no stories yet\n")
+        pending.extend(f"- `{r.spec}` {r.id}: {r.title}" for r in work.uncovered)
+        pending.append("")
+    if work.changed:
+        pending.append("### Changed — spec text was edited after these stories were written\n")
+        for row in work.changed:
+            existing = ", ".join(f"{s.id} [{s.status.value}]" for s in row.stories)
+            r = row.requirement
+            pending.append(f"- `{r.spec}` {r.id}: {r.title} (existing stories: {existing})")
+        pending.append("")
+    if not pending:
+        pending.append(
+            "(None — every requirement has at least one story and no requirement changed. "
+            "Check coverage as described in step 3.)"
+        )
+
+    prompt = state.resolve_prompt_template("stories-spec", SPEC_EXTRACT_PROMPT)
+    prompt = _safe_sub(prompt, "specs_overview", _escape_template_vars("\n".join(overview).strip()))
+    prompt = _safe_sub(prompt, "spec_content", _escape_template_vars(spec_content))
+    prompt = _safe_sub(prompt, "pending_requirements", _escape_template_vars("\n".join(pending).strip()))
+    prompt = _safe_sub(prompt, "total_stories", str(len(state.load_stories())))
+    prompt = _safe_sub(prompt, "existing_stories", _escape_template_vars(spec_lib.format_stories_with_trace(state)))
+    prompt = _safe_sub(prompt, "category_stats", state.format_category_stats())
+    prompt = _safe_sub(prompt, "example_spec", specs[0].name if specs else "main")
+    return prompt
+
+
 def _assemble_research_prompt(state: StateManager) -> str:
     return state.resolve_prompt_template("stories-research", PLANNING_RESEARCH_PROMPT)
 
 
 def _assemble_webgen_prompt(state: StateManager) -> str:
-    design_doc = state.read_design_doc()
+    design_doc, _ = _planning_doc(state)
     # Use first 5000 chars as summary for webgen
     summary = design_doc[:5000] if design_doc else "(no design doc)"
     summary = _escape_template_vars(summary)
@@ -194,13 +449,7 @@ def assemble_add_prompt(
     is_next: bool,
 ) -> str:
     """Build the prompt for adding a single story from an idea."""
-    design_doc = state.read_design_doc()
-    if not design_doc:
-        design_doc_content = "(no design document)"
-    elif len(design_doc) > LARGE_DOC_THRESHOLD:
-        design_doc_content = f"(Design doc too large to inline — read it from: {state.design_doc_path})"
-    else:
-        design_doc_content = _escape_template_vars(design_doc)
+    design_doc_content = _planning_doc_for_prompt(state)
 
     if is_next:
         priority_mode = "Priority is forced to 1 — this story should be implemented next."
@@ -230,13 +479,7 @@ def assemble_ideate_prompt(
     """Build the prompt for batch ideation."""
     resume = _build_resume_context(phase_state)
 
-    design_doc = state.read_design_doc()
-    if not design_doc:
-        design_doc_content = "(no design document)"
-    elif len(design_doc) > LARGE_DOC_THRESHOLD:
-        design_doc_content = f"(Design doc too large to inline — read it from: {state.design_doc_path})"
-    else:
-        design_doc_content = _escape_template_vars(design_doc)
+    design_doc_content = _planning_doc_for_prompt(state)
 
     total = len(state.load_stories())
     existing = _escape_template_vars(state.format_existing_stories_context())
@@ -258,13 +501,7 @@ def assemble_refine_prompt(
     original_stories: list["Story"],
 ) -> str:
     """Build the prompt for refining existing stories."""
-    design_doc = state.read_design_doc()
-    if not design_doc:
-        design_doc_content = "(no design document)"
-    elif len(design_doc) > LARGE_DOC_THRESHOLD:
-        design_doc_content = f"(Design doc too large to inline — read it from: {state.design_doc_path})"
-    else:
-        design_doc_content = _escape_template_vars(design_doc)
+    design_doc_content = _planning_doc_for_prompt(state)
 
     original_ids = [s.id for s in original_stories]
     original_json = json.dumps([s.to_dict() for s in original_stories], indent=2)
@@ -314,6 +551,9 @@ def assemble_implement_prompt(
     guidance_parts = [p for p in [project_prompt, user_prompt] if p]
     if guidance_parts:
         prompt += "\n## Project context\n\n" + "\n\n".join(guidance_parts) + "\n"
+
+    # Spec-driven: the in-repo spec and the requirements this story implements
+    prompt += _build_spec_implement_context(state, story)
 
     # Rework context: include reviewer feedback when retrying a rejected story
     rework_context = _build_rework_context(state, story)
@@ -368,6 +608,10 @@ def assemble_review_prompt(
         review_guidance = f"## Project Review Guidelines\n\n{_escape_template_vars(guidance)}"
     else:
         review_guidance = ""
+
+    spec_review = _build_spec_review_context(state, story)
+    if spec_review:
+        review_guidance = "\n\n".join(p for p in [review_guidance, spec_review] if p)
 
     prompt = state.resolve_prompt_template("review", REVIEW_PROMPT)
     prompt = _safe_sub(prompt, "story_title", title)

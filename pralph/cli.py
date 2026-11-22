@@ -6,7 +6,8 @@ import sys
 import click
 
 from pralph import __version__
-from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_stories_loop, run_webgen_loop
+from pralph import spec as spec_lib
+from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_spec_loop, run_stories_loop, run_webgen_loop
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
 from pralph.state import StateManager
@@ -35,6 +36,17 @@ def _reset_phase(state: StateManager, phase: str) -> None:
     click.echo(f"  Reset phase '{phase}'")
 
 
+def _state(ctx: click.Context) -> StateManager:
+    """StateManager for the invocation, with integrations hooked in.
+
+    Spec support (tasks.md, requirement baseline) is always attached — it is
+    inert outside spec mode.
+    """
+    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    spec_lib.attach(state)
+    return state
+
+
 def _get_extra_tools(ctx: click.Context, state: StateManager) -> str:
     """Merge CLI --extra-tools with project-level .pralph/extra-tools.txt."""
     cli_tools = ctx.obj["extra_tools_cli"]
@@ -47,9 +59,9 @@ class OrderedGroup(click.Group):
     """Click group that shows commands in defined order with section headers."""
 
     SECTIONS = [
-        ("Workflow", ["plan", "stories", "webgen", "implement"]),
+        ("Workflow", ["plan", "spec", "stories", "webgen", "implement"]),
         ("Replan", ["add", "ideate", "refine"]),
-        ("Tools", ["justloop", "compound", "compact-index", "reset-errors", "viewer"]),
+        ("Tools", ["justloop", "compound", "compact-index", "spec-status", "reset-errors", "viewer"]),
     ]
 
     def list_commands(self, ctx):
@@ -104,7 +116,7 @@ def main(ctx, model, max_iterations, max_budget_usd, cooldown, verbose, project_
 @click.pass_context
 def plan(ctx, prompt, reset):
     """Phase 1: Create/refine a design document."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     if reset:
         _reset_phase(state, "plan")
     prompt = _resolve_prompt(prompt, "Design prompt")
@@ -125,18 +137,73 @@ def plan(ctx, prompt, reset):
 
 
 @main.command()
+@click.argument("prompt_args", nargs=-1)
+@click.option("--name", "-n", default=None, help="Spec name = directory under specs/ [default: the only spec, else the project name]")
+@click.option("--prompt", default=None, help="What to specify, or the change to make to an existing spec")
+@click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
+@click.pass_context
+def spec(ctx, prompt_args, name, prompt, reset):
+    """Phase 1 (spec-driven): Create or amend a spec stored in the repo.
+
+    Writes specs/<name>/spec.md (requirements) and design.md. Run it again
+    with a change request to amend the spec, then 'pralph stories' to derive
+    stories for whatever the spec gained or changed.
+    """
+    state = _state(ctx)
+    if reset:
+        _reset_phase(state, "spec")
+    try:
+        spec_name = spec_lib.resolve_spec_name(state, name)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    target = spec_lib.get_spec(state, spec_name)
+
+    # Resolve prompt: positional args > --prompt > stdin > interactive.
+    # An existing spec can be refined without a prompt.
+    if prompt_args:
+        user_prompt = " ".join(prompt_args)
+    elif prompt:
+        user_prompt = prompt
+    else:
+        user_prompt = _read_stdin() or ""
+        if not user_prompt and not target.exists():
+            user_prompt = click.prompt("What should be specified")
+
+    click.echo(f"pralph spec — max {ctx.obj['max_iterations']} iterations")
+    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  model: {ctx.obj['model']}")
+    click.echo(f"  spec: {spec_lib.rel_path(state, target.spec_path)}"
+               f" ({'amend' if target.exists() else 'new'})")
+
+    run_spec_loop(
+        state,
+        spec_name=spec_name,
+        model=ctx.obj["model"],
+        max_iterations=ctx.obj["max_iterations"],
+        cooldown=ctx.obj["cooldown"],
+        user_prompt=user_prompt,
+        verbose=ctx.obj["verbose"],
+        dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
+        max_budget_usd=ctx.obj["max_budget_usd"],
+    )
+
+
+@main.command()
 @click.option("--extract-weight", default=80, type=int, help="Extract vs research weight (0-100)")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
 def stories(ctx, extract_weight, reset):
-    """Phase 2: Extract user stories from design doc."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    """Phase 2: Extract user stories from the design doc or spec."""
+    state = _state(ctx)
     if reset:
         _reset_phase(state, "stories")
     click.echo(f"pralph stories — max {ctx.obj['max_iterations']} iterations")
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  model: {ctx.obj['model']}")
-    click.echo(f"  extract_weight: {extract_weight}%")
+    if state.spec_mode:
+        click.echo(f"  source: specs in {spec_lib.rel_path(state, state.spec_dir)}/ (spec-driven)")
+    else:
+        click.echo(f"  extract_weight: {extract_weight}%")
 
     run_stories_loop(
         state,
@@ -155,7 +222,7 @@ def stories(ctx, extract_weight, reset):
 @click.pass_context
 def webgen(ctx, reset):
     """Phase 2b: Discover missing requirements via web research."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     if reset:
         _reset_phase(state, "webgen")
     click.echo(f"pralph webgen — max {ctx.obj['max_iterations']} iterations")
@@ -181,7 +248,7 @@ def webgen(ctx, reset):
 def add(ctx, prompt, is_next, anytime):
     """Add a single story from an idea."""
     prompt = _resolve_prompt(prompt, "Idea")
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     click.echo(f"pralph add")
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  model: {ctx.obj['model']}")
@@ -225,7 +292,7 @@ def ideate(ctx, ideas_args, ideas_file, prompt, reset):
 
     Ideas can be passed as arguments: pralph ideate "add dark mode" "CSV export"
     """
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     if reset:
         _reset_phase(state, "ideate")
 
@@ -292,7 +359,7 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
     """Refine existing stories: split, merge, or rewrite."""
     import fnmatch
 
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     all_stories = state.load_stories()
     stories_by_id = {s.id: s for s in all_stories}
 
@@ -372,7 +439,7 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
 @click.pass_context
 def implement(ctx, story_id, phase1, review, compound, prompt, reset):
     """Phase 3: Implement stories from backlog."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     if reset:
         _reset_phase(state, "implement")
     prompt = prompt or _read_stdin() or ""
@@ -385,6 +452,8 @@ def implement(ctx, story_id, phase1, review, compound, prompt, reset):
     if compound and save_global:
         domains = state.detect_domains()
         click.echo(f"  global: on (domains: {', '.join(domains) or 'none detected'})")
+    if state.spec_mode:
+        click.echo(f"  spec-driven: {', '.join(sp.name for sp in spec_lib.list_specs(state)) or 'no specs yet'}")
     if story_id:
         click.echo(f"  story: {story_id}")
 
@@ -412,7 +481,7 @@ def implement(ctx, story_id, phase1, review, compound, prompt, reset):
 @click.pass_context
 def justloop(ctx, prompt_args, prompt):
     """Run a prompt in a loop until complete."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
 
     # Resolve prompt: positional args > --prompt > stdin > interactive
     if prompt_args:
@@ -450,7 +519,7 @@ def justloop(ctx, prompt_args, prompt):
 def compound(ctx, story_id, prompt):
     """Capture learnings from recent work (compound learning)."""
     prompt = _resolve_prompt(prompt, "Description of work done")
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     save_global = state.global_compound
     click.echo(f"pralph compound")
     click.echo(f"  project: {ctx.obj['project_dir']}")
@@ -485,7 +554,7 @@ def compound(ctx, story_id, prompt):
 @click.pass_context
 def compact_index(ctx, global_only, local_only, yes, full):
     """Compact solution indexes: merge duplicates via Haiku and prune orphans."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     model = "haiku"
     verbose = ctx.obj.get("verbose", False)
     dangerously_skip_permissions = ctx.obj.get("dangerously_skip_permissions", False)
@@ -583,11 +652,66 @@ def compact_index(ctx, global_only, local_only, yes, full):
         click.echo(f"  Cost: ${total_cost:.4f}")
 
 
+_REQ_MARKS = {
+    "done": ("\u2713", "green"),
+    "in_progress": ("\u25d0", "yellow"),
+    "pending": ("\u25cb", None),
+    "error": ("\u2717", "red"),
+    "dropped": ("\u2717", "red"),
+    "uncovered": ("\u2717", "red"),
+}
+
+
+@main.command("spec-status")
+@click.pass_context
+def spec_status(ctx):
+    """Show how the backlog covers the spec's requirements."""
+    state = _state(ctx)
+    specs = spec_lib.list_specs(state)
+    if not specs:
+        click.echo(f"No specs found in {state.spec_dir}. Run 'pralph spec' first.")
+        return
+
+    coverage = spec_lib.build_coverage(state)
+    work = spec_lib.pending_work(state)
+    for sp in specs:
+        rows = coverage.get(sp.name, [])
+        counts: dict[str, int] = {}
+        for row in rows:
+            counts[row.state] = counts.get(row.state, 0) + 1
+        summary = ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in sorted(counts.items())) or "no requirements found"
+        click.echo(f"\n  {click.style(spec_lib.rel_path(state, sp.spec_path), fg='blue', bold=True)}"
+                   f" — {len(rows)} requirements: {summary}")
+        width = max((len(row.requirement.id) for row in rows), default=0)
+        for row in rows:
+            mark, color = _REQ_MARKS.get(row.state, ("?", None))
+            covering = ", ".join(f"{s.id} [{s.status.value}]" for s in row.stories) or "no stories"
+            line = f"    {click.style(mark, fg=color)} {row.requirement.id.ljust(width)}  {row.requirement.title}"
+            if row.changed:
+                line += click.style("  (changed since stories were written)", fg='yellow')
+            click.echo(line)
+            click.echo(click.style(f"      {covering}", dim=True))
+
+    if work.orphaned:
+        click.echo(click.style("\n  Stories whose requirement is no longer in the spec:", fg='yellow'))
+        for story, gone in work.orphaned:
+            click.echo(f"    {click.style(story.id, fg='blue')}: {story.title} ({', '.join(gone)})")
+    if work.untraced:
+        click.echo(click.style(f"\n  {len(work.untraced)} stories do not trace to a requirement:", fg='yellow'))
+        for story in work.untraced:
+            click.echo(f"    {click.style(story.id, fg='blue')}: {story.title} [{story.status.value}]")
+    if work.has_work:
+        click.echo(f"\n  {len(work.uncovered)} requirements without stories, {len(work.changed)} changed"
+                   " — run " + click.style("pralph stories", fg='cyan'))
+    else:
+        click.echo(click.style("\n  Every requirement is covered by the backlog", fg='green'))
+
+
 @main.command("reset-errors")
 @click.pass_context
 def reset_errors(ctx):
     """Reset error stories to pending and clear error state."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
 
     # Show error details before resetting
     error_stories = [s for s in state.load_stories() if s.status == StoryStatus.error]
@@ -634,7 +758,7 @@ def reset_errors(ctx):
 @click.pass_context
 def viewer(ctx, port, no_open):
     """Browse and review user stories in a web UI."""
-    state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
+    state = _state(ctx)
     stories = state.load_stories()
     if not stories:
         click.echo("No stories found. Run 'pralph stories' first.")

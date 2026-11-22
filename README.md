@@ -10,6 +10,7 @@
 - [Usage](#usage)
   - [Standard workflow](#standard-workflow)
   - [Adding stories later](#adding-stories-later)
+  - [Spec-driven development](#spec-driven-development)
   - [Justloop](#justloop)
   - [Compound learning](#compound-learning)
   - [Index compaction](#index-compaction)
@@ -42,6 +43,10 @@ pralph breaks development into phases:
 ### Phase 1: Plan
 
 Creates a comprehensive design document through interactive conversation with Claude. Researches best practices via web search and generates coding guardrails.
+
+### Phase 1 (spec-driven): Spec
+
+Instead of a design document in `.pralph/`, write a **specification that lives in the repository** (`specs/<name>/spec.md` + `design.md`) and is committed with the code. Requirements get stable IDs (`REQ-001`), stories trace back to them, and implementations are checked against them. Changing the software starts with changing the spec — pralph works out what that means for the backlog. See [Spec-driven development](#spec-driven-development).
 
 ### Phase 2: Stories
 
@@ -192,6 +197,79 @@ pralph compound --prompt "Fixed CORS issue by adding middleware"
 pralph compound --story-id AUTH-001
 ```
 
+### Spec-driven development
+
+In spec-driven mode the source of truth is a specification **inside your repository**, versioned and reviewed like code:
+
+```
+specs/
+  taskify/
+    spec.md      # WHAT and WHY: requirements with stable IDs and acceptance criteria
+    design.md    # HOW: technical design, referencing the requirement IDs
+    tasks.md     # task list derived from the backlog (maintained by pralph)
+```
+
+```bash
+# 1. Write the spec (instead of `pralph plan`), review it, commit it
+pralph spec "Build a task management app with auth and real-time updates"
+git add specs/ && git commit -m "Add taskify spec"
+
+# 2. Derive stories — every story records the requirements it implements
+pralph stories
+
+# 3. See how the backlog covers the spec
+pralph spec-status
+
+# 4. Implement — against the spec, checked against the spec
+pralph implement
+```
+
+**Requirements** are headings of the form `### REQ-001: Short title` (non-functional: `### NFR-001: ...`) followed by a statement and acceptance criteria. The IDs are permanent: stories, commits and tickets refer to them. Bullet-style requirements (`- **FR-001**: The system MUST ...`) are recognized too, so specs written by hand or with other spec tooling work as they are.
+
+pralph writes the spec but leaves committing it to you — a spec is worth reading before it becomes the source of truth. If you skip that, the first implementation commits the spec files along with its change.
+
+**Changing the software starts with changing the spec.** Edit `spec.md` yourself, or let pralph do it:
+
+```bash
+pralph spec "Tasks can have a due date; overdue tasks are highlighted"
+pralph stories      # derives stories only for what is new or changed
+pralph implement
+```
+
+pralph compares the spec with the backlog on every `stories` run:
+
+| Spec vs. backlog | What happens |
+|---|---|
+| Requirement without stories | Stories are generated for it |
+| Requirement text edited after its stories were written | Follow-up stories are generated for the difference (whitespace-only edits are ignored) |
+| Requirement removed, stories still pending | Reported by `stories` and `spec-status` — `refine` or skip them |
+| Story that traces to no requirement | Reported by `spec-status` |
+
+What spec-driven mode changes in the other phases:
+
+- **`stories`** extracts from the specs only — no research mode, because every story has to trace to a requirement. If something is missing, amend the spec first.
+- **`implement`** gives Claude the exact text of the requirements the story implements, plus the spec and design files. Code and spec may not diverge: if the spec turns out to be wrong, the implementation fixes the spec in the same commit and notes it in the spec's changelog. The story's box in `tasks.md` is ticked in that commit too.
+- **Review** additionally checks conformance to the spec and rejects implementations that contradict it.
+- **`add`, `ideate`, `refine`, `webgen`** use the specs as their planning context. Stories they create without a requirement show up as untraced in `spec-status`.
+
+The mode switches on by itself as soon as the repository contains a spec (`specs/<name>/spec.md`). Several specs can live side by side — one per feature area, for instance — selected with `pralph spec --name payments "..."`. Already have a `.pralph/design-doc.md`? `pralph spec` reads it and carries it over into the new spec.
+
+```
+$ pralph spec-status
+
+  specs/taskify/spec.md — 4 requirements: 2 done, 1 in progress, 1 uncovered
+    ✓ REQ-001  Create tasks
+      TASK-001 [implemented], TASK-002 [implemented]
+    ◐ REQ-002  Complete tasks  (changed since stories were written)
+      TASK-003 [implemented]
+    ✗ REQ-003  Due dates
+      no stories
+    ...
+  1 requirements without stories, 1 changed — run pralph stories
+```
+
+To use a different directory, set `spec_dir` in the [configuration](#configuration); to keep pralph from treating an existing `specs/` directory as its own, set `"spec_driven": false`.
+
 ### Justloop
 
 A simple loop for running any prompt to completion without the full plan/stories/implement workflow. Give it a task and pralph handles the rest — it wraps the prompt with proper end conditions, runs it in a loop, and stops when Claude signals the task is done.
@@ -287,11 +365,21 @@ Input is resolved in order: `--prompt` flag > stdin pipe > interactive prompt.
 | `--prompt` | — | Guidance for design doc creation |
 | `--reset` | off | Reset phase state and start fresh |
 
+#### `spec`
+
+Accepts the request as positional arguments (e.g. `pralph spec "tasks can have due dates"`). On an existing spec the request is treated as a change to make; without a request the spec is refined.
+
+| Option | Default | Description |
+|---|---|---|
+| `-n`, `--name` | the only spec, else the project name | Spec name = directory under `specs/` |
+| `--prompt` | — | Request (alternative to positional args) |
+| `--reset` | off | Reset phase state and start fresh |
+
 #### `stories`
 
 | Option | Default | Description |
 |---|---|---|
-| `--extract-weight` | `80` | Extract vs research weight (0–100) |
+| `--extract-weight` | `80` | Extract vs research weight (0–100). Ignored in spec-driven mode |
 | `--reset` | off | Reset phase state and start fresh |
 
 #### `webgen`
@@ -366,6 +454,10 @@ Accepts the task as positional arguments (e.g. `pralph justloop fix all linting 
 
 Uses Haiku to semantically merge duplicate solutions and prune orphans. See [Index compaction](#index-compaction).
 
+#### `spec-status`
+
+No options. Shows every requirement of every spec with the stories that implement it and their status, flags requirements that changed since their stories were written, and lists stories that trace to no requirement (or to one that no longer exists).
+
 #### `reset-errors`
 
 No options. Resets all stories with `error` status back to `pending` and clears the current phase's error state (`consecutive_errors`, `last_error`, and `completion_reason` if the phase was stopped due to errors). This unblocks a phase that halted after hitting too many consecutive errors.
@@ -383,13 +475,20 @@ pralph reset-errors
 
 ### Project state
 
-All state lives in `.pralph/` within your project:
+All state lives in `.pralph/` within your project — except the spec, which in [spec-driven mode](#spec-driven-development) lives in the repository itself (`specs/`) and is meant to be committed:
 
 ```
+specs/                  # Spec-driven mode: the specification (commit this)
+  <name>/
+    spec.md             # Requirements
+    design.md           # Technical design
+    tasks.md            # Task list, maintained by pralph
+
 .pralph/
   config.json           # Project-level config overrides (optional)
   domains.txt           # Override auto-detected domains (optional)
   design-doc.md         # Design document (Phase 1)
+  spec-baseline.json    # Spec-driven mode: requirement text the backlog was derived from
   guardrails.md         # Coding standards and constraints
   stories.jsonl         # Story backlog
   status.jsonl          # Story status history
@@ -454,6 +553,8 @@ pralph uses JSON config files for persistent settings. Config is resolved in ord
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `global_compound` | `bool` | `false` | Save compound learnings to `~/.pralph/solutions/{domain}/` for cross-project reuse |
+| `spec_dir` | `string` | `"specs"` | Directory (inside the project) that holds the specs |
+| `spec_driven` | `bool` | auto | Force spec-driven mode on or off. By default it is on when `<spec_dir>/<name>/spec.md` exists |
 
 Set user-wide defaults in `~/.pralph/config.json`. Override per-project in `.pralph/config.json` (e.g. disable global saving for a throwaway project).
 
@@ -466,6 +567,7 @@ These files live directly in `.pralph/` and provide extra context that gets appe
 | `guardrails.md` | Project-specific coding standards and constraints injected into every phase |
 | `extra-tools.txt` | Additional MCP tools to enable (one per line), merged with `--extra-tools` CLI flag (see example below) |
 | `plan-prompt.md` | Extra context appended to plan phase prompts |
+| `spec-prompt.md` | Extra context appended to spec phase prompts |
 | `implement-prompt.md` | Extra context appended to implement phase prompts |
 | `review-prompt.md` | Project-specific review guidelines injected into the review template |
 
@@ -499,7 +601,10 @@ Use project-level overrides to tailor behavior for a specific project, or home-l
 |---|---|---|
 | `plan-initial.md` | Plan | First design document creation |
 | `plan-iteration.md` | Plan | Iterative design refinement |
+| `spec-initial.md` | Spec | First creation of an in-repo spec |
+| `spec-iteration.md` | Spec | Refining or amending a spec |
 | `stories-extract.md` | Stories | Extracting stories from design doc |
+| `stories-spec.md` | Stories | Deriving stories from the specs (spec-driven mode) |
 | `stories-research.md` | Stories | Research mode for best practices |
 | `stories-webgen.md` | Stories | Web-based requirements discovery |
 | `add.md` | Add | Creating a single story from an idea |
@@ -509,6 +614,8 @@ Use project-level overrides to tailor behavior for a specific project, or home-l
 | `implement-phase1-analyze.md` | Implement | Architecture-first grouping analysis |
 | `implement-phase1.md` | Implement | Phase 1 batch implementation |
 | `review.md` | Implement | Code review after implementation |
+| `spec-implement.md` | Implement | Spec section appended to the implement prompt (spec-driven mode) |
+| `spec-review.md` | Implement | Spec conformance section of the review prompt (spec-driven mode) |
 | `justloop.md` | Justloop | Task execution prompt with completion signal |
 | `compound.md` | Compound | Solution capture after implementation |
 | `compact.md` | Compact | Semantic merging of duplicate solutions |
