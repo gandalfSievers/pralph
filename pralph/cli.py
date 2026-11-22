@@ -6,7 +6,9 @@ import sys
 import click
 
 from pralph import __version__
+from pralph import linear_sync
 from pralph import spec as spec_lib
+from pralph.linear import LinearClient, LinearError, resolve_api_key
 from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_spec_loop, run_stories_loop, run_webgen_loop
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
@@ -36,14 +38,23 @@ def _reset_phase(state: StateManager, phase: str) -> None:
     click.echo(f"  Reset phase '{phase}'")
 
 
-def _state(ctx: click.Context) -> StateManager:
+def _state(ctx: click.Context, *, linear: str = "off") -> StateManager:
     """StateManager for the invocation, with integrations hooked in.
 
     Spec support (tasks.md, requirement baseline) is always attached — it is
-    inert outside spec mode.
+    inert outside spec mode. ``linear`` controls the Linear sync for commands
+    that change the backlog: ``"auto"`` syncs when the project is linked,
+    ``"required"`` fails when it can't, ``"off"`` leaves Linear alone. The
+    sync object, if any, ends up in ``ctx.obj["linear_sync"]``.
     """
     state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
     spec_lib.attach(state)
+    ctx.obj["linear_sync"] = None
+    if linear != "off":
+        try:
+            ctx.obj["linear_sync"] = linear_sync.attach(state, required=linear == "required")
+        except LinearError as e:
+            raise click.ClickException(str(e))
     return state
 
 
@@ -61,6 +72,7 @@ class OrderedGroup(click.Group):
     SECTIONS = [
         ("Workflow", ["plan", "spec", "stories", "webgen", "implement"]),
         ("Replan", ["add", "ideate", "refine"]),
+        ("Integration", ["linear"]),
         ("Tools", ["justloop", "compound", "compact-index", "spec-status", "reset-errors", "viewer"]),
     ]
 
@@ -194,7 +206,7 @@ def spec(ctx, prompt_args, name, prompt, reset):
 @click.pass_context
 def stories(ctx, extract_weight, reset):
     """Phase 2: Extract user stories from the design doc or spec."""
-    state = _state(ctx)
+    state = _state(ctx, linear="auto")
     if reset:
         _reset_phase(state, "stories")
     click.echo(f"pralph stories — max {ctx.obj['max_iterations']} iterations")
@@ -222,7 +234,7 @@ def stories(ctx, extract_weight, reset):
 @click.pass_context
 def webgen(ctx, reset):
     """Phase 2b: Discover missing requirements via web research."""
-    state = _state(ctx)
+    state = _state(ctx, linear="auto")
     if reset:
         _reset_phase(state, "webgen")
     click.echo(f"pralph webgen — max {ctx.obj['max_iterations']} iterations")
@@ -248,7 +260,7 @@ def webgen(ctx, reset):
 def add(ctx, prompt, is_next, anytime):
     """Add a single story from an idea."""
     prompt = _resolve_prompt(prompt, "Idea")
-    state = _state(ctx)
+    state = _state(ctx, linear="auto")
     click.echo(f"pralph add")
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  model: {ctx.obj['model']}")
@@ -292,7 +304,7 @@ def ideate(ctx, ideas_args, ideas_file, prompt, reset):
 
     Ideas can be passed as arguments: pralph ideate "add dark mode" "CSV export"
     """
-    state = _state(ctx)
+    state = _state(ctx, linear="auto")
     if reset:
         _reset_phase(state, "ideate")
 
@@ -359,7 +371,7 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
     """Refine existing stories: split, merge, or rewrite."""
     import fnmatch
 
-    state = _state(ctx)
+    state = _state(ctx, linear="auto")
     all_stories = state.load_stories()
     stories_by_id = {s.id: s for s in all_stories}
 
@@ -435,11 +447,20 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
 @click.option("--review/--no-review", default=True, help="Run reviewer after each implementation")
 @click.option("--compound/--no-compound", default=False, help="Capture learnings after each story (compound learning)")
 @click.option("--prompt", default=None, help="Guidance for implementation (e.g. 'use FastAPI', 'use MCP for DB access')")
+@click.option("--linear/--no-linear", "use_linear", default=None, help="Work off the linked Linear project [default: on when linked]")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def implement(ctx, story_id, phase1, review, compound, prompt, reset):
+def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, reset):
     """Phase 3: Implement stories from backlog."""
-    state = _state(ctx)
+    linear_mode = {None: "auto", True: "required", False: "off"}[use_linear]
+    if linear_mode == "auto" and linear_sync.LinearLink.load(
+        StateManager(ctx.obj["project_dir"]).linear_link_path
+    ):
+        # Linked projects are executed off their tickets — running without
+        # them has to be an explicit choice (--no-linear), not a missing key.
+        linear_mode = "required"
+    state = _state(ctx, linear=linear_mode)
+    tracker = ctx.obj["linear_sync"]
     if reset:
         _reset_phase(state, "implement")
     prompt = prompt or _read_stdin() or ""
@@ -452,9 +473,17 @@ def implement(ctx, story_id, phase1, review, compound, prompt, reset):
     if compound and save_global:
         domains = state.detect_domains()
         click.echo(f"  global: on (domains: {', '.join(domains) or 'none detected'})")
+    if tracker is not None:
+        click.echo(f"  linear: {tracker.link.project_name} ({tracker.link.team_key}) {tracker.link.project_url}")
     if state.spec_mode:
         click.echo(f"  spec-driven: {', '.join(sp.name for sp in spec_lib.list_specs(state)) or 'no specs yet'}")
     if story_id:
+        # Accept a Linear identifier (ENG-123) as well as a story ID.
+        for st in state.load_stories():
+            link = linear_sync.story_link(st)
+            if link and str(link.get("identifier", "")).upper() == story_id.upper():
+                story_id = st.id
+                break
         click.echo(f"  story: {story_id}")
 
     run_implement_loop(
@@ -472,6 +501,7 @@ def implement(ctx, story_id, phase1, review, compound, prompt, reset):
         verbose=ctx.obj["verbose"],
         dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
         max_budget_usd=ctx.obj["max_budget_usd"],
+        tracker=tracker,
     )
 
 
@@ -707,11 +737,139 @@ def spec_status(ctx):
         click.echo(click.style("\n  Every requirement is covered by the backlog", fg='green'))
 
 
+# ── Linear ───────────────────────────────────────────────────────────
+
+
+def _linear_sync(ctx: click.Context, *, need_key: bool = True) -> tuple[StateManager, linear_sync.LinearSync]:
+    """State + sync object for the `pralph linear` commands (linked or not)."""
+    state = _state(ctx)
+    api_key = resolve_api_key(state.get_config)
+    if need_key and not api_key:
+        raise click.ClickException(
+            "LINEAR_API_KEY is not set. Create a personal API key in Linear "
+            "(Settings → Security & access) and export it."
+        )
+    link = linear_sync.LinearLink.load(state.linear_link_path)
+    return state, linear_sync.LinearSync(state, LinearClient(api_key), link)
+
+
+def _echo_pull(report: linear_sync.PullReport) -> None:
+    for story in report.new:
+        click.echo(f"  {click.style('+', fg='green')} {click.style(story.id, fg='blue')}: {story.title}")
+    for story_id, old, new, reason in report.status_changes:
+        click.echo(f"  {click.style(story_id, fg='blue')}: {old} → {new}" + (f" ({reason})" if reason else ""))
+    click.echo(f"  {report.total} issues: {len(report.new)} new, {report.updated} updated, "
+               f"{len(report.status_changes)} status changes, {report.pushed} pushed back"
+               + (f", {report.relations_created} blocking relations created" if report.relations_created else ""))
+
+
+@main.group(cls=click.Group)
+def linear():
+    """Run the plan as a Linear project (push, pull, link, status)."""
+
+
+@linear.command("push")
+@click.option("--team", default=None, help="Linear team key, e.g. ENG [default: config linear_team, or the only team]")
+@click.option("--project", "project_name", default=None, help="Name for the Linear project [default: title of the plan]")
+@click.option("--dry-run", is_flag=True, help="Show what would be created without calling Linear")
+@click.pass_context
+def linear_push(ctx, team, project_name, dry_run):
+    """Turn the plan into a Linear project with sub-issues.
+
+    Creates the project (design doc / spec as its description), a parent issue
+    per story category, a sub-issue per story and blocking relations for
+    dependencies. Safe to re-run: only what is missing gets created.
+    """
+    state, sync = _linear_sync(ctx, need_key=not dry_run)
+    if not state.load_stories():
+        raise click.ClickException("No stories to push. Run 'pralph stories' first.")
+    click.echo("pralph linear push" + (" (dry run)" if dry_run else ""))
+    try:
+        report = sync.push(team_key=team, project_name=project_name, dry_run=dry_run)
+    except LinearError as e:
+        raise click.ClickException(str(e))
+
+    verb = "would create" if dry_run else "created"
+    project_note = f" ({verb})" if report.project_created else " (existing)"
+    click.echo(f"  project: {report.project_name}{project_note} {report.project_url}")
+    if report.epics_created:
+        click.echo(f"  parent issues {verb}: {', '.join(report.epics_created)}")
+    for story_id, identifier in report.issues_created:
+        click.echo(f"    {click.style(story_id, fg='blue')}" + (f" → {identifier}" if identifier else ""))
+    click.echo(f"  {verb}: {len(report.issues_created)} sub-issues, {report.relations_created} blocking relations"
+               f" ({report.already_linked} stories already in Linear)")
+    if not dry_run:
+        click.echo(click.style("  Next:", dim=True) + click.style(" pralph implement", fg='cyan')
+                   + click.style(" now works off the Linear project", dim=True))
+
+
+@linear.command("pull")
+@click.pass_context
+def linear_pull(ctx):
+    """Refresh the backlog from the Linear project (implement does this itself)."""
+    state, sync = _linear_sync(ctx)
+    click.echo("pralph linear pull")
+    try:
+        report = sync.pull()
+    except LinearError as e:
+        raise click.ClickException(str(e))
+    _echo_pull(report)
+
+
+@linear.command("link")
+@click.argument("project")
+@click.option("--team", default=None, help="Linear team key, if the project belongs to several teams")
+@click.pass_context
+def linear_link(ctx, project, team):
+    """Attach this checkout to an existing Linear project (URL, ID or name).
+
+    Use this on a fresh clone: the backlog is rebuilt from the tickets.
+    """
+    state, sync = _linear_sync(ctx)
+    if sync.linked:
+        raise click.ClickException(
+            f"Already linked to {sync.link.project_name} — remove {state.linear_link_path} to link elsewhere"
+        )
+    click.echo("pralph linear link")
+    try:
+        sync.link_project(project, team_key=team)
+        click.echo(f"  project: {sync.link.project_name} ({sync.link.team_key}) {sync.link.project_url}")
+        report = sync.pull()
+    except LinearError as e:
+        raise click.ClickException(str(e))
+    _echo_pull(report)
+
+
+@linear.command("status")
+@click.pass_context
+def linear_status(ctx):
+    """Show the Linear link and how the backlog maps onto it (as of the last sync)."""
+    state, sync = _linear_sync(ctx, need_key=False)
+    if not sync.linked:
+        click.echo("Not linked to a Linear project. Run 'pralph linear push' or 'pralph linear link'.")
+        return
+    click.echo(f"  project: {sync.link.project_name} {sync.link.project_url}")
+    click.echo(f"  team: {sync.link.team_key}")
+    click.echo(f"  parent issues: {', '.join(sorted(sync.link.epics)) or 'none'}")
+    by_state: dict[str, int] = {}
+    for story in state.load_stories():
+        link = linear_sync.story_link(story)
+        if link:
+            name = link.get("state") or link.get("state_type") or "?"
+            by_state[name] = by_state.get(name, 0) + 1
+    click.echo(f"  issues: {sum(by_state.values())}"
+               + (" (" + ", ".join(f"{n} {k}" for k, n in sorted(by_state.items())) + ")" if by_state else ""))
+    unpushed = sync.unpushed()
+    if unpushed:
+        click.echo(click.style(f"  {len(unpushed)} stories not in Linear yet", fg='yellow')
+                   + " — run 'pralph linear push'")
+
+
 @main.command("reset-errors")
 @click.pass_context
 def reset_errors(ctx):
     """Reset error stories to pending and clear error state."""
-    state = _state(ctx)
+    state = _state(ctx, linear="auto")
 
     # Show error details before resetting
     error_stories = [s for s in state.load_stories() if s.status == StoryStatus.error]

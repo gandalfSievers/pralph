@@ -860,6 +860,12 @@ class StateManager:
         spec_dir = self.spec_dir
         return spec_dir.is_dir() and any(p.is_file() for p in spec_dir.glob("*/spec.md"))
 
+    # -- linear --
+
+    @property
+    def linear_link_path(self) -> Path:
+        return self.state_dir / "linear.json"
+
     @property
     def home_dir(self) -> Path:
         return Path.home() / ".pralph"

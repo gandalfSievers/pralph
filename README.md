@@ -11,6 +11,7 @@
   - [Standard workflow](#standard-workflow)
   - [Adding stories later](#adding-stories-later)
   - [Spec-driven development](#spec-driven-development)
+  - [Linear mode](#linear-mode)
   - [Justloop](#justloop)
   - [Compound learning](#compound-learning)
   - [Index compaction](#index-compaction)
@@ -63,6 +64,10 @@ Manage stories on the fly:
 ### Phase 3: Implement
 
 Autonomously implements stories one at a time from the backlog. Optionally runs a review loop after each implementation. Includes crash recovery — orphaned in-progress stories reset to pending on restart.
+
+### Linear
+
+The plan can be turned into a [Linear](https://linear.app) project — a parent issue per story category, a sub-issue per story, blocking relations for dependencies — and executed from there: `implement` picks up the tickets, moves them through the workflow and comments on them, and respects whatever people change in Linear in the meantime. See [Linear mode](#linear-mode).
 
 ### Compound Learning
 
@@ -270,6 +275,68 @@ $ pralph spec-status
 
 To use a different directory, set `spec_dir` in the [configuration](#configuration); to keep pralph from treating an existing `specs/` directory as its own, set `"spec_driven": false`.
 
+### Linear mode
+
+Turn the whole plan into a Linear project and run the implementation off the tickets.
+
+```bash
+export LINEAR_API_KEY=lin_api_...     # Linear → Settings → Security & access → Personal API keys
+
+pralph linear push --dry-run          # show what would be created
+pralph linear push --team ENG         # create the project, parent issues and sub-issues
+pralph implement                      # now works off the Linear project
+```
+
+`pralph linear push` creates:
+
+- a **project**, named after the plan, with the design document (or spec) as its content
+- a **parent issue per story category** (`AUTH — Authentication`, `API — API`, ...)
+- a **sub-issue per story** (`AUTH-001: Login form`) with the story text, the acceptance criteria as a checklist, and the priority
+- **blocking relations** for story dependencies
+
+It is safe to re-run: only what is missing gets created. Stories added later (`add`, `ideate`, `stories`, ...) get their tickets automatically.
+
+Once the project is linked, **Linear is the source of truth for what gets worked on**. Before every story, `implement` syncs with the project:
+
+| In Linear | Effect on the run |
+|---|---|
+| Title, description, acceptance criteria or priority edited | The story is implemented as the ticket now reads |
+| Issue created in the project (or as a sub-issue) | Becomes a story and is implemented |
+| Issue canceled, marked as duplicate, or removed from the project | Skipped |
+| Issue moved to a started state by someone | Left alone — a person is working on it. Picked up again if it goes back to Todo |
+| Issue completed by someone | Treated as implemented |
+| Done issue moved back to Todo | Implemented again |
+| Blocking relation added or removed | Dependency order changes accordingly |
+| Sub-issues added to a story ticket | The sub-issues are implemented instead of the parent |
+
+And pralph reports back on the ticket:
+
+| pralph | In Linear |
+|---|---|
+| Starts a story | Issue → In Progress (and its parent issue, if not started yet) |
+| Implements it and the review passes | Issue → Done, comment with the summary and changed files. The parent closes with its last sub-issue |
+| Review rejects it | Stays In Progress, comment with the review feedback |
+| Fails | Stays In Progress, comment with the error. Move it to Todo (or run `pralph reset-errors`) to retry |
+| Skips it / finds a duplicate | Issue → Canceled, comment with the reason (and what it duplicates) |
+
+The implementation is told to mention the issue identifier (`ENG-123`) in its commit message, so Linear's GitHub/GitLab integration links the commits to the ticket.
+
+If Linear cannot be reached during a run, pralph continues with the backlog as last synced and catches up on the missed updates at the next sync.
+
+```bash
+pralph linear status                  # link, and ticket states as of the last sync
+pralph linear pull                    # sync now (implement does this by itself)
+pralph implement --story-id ENG-123   # a Linear identifier works as a story ID
+pralph implement --no-linear          # run without touching Linear
+
+# On a fresh clone: attach to the existing project and rebuild the backlog from its tickets
+pralph linear link https://linear.app/acme/project/shop-1a2b3c4d5e6f
+```
+
+The link is stored in `.pralph/linear.json`. The API key is read from `LINEAR_API_KEY`, or from `linear_api_key` in `~/.pralph/config.json` — don't put it in a config file that gets committed.
+
+Linear mode and spec-driven mode combine: the project content is a snapshot of the spec, and each sub-issue names the requirements it implements.
+
 ### Justloop
 
 A simple loop for running any prompt to completion without the full plan/stories/implement workflow. Give it a task and pralph handles the rest — it wraps the prompt with proper end conditions, runs it in a loop, and stops when Claude signals the task is done.
@@ -425,7 +492,25 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `--review` / `--no-review` | on | Run reviewer after each implementation |
 | `--compound` / `--no-compound` | off | Capture learnings after each story |
 | `--prompt` | — | Guidance for implementation (e.g. "use FastAPI") |
+| `--linear` / `--no-linear` | on when linked | Work off the linked Linear project |
 | `--reset` | off | Reset phase state and start fresh |
+
+#### `linear`
+
+| Command | Description |
+|---|---|
+| `linear push` | Create the Linear project, parent issues, sub-issues and blocking relations for everything not in Linear yet |
+| `linear pull` | Sync the backlog from the Linear project |
+| `linear link PROJECT` | Attach to an existing Linear project (URL, ID or name) and rebuild the backlog from it |
+| `linear status` | Show the link and the ticket states as of the last sync |
+
+`linear push` options:
+
+| Option | Default | Description |
+|---|---|---|
+| `--team` | config `linear_team`, or the only team | Linear team key (e.g. `ENG`) |
+| `--project` | title of the plan | Name of the Linear project |
+| `--dry-run` | off | Show what would be created without calling Linear |
 
 #### `justloop`
 
@@ -489,6 +574,7 @@ specs/                  # Spec-driven mode: the specification (commit this)
   domains.txt           # Override auto-detected domains (optional)
   design-doc.md         # Design document (Phase 1)
   spec-baseline.json    # Spec-driven mode: requirement text the backlog was derived from
+  linear.json           # Linear mode: linked team, project and parent issues
   guardrails.md         # Coding standards and constraints
   stories.jsonl         # Story backlog
   status.jsonl          # Story status history
@@ -555,6 +641,8 @@ pralph uses JSON config files for persistent settings. Config is resolved in ord
 | `global_compound` | `bool` | `false` | Save compound learnings to `~/.pralph/solutions/{domain}/` for cross-project reuse |
 | `spec_dir` | `string` | `"specs"` | Directory (inside the project) that holds the specs |
 | `spec_driven` | `bool` | auto | Force spec-driven mode on or off. By default it is on when `<spec_dir>/<name>/spec.md` exists |
+| `linear_team` | `string` | — | Default Linear team key for `pralph linear push` |
+| `linear_api_key` | `string` | — | Linear API key, if not set via `LINEAR_API_KEY`. Keep it in `~/.pralph/config.json`, not in the project |
 
 Set user-wide defaults in `~/.pralph/config.json`. Override per-project in `.pralph/config.json` (e.g. disable global saving for a throwaway project).
 

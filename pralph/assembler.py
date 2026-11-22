@@ -310,6 +310,21 @@ def _build_spec_review_context(state: StateManager, story: Story) -> str:
     return section
 
 
+def _build_linear_context(story: Story) -> str:
+    """Tell the implementer which Linear issue it is working on."""
+    link = story.metadata.get("linear")
+    if not isinstance(link, dict) or not link.get("identifier"):
+        return ""
+    identifier = link["identifier"]
+    url = f" ({link['url']})" if link.get("url") else ""
+    return (
+        "\n## Linear\n\n"
+        f"This story is tracked in Linear as **{identifier}**{url}.\n\n"
+        f"- Mention `{identifier}` in your commit message so Linear links the commit to the issue\n"
+        "- Do not edit the issue yourself — pralph moves it through the workflow and posts your summary\n"
+    )
+
+
 # -- Stories prompts --
 
 
@@ -554,6 +569,9 @@ def assemble_implement_prompt(
 
     # Spec-driven: the in-repo spec and the requirements this story implements
     prompt += _build_spec_implement_context(state, story)
+
+    # Linear: which issue this story is tracked as
+    prompt += _build_linear_context(story)
 
     # Rework context: include reviewer feedback when retrying a rejected story
     rework_context = _build_rework_context(state, story)

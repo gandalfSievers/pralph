@@ -25,6 +25,7 @@ from pralph.assembler import (
     assemble_stories_prompt,
     build_guardrails_system_prompt,
 )
+from pralph.linear import LinearError
 from pralph.models import IterationResult, PhaseState, Story, StoryStatus
 from pralph.parser import (
     detect_completion_signal,
@@ -1074,14 +1075,24 @@ def run_implement_loop(
     verbose: bool = False,
     dangerously_skip_permissions: bool = False,
     max_budget_usd: float | None = None,
+    tracker=None,
 ) -> PhaseState:
-    """Run the implementation loop."""
+    """Run the implementation loop.
+
+    With a ``tracker`` (Linear) the tickets are the source of truth: the
+    backlog is refreshed from the tracker before every story, so work that
+    was re-prioritized, added, taken or closed there is respected.
+    """
     # Recover any stories orphaned by a previous crash
     recovered = state.recover_orphaned_stories()
     if recovered:
         click.echo(click.style(f"  Recovered {len(recovered)} orphaned stories from previous crash:", fg='yellow', bold=True))
         for s in recovered:
             click.echo(f"    {click.style(s.id, fg='blue')}: {s.title}")
+
+    if tracker is not None:
+        _sync_tracker(tracker, push_missing=True)
+    tracker_fresh = tracker is not None  # the first iteration doesn't need to pull again
 
     if not state.stories_path.exists():
         click.echo("Error: No stories found. Run 'pralph stories' first.")
@@ -1134,7 +1145,12 @@ def run_implement_loop(
         return rework + _sort_stories(pending)
 
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
-        nonlocal story_queue
+        nonlocal story_queue, tracker_fresh
+        if tracker is not None:
+            if not tracker_fresh:
+                _sync_tracker(tracker)
+            tracker_fresh = False
+            story_queue = []  # tickets may have been re-prioritized, added or closed
         mode = _pick_implement_mode()
 
         # ── phase1_analyze: identify foundation stories ──
@@ -1430,6 +1446,33 @@ def run_implement_loop(
         return False
 
     return _run_loop("implement", state, max_iterations, cooldown, iteration_fn, completion_fn, resume_fn, verbose, dangerously_skip_permissions)
+
+
+def _sync_tracker(tracker, *, push_missing: bool = False) -> None:
+    """Refresh the backlog from the tracker (Linear) and report what changed.
+
+    A tracker that can't be reached doesn't stop the run — the loop carries on
+    with the backlog as last synced, and says so.
+    """
+    try:
+        if push_missing and tracker.unpushed():
+            pushed = tracker.push()
+            if pushed.issues_created:
+                click.echo(click.style(f"  [linear] created {len(pushed.issues_created)} missing issues", fg='blue'))
+        report = tracker.pull()
+    except LinearError as e:
+        click.echo(click.style(
+            f"  [linear] sync failed: {e}\n  [linear] continuing with the backlog as last synced", fg='yellow',
+        ))
+        return
+
+    for story in report.new:
+        click.echo(click.style("  [linear] new: ", fg='blue') + f"{story.id} — {story.title}")
+    for story_id, old, new, reason in report.status_changes:
+        click.echo(click.style("  [linear] ", fg='blue') + f"{story_id}: {old} → {new}"
+                   + (f" ({reason})" if reason else ""))
+    if report.updated:
+        click.echo(click.style("  [linear] ", fg='blue') + f"{report.updated} stories updated from their tickets")
 
 
 @dataclass
