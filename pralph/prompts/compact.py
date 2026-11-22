@@ -42,12 +42,15 @@ Rules:
 
 
 COMPACT_INDEX_PROMPT = """\
-# Solution Index Compaction
+# Solution Index Compaction (chunk)
 
-You are compacting a solution index for a compound learning system. Your job is
-to merge duplicate or near-duplicate solution entries and flag orphans.
+You are compacting a small chunk of a solution index for a compound learning
+system. The chunk below contains up to a few dozen solutions that may overlap
+with one another. Your job is to merge duplicate or near-duplicate entries
+*within this chunk* and flag orphans. Entries outside the chunk are out of
+scope; do not invent references to them.
 
-## Current Index Entries
+## Candidate Entries
 
 {{index_entries}}
 
@@ -57,9 +60,10 @@ to merge duplicate or near-duplicate solution entries and flag orphans.
 
 ## Your Task
 
-1. **Identify duplicates and near-duplicates** — Solutions that describe the same
-   problem/fix but were captured at different times or from different projects.
-   Look at titles, error signatures, tags, and actual content to judge similarity.
+1. **Identify duplicates and near-duplicates inside this chunk** — Solutions
+   that describe the same problem/fix but were captured at different times or
+   from different projects. Look at titles, error signatures, tags, and actual
+   content to judge similarity. Only consider entries shown above.
 
 2. **Merge duplicates** — When two or more solutions cover the same issue, produce
    a single merged entry that combines the best information from each:

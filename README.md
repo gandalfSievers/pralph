@@ -114,9 +114,15 @@ Over time, solution indexes accumulate duplicates (re-captured solutions) and ne
 pralph compact-index              # compact local + global indexes
 pralph compact-index --local-only  # only compact project-local index
 pralph compact-index --global-only # only compact global indexes
+pralph compact-index --yes         # skip the cost confirmation
+pralph compact-index --full        # re-check everything, not just what is new
 ```
 
-Compaction sends all solution entries and their content to Haiku, which identifies near-duplicates, merges them into single comprehensive documents, and removes stale entries. Merged files are written back and superseded files are cleaned up. The process is locked — concurrent solution saves wait until compaction finishes, and only one compaction can run at a time.
+Compaction first groups entries that look like the same incident (same error signature, overlapping tags, same title prefix, same story) and only sends those groups to Haiku — entries with nothing similar never cost a call. Haiku merges near-duplicates into single comprehensive documents and removes stale entries; merged files are written back and superseded files are cleaned up. Entries whose solution file no longer exists are dropped from the index.
+
+Before anything is sent, `compact-index` shows how many calls it will make and roughly what they cost, and asks for confirmation (`--yes` skips the question). Runs are incremental: a group that gained no entry since the last successful run is not sent again. `--full` re-checks every group.
+
+The index is rewritten after each group, so an interrupted or partly failed run keeps the merges it already made, and solutions saved while a compaction is running are not lost. Set `PRALPH_COMPACT_ON_SAVE=1` to merge a new solution with its look-alikes right when it is saved.
 
 ```
 ~/.pralph/solutions/
@@ -355,6 +361,8 @@ Accepts the task as positional arguments (e.g. `pralph justloop fix all linting 
 |---|---|---|
 | `--global-only` | off | Only compact global indexes |
 | `--local-only` | off | Only compact project-local index |
+| `--yes`, `-y` | off | Skip the cost-estimate confirmation |
+| `--full` | off | Re-check every group of similar entries, not only those that gained entries since the last run |
 
 Uses Haiku to semantically merge duplicate solutions and prune orphans. See [Index compaction](#index-compaction).
 

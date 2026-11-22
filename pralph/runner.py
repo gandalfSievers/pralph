@@ -30,11 +30,33 @@ class ClaudeResult:
     session_id: str = ""
     error: str = ""
     is_rate_limit: bool = False
+    is_context_overflow: bool = False
     interrupted: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
+
+
+_CONTEXT_OVERFLOW_MARKERS = (
+    "prompt is too long",
+    "context_length_exceeded",
+    "context length exceeded",
+    "input length",
+    "input is too long",
+    "input_tokens_exceed",
+    "max_tokens_to_sample",
+    "exceeds the maximum",
+    "too many tokens",
+    "context window",
+)
+
+
+def _is_context_overflow(error: str) -> bool:
+    if not error:
+        return False
+    err = error.lower()
+    return any(marker in err for marker in _CONTEXT_OVERFLOW_MARKERS)
 
 
 # Tools per phase
@@ -446,10 +468,12 @@ def run_claude(
 
     if proc.returncode != 0 and final_result is None:
         is_rate = "rate" in stderr.lower() or "overloaded" in stderr.lower()
+        err_text = stderr or f"exit code {proc.returncode}"
         return ClaudeResult(
             success=False,
-            error=stderr or f"exit code {proc.returncode}",
+            error=err_text,
             is_rate_limit=is_rate,
+            is_context_overflow=_is_context_overflow(err_text),
             session_id=session_id,
         )
 
@@ -696,13 +720,15 @@ def _parse_result_event(data: dict) -> ClaudeResult:
 
     usage = data.get("usage", {})
 
+    err_text = "" if is_success else data.get("error", subtype or "unknown")
     return ClaudeResult(
         success=is_success,
         result=data.get("result", ""),
         cost_usd=data.get("total_cost_usd", data.get("cost_usd", 0.0)),
         session_id=data.get("session_id", ""),
-        error="" if is_success else data.get("error", subtype or "unknown"),
+        error=err_text,
         is_rate_limit="rate" in data.get("error", "").lower(),
+        is_context_overflow=_is_context_overflow(err_text),
         input_tokens=usage.get("input_tokens", 0),
         output_tokens=usage.get("output_tokens", 0),
         cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
@@ -824,6 +850,15 @@ def run_with_retry(
             return result
 
         if result.interrupted:
+            return result
+
+        if result.is_context_overflow:
+            # Retrying with the same prompt won't help — bail immediately so
+            # the caller can chunk down or surface the error.
+            print(
+                "  [retry] prompt too large for model context — not retrying",
+                file=sys.stderr,
+            )
             return result
 
         if result.error == "timeout" and attempt == 0:

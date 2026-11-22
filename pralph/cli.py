@@ -480,8 +480,10 @@ def compound(ctx, story_id, prompt):
 @main.command("compact-index")
 @click.option("--global-only", is_flag=True, help="Only compact global indexes")
 @click.option("--local-only", is_flag=True, help="Only compact project-local index")
+@click.option("--yes", "-y", is_flag=True, help="Skip the cost-estimate confirmation prompt")
+@click.option("--full", is_flag=True, help="Re-check every cluster, not only those that gained entries since the last run")
 @click.pass_context
-def compact_index(ctx, global_only, local_only):
+def compact_index(ctx, global_only, local_only, yes, full):
     """Compact solution indexes: merge duplicates via Haiku and prune orphans."""
     state = StateManager(ctx.obj["project_dir"], domains=ctx.obj.get("domains"))
     model = "haiku"
@@ -491,10 +493,47 @@ def compact_index(ctx, global_only, local_only):
     click.echo(f"  project: {ctx.obj['project_dir']}")
     click.echo(f"  model: {model}")
 
+    # ── Pre-flight estimate ──────────────────────────────────────────────
+    estimates: list[tuple[str, dict]] = []
+    if not global_only and state.solutions_index_path.exists():
+        estimates.append(("local", state.estimate_local_compaction(model=model, full=full)))
+    if not local_only:
+        for est in state.estimate_global_compactions(model=model, full=full):
+            estimates.append((f"global/{est['domain']}", est))
+
+    if not estimates:
+        click.echo("  no indexes to compact")
+        return
+
+    click.echo("\n  Pre-flight estimate:")
+    label_width = max(len(label) for label, _ in estimates)
+    total_usd = 0.0
+    total_calls = 0
+    total_entries = 0
+    for label, est in estimates:
+        total_usd += est["usd"]
+        total_calls += est["calls"]
+        total_entries += est["entries"]
+        click.echo(
+            f"    {label.ljust(label_width)}  {est['entries']:>5} entries  "
+            f"{est['calls']:>3} calls  ~${est['usd']:.4f}"
+        )
+    click.echo(f"    {'─' * (label_width + 36)}")
+    click.echo(
+        f"    {'total'.ljust(label_width)}  {total_entries:>5} entries  "
+        f"{total_calls:>3} calls  ~${total_usd:.4f}"
+    )
+
+    if not yes:
+        if not click.confirm("\n  Proceed?", default=False):
+            click.echo("  aborted")
+            return
+
     compact_kwargs = dict(
         model=model,
         verbose=verbose,
         dangerously_skip_permissions=dangerously_skip_permissions,
+        full=full,
     )
 
     total_merged = 0

@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
@@ -214,6 +215,544 @@ def _index_lock(index_path: Path):
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
+
+
+class _NegStr:
+    """Wrap a string so it sorts in reverse (newest first for ISO timestamps)."""
+
+    __slots__ = ("s",)
+
+    def __init__(self, s: str) -> None:
+        self.s = s
+
+    def __lt__(self, other: "_NegStr") -> bool:
+        return self.s > other.s
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _NegStr) and self.s == other.s
+
+    def __hash__(self) -> int:
+        return hash(self.s)
+
+
+# USD per million tokens. Conservative estimates; refine if pricing shifts.
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "haiku": (1.00, 5.00),
+    "sonnet": (3.00, 15.00),
+    "opus": (15.00, 75.00),
+}
+
+# Compaction tunables.
+_COMPACT_CHUNK_SIZE = 30
+_COMPACT_BODY_CAP = 3000  # per-file body chars sent to LLM
+
+
+def _estimate_compaction_cost(
+    entries: list[dict],
+    solutions_base: Path,
+    *,
+    model: str = "haiku",
+    chunk_size: int = _COMPACT_CHUNK_SIZE,
+    marker: str | None = None,
+) -> dict:
+    """Rough pre-flight estimate for ``_compact_index`` over *entries*.
+
+    Estimates one LLM call per batch ``_plan_compaction`` would send: one per
+    multi-entry cluster (clusters > ``chunk_size`` are split), minus the
+    clusters an incremental run skips because nothing in them is newer than
+    *marker*. Token estimate is ``chars // 4`` for input; output is capped
+    at 8000 tokens per call. Returns ``{calls, input_tokens, output_tokens, usd}``.
+    """
+    if not entries:
+        return {"calls": 0, "input_tokens": 0, "output_tokens": 0, "usd": 0.0}
+
+    in_per_mtok, out_per_mtok = _MODEL_PRICING.get(model, _MODEL_PRICING["haiku"])
+
+    def _entry_chars(entry: dict) -> int:
+        chars = len(json.dumps(entry))
+        filename = entry.get("filename", "")
+        if filename:
+            path = _safe_resolve(solutions_base, filename)
+            if path is not None and path.exists():
+                try:
+                    chars += min(path.stat().st_size, _COMPACT_BODY_CAP)
+                except OSError:
+                    pass
+        return chars
+
+    _, batches = _plan_compaction(entries, marker=marker, chunk_size=chunk_size)
+    total_input_tokens = 0
+    total_output_tokens = 0
+    calls = 0
+    for batch in batches:
+        if len(batch) <= 1:
+            continue  # singletons skip the LLM
+        batch_chars = sum(_entry_chars(e) for e in batch)
+        in_tok = batch_chars // 4
+        out_tok = min(8000, max(500, in_tok // 2))
+        total_input_tokens += in_tok
+        total_output_tokens += out_tok
+        calls += 1
+
+    usd = (
+        (total_input_tokens / 1_000_000) * in_per_mtok
+        + (total_output_tokens / 1_000_000) * out_per_mtok
+    )
+    return {
+        "calls": calls,
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "usd": round(usd, 4),
+    }
+
+
+def _read_index_entries(index_path: Path) -> list[dict]:
+    """Read all valid JSON dict entries from a .jsonl index file."""
+    if not index_path.exists():
+        return []
+    entries: list[dict] = []
+    for line in index_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            entries.append(parsed)
+    return entries
+
+
+def _atomic_write_index(index_path: Path, entries: list[dict]) -> None:
+    """Atomic JSONL rewrite via tmp + os.replace."""
+    tmp_path = index_path.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+    os.replace(tmp_path, index_path)
+
+
+def _compact_state_path(index_path: Path) -> Path:
+    return index_path.parent / ".compact_state.json"
+
+
+def _read_compact_state(index_path: Path) -> dict:
+    p = _compact_state_path(index_path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_compact_state(index_path: Path, state: dict) -> None:
+    p = _compact_state_path(index_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, p)
+
+
+def _slugify(text: str) -> str:
+    import re as _re
+
+    slug = text.lower().strip()
+    slug = _re.sub(r"[^\w\s-]", "", slug)
+    slug = _re.sub(r"[\s_]+", "-", slug)
+    slug = _re.sub(r"-+", "-", slug)
+    return slug[:80].strip("-")
+
+
+def _is_stable_filename(filename: str) -> bool:
+    """True if ``filename`` already follows the ``category/{8hex}-slug.md`` shape."""
+    import re as _re
+
+    # category may contain - and word chars; require a hex prefix on the basename.
+    return bool(_re.match(r"^[\w./-]+?/[0-9a-f]{8}-", filename or ""))
+
+
+def _stable_filename(category: str, error_signature: str, title: str) -> str:
+    """Filename whose name is stable across compactions.
+
+    Built from a hash of (error_signature or title) plus a short readable slug.
+    Two solutions describing the same incident produce the same filename, so a
+    re-merge overwrites cleanly instead of orphaning files.
+    """
+    import hashlib
+
+    cat = category or "misc"
+    key = (error_signature or title or "untitled").lower().strip()
+    if not key:
+        key = "untitled"
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    slug = _slugify(title or "untitled")[:40].strip("-") or "untitled"
+    return f"{cat}/{h}-{slug}.md"
+
+
+def _pre_prune_entries(
+    entries: list[dict], solutions_base: Path
+) -> tuple[list[dict], int, int]:
+    """Return (valid, exact_dupes, pre_orphans).
+
+    Drops exact filename duplicates (keep last) and entries whose file is
+    missing on disk.
+    """
+    seen: dict[str, int] = {}
+    for i, entry in enumerate(entries):
+        seen[entry.get("filename", "")] = i
+    deduped = [entries[i] for i in sorted(seen.values())]
+    exact_dupes = len(entries) - len(deduped)
+
+    valid: list[dict] = []
+    pre_orphans = 0
+    for entry in deduped:
+        filename = entry.get("filename", "")
+        if not filename:
+            pre_orphans += 1
+            continue
+        path = _safe_resolve(solutions_base, filename)
+        if path is not None and path.exists():
+            valid.append(entry)
+        else:
+            pre_orphans += 1
+    return valid, exact_dupes, pre_orphans
+
+
+def _normalize_error_signature(s: str) -> str:
+    import re as _re
+
+    return _re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _cluster_entries(entries: list[dict]) -> list[list[dict]]:
+    """Group entries that likely describe the same incident.
+
+    Uses a union-find over indices, joining pairs that share *any* of:
+      * exact normalized error_signature
+      * same category + tag Jaccard ≥ 0.6
+      * same category + same story_id + same source_project
+      * same category + same first 5 title tokens (lowercased)
+
+    Returns multi-entry groups first (largest first), then singletons.
+    """
+    n = len(entries)
+    if n <= 1:
+        return [list(entries)] if entries else []
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Index entries by deterministic keys. Hits → unions.
+    by_sig: dict[str, list[int]] = defaultdict(list)
+    by_cat_story_proj: dict[tuple, list[int]] = defaultdict(list)
+    by_cat_title_prefix: dict[tuple, list[int]] = defaultdict(list)
+    cat_to_indices: dict[str, list[int]] = defaultdict(list)
+    tag_sets: list[set[str]] = []
+
+    for i, e in enumerate(entries):
+        cat = e.get("category", "") or ""
+        sig = _normalize_error_signature(e.get("error_signature", ""))
+        story = e.get("story_id", "") or ""
+        proj = e.get("source_project", "") or ""
+        title = (e.get("title", "") or "").lower()
+        title_tokens = tuple(title.split()[:5])
+        tags = {t.lower() for t in (e.get("tags") or []) if isinstance(t, str)}
+        tag_sets.append(tags)
+        cat_to_indices[cat].append(i)
+        if sig:
+            by_sig[sig].append(i)
+        if cat and story and proj:
+            by_cat_story_proj[(cat, story, proj)].append(i)
+        if cat and title_tokens:
+            by_cat_title_prefix[(cat, title_tokens)].append(i)
+
+    for indices in by_sig.values():
+        for j in indices[1:]:
+            union(indices[0], j)
+    for indices in by_cat_story_proj.values():
+        for j in indices[1:]:
+            union(indices[0], j)
+    for indices in by_cat_title_prefix.values():
+        for j in indices[1:]:
+            union(indices[0], j)
+
+    # Tag Jaccard ≥ 0.6, scoped to same category.
+    for indices in cat_to_indices.values():
+        if len(indices) < 2:
+            continue
+        # Skip if no tags exist to consider.
+        for a_pos, i in enumerate(indices):
+            tags_i = tag_sets[i]
+            if not tags_i:
+                continue
+            for j in indices[a_pos + 1:]:
+                tags_j = tag_sets[j]
+                if not tags_j:
+                    continue
+                union_size = len(tags_i | tags_j)
+                if union_size == 0:
+                    continue
+                jacc = len(tags_i & tags_j) / union_size
+                if jacc >= 0.6:
+                    union(i, j)
+
+    groups: dict[int, list[dict]] = defaultdict(list)
+    for i, entry in enumerate(entries):
+        groups[find(i)].append(entry)
+
+    multi = [g for g in groups.values() if len(g) > 1]
+    singles = [g for g in groups.values() if len(g) == 1]
+    multi.sort(key=lambda g: -len(g))
+    return multi + singles
+
+
+def _plan_compaction(
+    entries: list[dict],
+    *,
+    marker: str | None = None,
+    chunk_size: int = _COMPACT_CHUNK_SIZE,
+) -> tuple[list[dict], list[list[dict]]]:
+    """Decide what a compaction run sends to the LLM.
+
+    Returns ``(skipped, batches)``. ``batches`` are the clusters to process,
+    split into ``chunk_size`` pieces, multi-entry batches first (largest
+    first). ``skipped`` are the entries of clusters an incremental run leaves
+    alone: with a *marker* (the start time of the last fully successful run),
+    a cluster is only worth another LLM call if it gained an entry since —
+    everything else was already judged, merged or left distinct, back then.
+    Entries without a ``created`` timestamp count as new. ``marker=None``
+    (first run, or ``--full``) processes every cluster.
+    """
+    def _is_new(e: dict) -> bool:
+        created = e.get("created") or ""
+        return not marker or not created or created > marker
+
+    def _sort_key(e: dict) -> tuple:
+        return (e.get("category", ""), _NegStr(e.get("created") or ""), e.get("filename", ""))
+
+    skipped: list[dict] = []
+    batches: list[list[dict]] = []
+    for cluster in _cluster_entries(entries):
+        if not any(_is_new(e) for e in cluster):
+            skipped.extend(cluster)
+            continue
+        cluster = sorted(cluster, key=_sort_key)
+        for i in range(0, len(cluster), chunk_size):
+            batches.append(cluster[i : i + chunk_size])
+    batches.sort(key=lambda b: (len(b) <= 1, -len(b)))
+    return skipped, batches
+
+
+def _compact_chunk(
+    chunk: list[dict],
+    solutions_base: Path,
+    *,
+    model: str,
+    verbose: bool,
+    dangerously_skip_permissions: bool,
+) -> tuple[list[dict], set[str], int, int, float, bool]:
+    """Run one LLM compaction pass on *chunk*.
+
+    Returns ``(new_entries, files_to_delete, merges_count, removed_count,
+    cost, success)``. On failure, ``new_entries`` is the chunk unchanged,
+    ``files_to_delete`` is empty, counts are zero, and ``success=False``.
+    """
+    from pralph.parser import extract_json_from_text
+    from pralph.prompts.compact import COMPACT_INDEX_PROMPT
+    from pralph.runner import run_with_retry
+
+    if len(chunk) <= 1:
+        return list(chunk), set(), 0, 0, 0.0, True
+
+    index_json = json.dumps(chunk, indent=2)
+    contents_parts: list[str] = []
+    for entry in chunk:
+        filename = entry.get("filename", "")
+        path = _safe_resolve(solutions_base, filename)
+        if path is None or not path.exists():
+            continue
+        body = path.read_text().strip()
+        if len(body) > _COMPACT_BODY_CAP:
+            body = body[:_COMPACT_BODY_CAP] + "\n\n(truncated)"
+        contents_parts.append(f"### {filename}\n\n{body}")
+    contents_text = "\n\n---\n\n".join(contents_parts)
+
+    prompt = COMPACT_INDEX_PROMPT
+    prompt = prompt.replace("{{index_entries}}", index_json)
+    prompt = prompt.replace("{{solution_contents}}", contents_text)
+
+    result = run_with_retry(
+        prompt,
+        model=model,
+        timeout=120,
+        verbose=verbose,
+        dangerously_skip_permissions=dangerously_skip_permissions,
+    )
+    cost = result.cost_usd
+
+    if not result.success:
+        return list(chunk), set(), 0, 0, cost, False
+
+    parsed = extract_json_from_text(result.result)
+    if not isinstance(parsed, dict) or "entries" not in parsed:
+        return list(chunk), set(), 0, 0, cost, False
+
+    new_entries_raw = parsed["entries"]
+    merges = parsed.get("merges", []) or []
+    removed = parsed.get("removed", []) or []
+
+    failed = (list(chunk), set(), 0, 0, cost, False)
+    if not isinstance(new_entries_raw, list):
+        return failed
+
+    sources: dict[str, dict] = {e["filename"]: e for e in chunk if e.get("filename")}
+
+    # Pass 1 — decide every destination before touching the disk, so a
+    # response we can't apply safely leaves the chunk exactly as it was.
+    planned: list[tuple[dict, Path, str]] = []
+    new_filenames: set[str] = set()
+    for entry in new_entries_raw:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.pop("content", "")
+        if not isinstance(content, str):
+            content = ""
+        filename = entry.get("filename", "")
+        if not isinstance(filename, str) or filename not in sources:
+            # A new entry (the product of a merge): name it by the stable hash
+            # so merging the same incident again lands on the same file.
+            filename = _stable_filename(
+                entry.get("category", "") or "misc",
+                entry.get("error_signature", "") or "",
+                entry.get("title", "") or "untitled",
+            )
+        # An entry that keeps the name of a file in this chunk is never
+        # renamed: the LLM may have reworded its title or signature, and a
+        # recomputed name would point the index at a file that doesn't exist.
+        resolved = _safe_resolve(solutions_base, filename)
+        if resolved is None:
+            return failed
+        if not content and not resolved.exists():
+            return failed  # index entry without a file
+        entry["filename"] = filename
+        planned.append((entry, resolved, content))
+        new_filenames.add(filename)
+
+    merged_sources: set[str] = set()
+    for merge in merges:
+        if isinstance(merge, dict):
+            for src in merge.get("sources", []) or []:
+                if isinstance(src, str):
+                    merged_sources.add(src)
+    removed_filenames: set[str] = {
+        rem.get("filename", "") for rem in removed if isinstance(rem, dict)
+    }
+    # Only files of this chunk can be superseded — never trust a filename the
+    # LLM made up to pick what gets deleted.
+    accounted = (merged_sources | removed_filenames) & set(sources)
+    files_to_delete = accounted - new_filenames
+
+    # Pass 2 — write.
+    final_entries: list[dict] = []
+    for entry, resolved, content in planned:
+        if content:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(content)
+        final_entries.append(entry)
+
+    # Entries the LLM neither returned nor declared merged/removed stay as they are.
+    for filename, source in sources.items():
+        if filename not in new_filenames and filename not in accounted:
+            final_entries.append(source)
+
+    return final_entries, files_to_delete, len(merges), len(removed), cost, True
+
+
+def _maybe_merge_on_save(
+    new_entry: dict,
+    index_path: Path,
+    solutions_base: Path,
+    *,
+    model: str = "haiku",
+    verbose: bool = False,
+) -> dict | None:
+    """Best-effort merge of *new_entry* against existing candidates.
+
+    Gated by ``PRALPH_COMPACT_ON_SAVE=1``. Reads the index, finds entries that
+    share a deterministic dedupe signal with the just-saved one, runs Haiku
+    against just that small group, and rewrites the index if a merge happens.
+    Returns the LLM batch result dict, or ``None`` if no work happened.
+
+    All errors are swallowed: this is a maintenance hook, not a save guarantee.
+    """
+    if os.environ.get("PRALPH_COMPACT_ON_SAVE") != "1":
+        return None
+    new_fn = new_entry.get("filename", "")
+    if not new_fn:
+        return None
+
+    try:
+        with _index_lock(index_path):
+            entries = _read_index_entries(index_path)
+        if len(entries) <= 1:
+            return None
+
+        clusters = _cluster_entries(entries)
+        target_group: list[dict] | None = None
+        for g in clusters:
+            if any(e.get("filename") == new_fn for e in g):
+                target_group = g
+                break
+        if target_group is None or len(target_group) <= 1:
+            return None
+        if len(target_group) > _COMPACT_CHUNK_SIZE:
+            target_group = target_group[:_COMPACT_CHUNK_SIZE]
+
+        new_entries, files_to_delete, merges_n, removed_n, cost, success = _compact_chunk(
+            target_group,
+            solutions_base,
+            model=model,
+            verbose=verbose,
+            dangerously_skip_permissions=False,
+        )
+        if not success or not new_entries:
+            return None
+
+        with _index_lock(index_path):
+            on_disk = _read_index_entries(index_path)
+            target_filenames = {e.get("filename", "") for e in target_group}
+            kept = [e for e in on_disk if e.get("filename", "") not in target_filenames]
+            kept.extend(new_entries)
+            _atomic_write_index(index_path, kept)
+            for old_fn in files_to_delete:
+                old_path = _safe_resolve(solutions_base, old_fn)
+                if old_path is not None and old_path.exists():
+                    try:
+                        old_path.unlink()
+                    except OSError:
+                        pass
+
+        return {
+            "merged": merges_n,
+            "removed": removed_n,
+            "cost": cost,
+            "candidates": len(target_group),
+        }
+    except Exception:
+        # Compact-on-save is best-effort — never let it break a save.
+        return None
 
 
 class StateManager:
@@ -695,6 +1234,15 @@ class StateManager:
     def has_solutions(self) -> bool:
         return self.solutions_index_path.exists() and self.solutions_index_path.stat().st_size > 0
 
+    @staticmethod
+    def make_stable_filename(category: str, error_signature: str, title: str) -> str:
+        """Public wrapper around the stable hash-based filename helper.
+
+        Callers that produce solution entries can use this to pick a filename
+        whose name doesn't drift across compactions.
+        """
+        return _stable_filename(category, error_signature, title)
+
     def save_solution(
         self,
         category: str,
@@ -714,6 +1262,10 @@ class StateManager:
             # Append index entry
             with open(self.solutions_index_path, "a") as f:
                 f.write(json.dumps(index_entry) + "\n")
+
+        # Best-effort merge of the just-saved entry against existing candidates.
+        # No-op unless PRALPH_COMPACT_ON_SAVE=1 is set.
+        _maybe_merge_on_save(index_entry, self.solutions_index_path, self.solutions_dir)
 
         return solution_path
 
@@ -827,6 +1379,8 @@ class StateManager:
                 with open(idx_path, "a") as f:
                     f.write(json.dumps(entry) + "\n")
 
+            # Best-effort merge against existing candidates in this domain.
+            _maybe_merge_on_save(entry, idx_path, domain_dir)
             paths.append(solution_path)
 
         return paths
@@ -957,12 +1511,44 @@ class StateManager:
 
     # -- index compaction --
 
+    @staticmethod
+    def _estimate_index(index_path: Path, solutions_base: Path, *, model: str, full: bool) -> dict:
+        """Estimate for one index, over the same entries and marker the run will use."""
+        entries = _read_index_entries(index_path)
+        valid, _, _ = _pre_prune_entries(entries, solutions_base)
+        marker = None if full else _read_compact_state(index_path).get("last_compacted_at")
+        est = _estimate_compaction_cost(valid, solutions_base, model=model, marker=marker)
+        est["entries"] = len(entries)
+        return est
+
+    def estimate_local_compaction(self, *, model: str = "haiku", full: bool = False) -> dict:
+        """Pre-flight cost estimate for the local solutions index."""
+        return self._estimate_index(self.solutions_index_path, self.solutions_dir, model=model, full=full)
+
+    def estimate_global_compactions(self, *, model: str = "haiku", full: bool = False) -> list[dict]:
+        """Pre-flight cost estimate for every global domain index."""
+        out: list[dict] = []
+        solutions_root = self.home_dir / "solutions"
+        if not solutions_root.exists():
+            return out
+        for domain_dir in sorted(solutions_root.iterdir()):
+            if not domain_dir.is_dir():
+                continue
+            idx_path = domain_dir / "index.jsonl"
+            if not idx_path.exists():
+                continue
+            est = self._estimate_index(idx_path, domain_dir, model=model, full=full)
+            est["domain"] = domain_dir.name
+            out.append(est)
+        return out
+
     def compact_local_index(
         self,
         *,
         model: str = "haiku",
         verbose: bool = False,
         dangerously_skip_permissions: bool = False,
+        full: bool = False,
     ) -> dict:
         """Compact the project-local solutions index using an LLM to merge duplicates.
 
@@ -974,6 +1560,7 @@ class StateManager:
             model=model,
             verbose=verbose,
             dangerously_skip_permissions=dangerously_skip_permissions,
+            full=full,
         )
 
     def compact_global_indexes(
@@ -982,6 +1569,7 @@ class StateManager:
         model: str = "haiku",
         verbose: bool = False,
         dangerously_skip_permissions: bool = False,
+        full: bool = False,
     ) -> list[dict]:
         """Compact every global solution index that exists under ~/.pralph/solutions/.
 
@@ -1005,6 +1593,7 @@ class StateManager:
                 model=model,
                 verbose=verbose,
                 dangerously_skip_permissions=dangerously_skip_permissions,
+                full=full,
             )
             stats["domain"] = domain_dir.name
             results.append(stats)
@@ -1018,211 +1607,164 @@ class StateManager:
         model: str = "haiku",
         verbose: bool = False,
         dangerously_skip_permissions: bool = False,
+        full: bool = False,
     ) -> dict:
         """Use an LLM to semantically merge duplicate solutions and prune orphans.
 
-        Acquires an exclusive lock so concurrent saves wait until compaction
-        finishes, and only one compaction runs at a time.  Rewrites index and
-        solution files atomically.  Returns stats.
-        """
-        import re as _re
+        Clusters the valid entries (see ``_cluster_entries``) and sends each
+        multi-entry cluster to the LLM, in chunks of ``_COMPACT_CHUNK_SIZE``.
+        The index is rewritten atomically after every chunk so a mid-run
+        failure preserves earlier chunks' merges.
 
-        from pralph.parser import extract_json_from_text
-        from pralph.prompts.compact import COMPACT_INDEX_PROMPT
-        from pralph.runner import run_with_retry
+        Runs are incremental: clusters that gained no entry since the last
+        fully successful run are not sent again. ``full=True`` sends them all.
+        """
+        # Taken before the index is read: entries saved while we run are not
+        # looked at, so they have to count as new for the next run.
+        started_at = datetime.now().isoformat()
 
         if not index_path.exists():
-            return {"original": 0, "kept": 0, "merged": 0, "removed": 0, "cost": 0.0}
+            return {
+                "original": 0, "kept": 0, "merged": 0, "removed": 0,
+                "cost": 0.0, "chunks": 0, "failed_chunks": 0,
+            }
 
+        # Initial read + clustering: short critical section.
         with _index_lock(index_path):
-            # -- read current state under lock --
-            raw_lines = index_path.read_text().splitlines()
-            entries: list[dict] = []
-            for line in raw_lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    parsed = json.loads(line)
-                    if isinstance(parsed, dict):
-                        entries.append(parsed)
-                except json.JSONDecodeError:
-                    continue
-
+            entries = _read_index_entries(index_path)
             if not entries:
-                return {"original": 0, "kept": 0, "merged": 0, "removed": 0, "cost": 0.0}
+                return {
+                    "original": 0, "kept": 0, "merged": 0, "removed": 0,
+                    "cost": 0.0, "chunks": 0, "failed_chunks": 0,
+                }
 
             original = len(entries)
-
-            # Pre-prune exact filename duplicates (keep last) and orphans
-            # to reduce what we send to the LLM
-            seen: dict[str, int] = {}
-            for i, entry in enumerate(entries):
-                seen[entry.get("filename", "")] = i
-            deduped = [entries[i] for i in sorted(seen.values())]
-            exact_dupes = original - len(deduped)
-
-            valid: list[dict] = []
-            pre_orphans = 0
-            for entry in deduped:
-                filename = entry.get("filename", "")
-                if not filename:
-                    pre_orphans += 1
-                    continue
-                solution_path = _safe_resolve(solutions_base, filename)
-                if solution_path is not None and solution_path.exists():
-                    valid.append(entry)
-                else:
-                    pre_orphans += 1
+            valid, exact_dupes, pre_orphans = _pre_prune_entries(entries, solutions_base)
 
             if len(valid) <= 1:
-                # Nothing to merge — just rewrite the cleaned index
-                tmp_path = index_path.with_suffix(".tmp")
-                with open(tmp_path, "w") as f:
-                    for entry in valid:
-                        f.write(json.dumps(entry) + "\n")
-                os.replace(tmp_path, index_path)
+                _atomic_write_index(index_path, valid)
                 return {
                     "original": original,
                     "kept": len(valid),
                     "merged": 0,
                     "removed": exact_dupes + pre_orphans,
                     "cost": 0.0,
+                    "chunks": 0,
+                    "failed_chunks": 0,
                 }
 
-            # -- build prompt with index + solution contents --
-            index_json = json.dumps(valid, indent=2)
+        # Cluster + batch work happens OUTSIDE the lock — it's pure CPU and
+        # frees concurrent saves to land while we're computing batches.
+        marker = None if full else _read_compact_state(index_path).get("last_compacted_at")
+        skipped, batches = _plan_compaction(valid, marker=marker)
 
-            contents_parts: list[str] = []
-            for entry in valid:
-                filename = entry.get("filename", "")
-                path = _safe_resolve(solutions_base, filename)
-                if path is not None and path.exists():
-                    body = path.read_text().strip()
-                    # Cap per-file to avoid blowing context
-                    if len(body) > 3000:
-                        body = body[:3000] + "\n\n(truncated)"
-                    contents_parts.append(f"### {filename}\n\n{body}")
+        # Filenames we are responsible for — anything else seen on disk during
+        # processing is a concurrent append and gets carried through unchanged.
+        # That includes the entries pre-pruning dropped (orphans, exact
+        # duplicates): they are still in the file until the first rewrite and
+        # must not be mistaken for appends.
+        claimed: set[str] = {e.get("filename", "") for e in entries if e.get("filename")}
+        # Skipped clusters go straight into the output unchanged.
+        processed: list[dict] = list(skipped)
+        remaining_flat = [e for b in batches for e in b]
+        total_cost = 0.0
+        total_merged = 0
+        total_removed = 0
+        failed_chunks = 0
+        llm_batches = sum(1 for b in batches if len(b) > 1)
+        llm_done = 0
 
-            contents_text = "\n\n---\n\n".join(contents_parts)
+        for batch in batches:
+            if len(batch) <= 1:
+                processed.extend(batch)
+                remaining_flat = remaining_flat[len(batch):]
+                continue
 
-            prompt = COMPACT_INDEX_PROMPT
-            prompt = prompt.replace("{{index_entries}}", index_json)
-            prompt = prompt.replace("{{solution_contents}}", contents_text)
+            llm_done += 1
+            if verbose:
+                print(
+                    f"  [compact] batch {llm_done}/{llm_batches} ({len(batch)} entries)",
+                    file=sys.stderr,
+                )
 
-            # -- call LLM --
-            result = run_with_retry(
-                prompt,
+            # LLM call — lock NOT held. Saves can land in parallel.
+            new_entries, files_to_delete, merges_n, removed_n, cost, success = _compact_chunk(
+                batch,
+                solutions_base,
                 model=model,
-                timeout=120,
                 verbose=verbose,
                 dangerously_skip_permissions=dangerously_skip_permissions,
             )
+            total_cost += cost
 
-            cost = result.cost_usd
+            # Brief lock to apply the batch and absorb any concurrent appends.
+            with _index_lock(index_path):
+                on_disk = _read_index_entries(index_path)
+                # Pick up entries that landed since we started. We carry them
+                # through unchanged; they'll be candidates next compaction run.
+                new_appends = [
+                    e for e in on_disk if e.get("filename", "") and e.get("filename", "") not in claimed
+                ]
+                for e in new_appends:
+                    claimed.add(e.get("filename", ""))
 
-            if not result.success:
-                # LLM failed — fall back to the pre-pruned state (still useful)
-                tmp_path = index_path.with_suffix(".tmp")
-                with open(tmp_path, "w") as f:
-                    for entry in valid:
-                        f.write(json.dumps(entry) + "\n")
-                os.replace(tmp_path, index_path)
-                return {
-                    "original": original,
-                    "kept": len(valid),
-                    "merged": 0,
-                    "removed": exact_dupes + pre_orphans,
-                    "cost": cost,
-                }
+                if success:
+                    for old_fn in files_to_delete:
+                        old_path = _safe_resolve(solutions_base, old_fn)
+                        if old_path is not None and old_path.exists():
+                            try:
+                                old_path.unlink()
+                            except OSError:
+                                pass
+                    total_merged += merges_n
+                    total_removed += removed_n
+                    batch_result = new_entries
+                else:
+                    failed_chunks += 1
+                    if verbose:
+                        print(f"  [compact] batch {llm_done} failed — keeping unchanged", file=sys.stderr)
+                    batch_result = batch
 
-            # -- parse LLM response --
-            parsed = extract_json_from_text(result.result)
-            if not isinstance(parsed, dict) or "entries" not in parsed:
-                # Bad parse — keep pre-pruned state
-                tmp_path = index_path.with_suffix(".tmp")
-                with open(tmp_path, "w") as f:
-                    for entry in valid:
-                        f.write(json.dumps(entry) + "\n")
-                os.replace(tmp_path, index_path)
-                return {
-                    "original": original,
-                    "kept": len(valid),
-                    "merged": 0,
-                    "removed": exact_dupes + pre_orphans,
-                    "cost": cost,
-                }
+                for e in batch_result:
+                    fn = e.get("filename", "")
+                    if fn:
+                        claimed.add(fn)
 
-            new_entries = parsed["entries"]
-            merges = parsed.get("merges", [])
-            removed = parsed.get("removed", [])
+                processed.extend(batch_result)
+                processed.extend(new_appends)
+                remaining_flat = remaining_flat[len(batch):]
+                _atomic_write_index(index_path, processed + remaining_flat)
 
-            # -- slugify helper (inline to keep static) --
-            def _slugify(text: str) -> str:
-                slug = text.lower().strip()
-                slug = _re.sub(r"[^\w\s-]", "", slug)
-                slug = _re.sub(r"[\s_]+", "-", slug)
-                slug = _re.sub(r"-+", "-", slug)
-                return slug[:80].strip("-")
+        chunks_count = len(batches)
 
-            # -- write merged solution files + rebuild index --
-            old_filenames = {e.get("filename", "") for e in valid}
-            new_filenames: set[str] = set()
-            final_entries: list[dict] = []
+        # Final writeback — also picks up any last-minute concurrent appends.
+        with _index_lock(index_path):
+            on_disk = _read_index_entries(index_path)
+            new_appends = [
+                e for e in on_disk if e.get("filename", "") and e.get("filename", "") not in claimed
+            ]
+            if new_appends:
+                processed.extend(new_appends)
+            _atomic_write_index(index_path, processed)
 
-            for entry in new_entries:
-                if not isinstance(entry, dict):
-                    continue
-                content = entry.pop("content", "")
-                filename = entry.get("filename", "")
-
-                # Generate filename from title if missing or changed
-                if not filename:
-                    category = entry.get("category", "misc")
-                    title = entry.get("title", "untitled")
-                    filename = f"{category}/{_slugify(title)}.md"
-                    entry["filename"] = filename
-
-                resolved = _safe_resolve(solutions_base, filename)
-                if resolved is None:
-                    continue
-
-                if content:
-                    resolved.parent.mkdir(parents=True, exist_ok=True)
-                    resolved.write_text(content)
-
-                new_filenames.add(filename)
-                final_entries.append(entry)
-
-            # Clean up files that were merged away
-            merged_sources: set[str] = set()
-            for merge in merges:
-                if isinstance(merge, dict):
-                    for src in merge.get("sources", []):
-                        merged_sources.add(src)
-
-            removed_filenames: set[str] = set()
-            for rem in removed:
-                if isinstance(rem, dict):
-                    removed_filenames.add(rem.get("filename", ""))
-
-            for old_fn in (merged_sources | removed_filenames) - new_filenames:
-                if old_fn:
-                    old_path = _safe_resolve(solutions_base, old_fn)
-                    if old_path is not None and old_path.exists():
-                        old_path.unlink()
-
-            # Atomic index rewrite
-            tmp_path = index_path.with_suffix(".tmp")
-            with open(tmp_path, "w") as f:
-                for entry in final_entries:
-                    f.write(json.dumps(entry) + "\n")
-            os.replace(tmp_path, index_path)
-
+        # If every batch we attempted succeeded, advance the incremental
+        # marker so the next run can skip the clusters that didn't change.
+        # If any batch failed, leave the marker alone — its entries are then
+        # still "new" and get retried.
+        if failed_chunks == 0:
+            _write_compact_state(
+                index_path,
+                {
+                    "last_compacted_at": started_at,
+                    "last_count": len(processed),
+                },
+            )
         return {
             "original": original,
-            "kept": len(final_entries),
-            "merged": len(merges),
-            "removed": exact_dupes + pre_orphans + len(removed),
-            "cost": cost,
+            "kept": len(processed),
+            "merged": total_merged,
+            "removed": exact_dupes + pre_orphans + total_removed,
+            "cost": total_cost,
+            "chunks": chunks_count,
+            "failed_chunks": failed_chunks,
         }
