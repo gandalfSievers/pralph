@@ -12,6 +12,7 @@
   - [Adding stories later](#adding-stories-later)
   - [Spec-driven development](#spec-driven-development)
   - [Linear mode](#linear-mode)
+  - [A branch per story: worktrees, pull requests, merges](#a-branch-per-story-worktrees-pull-requests-merges)
   - [Justloop](#justloop)
   - [Compound learning](#compound-learning)
   - [Index compaction](#index-compaction)
@@ -66,6 +67,8 @@ Manage stories on the fly:
 Autonomously implements stories one at a time from the backlog. Optionally runs a review loop after each implementation. Includes crash recovery — orphaned in-progress stories reset to pending on restart.
 
 `pralph review --story-id AUTH-001` runs the reviewer by itself on a story that is already implemented — after changing `.pralph/review-prompt.md`, or after fixing something by hand. A rejection puts the story into rework, and `pralph implement --story-id AUTH-001` continues from the feedback.
+
+By default all of this happens on whatever branch is checked out. pralph can also give every story its own branch and worktree, hand the reviewed branch to a ship step of yours that opens the pull request, and hold dependent stories back until that pull request is merged. See [A branch per story](#a-branch-per-story-worktrees-pull-requests-merges).
 
 ### Linear
 
@@ -407,6 +410,61 @@ The link is stored in `.pralph/linear.json`.
 
 Linear mode and spec-driven mode combine: the project content is a snapshot of the spec, and each sub-issue names the requirements it implements.
 
+### A branch per story: worktrees, pull requests, merges
+
+Out of the box pralph commits every story to the branch that is checked out, and a story counts as done once it is implemented. For work that goes through pull requests, pralph can instead run each story on its own branch — and treat it as done only when that branch is merged.
+
+It is switched on by any of these:
+
+| Setting | Effect |
+|---|---|
+| `"worktree_dir": "../worktrees"` in the [configuration](#configuration) | Every story gets its own [worktree](https://git-scm.com/docs/git-worktree) under that directory (`<worktree_dir>/<project>/<branch>`), on its own branch. Your checkout is not touched. Relative paths start at the project; `~` works |
+| `.pralph/ship.md` | A ship step (below). Stories get a branch each — in worktrees if `worktree_dir` is set, otherwise by switching branches in the checkout |
+| `"branch_per_story": true` | Just the branch, in the checkout itself |
+
+A story then goes through these steps:
+
+1. **Branch.** pralph fetches the base branch (`base_branch`, by default the remote's default branch) and starts the story on a new branch from it. The branch is named after the Linear issue (`gitBranchName`, e.g. `com-554-guard-in-comply`), so Linear's GitHub integration links the pull request, moves the issue to In Review when it opens and to Done when it merges. Without Linear the name is built from the story (`auth-001-login-form`).
+2. **Implement and review**, in the story's directory. The implementation is told to commit to the branch and not to push.
+3. **Ship.** After an approved review pralph runs `.pralph/ship.md` — your prompt — in the story's directory. The story becomes `shipped` when the step answers with the URL of a pull request. pralph itself never pushes and never opens a pull request: without `ship.md` the story stays `implemented` on its branch, and merging is up to you.
+4. **Wait for the merge.** A story is `merged` once its pull request is merged (or, without one, once its branch is in the base branch — squash merges count). Only then do the stories that depend on it start, on a base branch that contains its work. Meanwhile pralph works on stories nothing holds back.
+5. **React to the review.** When a reviewer requests changes on the pull request, the review and its comments become the story's rework feedback: it is implemented again on the same branch, reviewed, and the ship step is run again to update the pull request. A pull request that is closed without a merge skips the story, and pralph says so.
+
+When nothing can be worked on but pull requests are still open, `implement` waits and looks at them every five minutes (`merge_poll_interval`). `pralph implement --no-wait` stops instead; the next run carries on from wherever the merges have got to.
+
+Watching pull requests needs the [GitHub CLI](https://cli.github.com) (`gh`), logged in. Without it pralph still notices merges by looking at the branch, and — with a Linear link — by the issue being Done; it cannot see requested changes.
+
+#### The ship step
+
+`.pralph/ship.md` is a prompt. pralph fills in `{{story_id}}`, `{{story_title}}`, `{{branch}}`, `{{base_branch}}`, `{{linear_id}}`, `{{linear_url}}`, `{{pr_url}}` (when a pull request is already open) and `{{worktree}}`, adds the same facts as a list, and asks for the pull request URL as the last line of the answer.
+
+```markdown
+<!-- .pralph/ship.md -->
+Run /team:open-pr for the branch {{branch}}, then print the URL of the pull request.
+```
+
+```
+# .pralph/ship-tools.txt — the tools the ship step may use (default: Read,Glob,Grep,Bash)
+Skill
+Bash
+Read
+```
+
+- A slash command or skill only runs when `Skill` is among the tools.
+- The step gets an hour (`ship_timeout`, in seconds) — a ship step may run review rounds of its own.
+- It should push and open the pull request, then return. Waiting for reviewers is pralph's part (steps 4 and 5).
+- `pralph ship --story-id AUTH-001` runs the step by hand: after it failed, or for a story implemented before `ship.md` existed.
+
+#### When a story needs a person
+
+Some stories cannot be finished in code alone — infrastructure has to be applied, a deployment checked. The implementation can answer with `needs_human` and say what is left. pralph then pauses that story (`needs_human`), puts the request on the Linear issue as a comment, keeps the stories that depend on it waiting, and carries on with the rest.
+
+```bash
+pralph unblock INFRA-003 -m "Applied to staging, deploy is green"
+```
+
+puts the story back in the queue; the next `implement` continues it on the same branch, with what it asked for and your message. Moving the Linear issue back to Todo does the same.
+
 ### Justloop
 
 A simple loop for running any prompt to completion without the full plan/stories/implement workflow. Give it a task and pralph handles the rest — it wraps the prompt with proper end conditions, runs it in a loop, and stops when Claude signals the task is done.
@@ -563,6 +621,7 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `--compound` / `--no-compound` | off | Capture learnings after each story |
 | `--prompt` | — | Guidance for implementation (e.g. "use FastAPI") |
 | `--linear` / `--no-linear` | on when linked | Work off the linked Linear project |
+| `--wait` / `--no-wait` | on | With [a branch per story](#a-branch-per-story-worktrees-pull-requests-merges): when nothing else can be worked on, wait for the open pull requests to be merged |
 | `--reset` | off | Reset phase state and start fresh |
 
 #### `linear`
@@ -602,6 +661,18 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `--story-id`, `-s` | required | Story to review (story ID or Linear identifier). Must be implemented or in rework |
 
 Exits with 1 when the review rejects the story or cannot run.
+
+#### `ship`
+
+| Option | Default | Description |
+|---|---|---|
+| `--story-id`, `-s` | required | Story to ship (story ID or Linear identifier). Must be implemented on its own branch |
+
+Runs the [ship step](#the-ship-step) for one story. Exits with 1 when no pull request came out of it.
+
+#### `unblock`
+
+`pralph unblock STORY_ID [-m MESSAGE]` continues a story that was [paused for a person](#when-a-story-needs-a-person).
 
 #### `justloop`
 
@@ -672,6 +743,8 @@ specs/                  # Spec-driven mode: the specification (commit this)
   phase-state.json      # Current phase progress
   run-log.jsonl         # Iteration log
   review-feedback/      # Per-story review notes
+  ship.md               # Ship step: prompt that opens the pull request (optional)
+  ship-tools.txt        # Tools the ship step may use (optional)
   prompts/              # Project-level prompt overrides
   solutions/            # Compound learning knowledge base
     index.jsonl         # Lightweight index for fast keyword search
@@ -735,6 +808,11 @@ pralph uses JSON config files for persistent settings. Config is resolved in ord
 | `spec_driven` | `bool` | auto | Force spec-driven mode on or off. By default it is on when `<spec_dir>/<name>/spec.md` exists |
 | `linear_team` | `string` | — | Default Linear team key for `pralph linear push` |
 | `linear_ac_heading` | `string` or list | — | Heading(s) that introduce the acceptance criteria in a Linear issue, in addition to `Acceptance criteria`, `Done when` and `Definition of done` |
+| `worktree_dir` | `string` | — | Directory for story worktrees; switches on [a branch per story](#a-branch-per-story-worktrees-pull-requests-merges). Worktrees go to `<worktree_dir>/<project>/<branch>` |
+| `branch_per_story` | `bool` | `false` | A branch per story without worktrees (also on with `worktree_dir` or `.pralph/ship.md`) |
+| `base_branch` | `string` | remote default | Branch that story branches start from and are merged into |
+| `ship_timeout` | `int` | `3600` | Seconds the ship step may run |
+| `merge_poll_interval` | `int` | `300` | Seconds between looks at the open pull requests while waiting |
 
 Set user-wide defaults in `~/.pralph/config.json`. Override per-project in `.pralph/config.json` (e.g. disable global saving for a throwaway project).
 
@@ -745,11 +823,13 @@ These files live directly in `.pralph/` and provide extra context that gets appe
 | File | Description |
 |---|---|
 | `guardrails.md` | Project-specific coding standards and constraints injected into every phase |
-| `extra-tools.txt` | Additional MCP tools to enable (one per line), merged with `--extra-tools` CLI flag (see example below) |
+| `extra-tools.txt` | Additional tools for `implement` and `justloop` (one per line), merged with the `--extra-tools` CLI flag: MCP tools (see example below), or `Skill` to let the implementation run your skills and slash commands |
 | `plan-prompt.md` | Extra context appended to plan phase prompts |
 | `spec-prompt.md` | Extra context appended to spec phase prompts |
 | `implement-prompt.md` | Extra context appended to implement phase prompts |
 | `review-prompt.md` | Project-specific review guidelines injected into the review template |
+| `ship.md` | The [ship step](#the-ship-step): run after an approved review to open the pull request |
+| `ship-tools.txt` | Tools the ship step may use (one per line) |
 
 For example, adding a `guardrails.md` with "Always use TypeScript strict mode" will influence every phase without needing to touch the underlying prompts.
 
