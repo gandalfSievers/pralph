@@ -1111,7 +1111,8 @@ def run_implement_loop(
                                  tools=tools, user_prompt=user_prompt, review=review,
                                  compound=compound, save_global=save_global, verbose=verbose,
                                  dangerously_skip_permissions=dangerously_skip_permissions,
-                                 max_budget_usd=max_budget_usd)
+                                 max_budget_usd=max_budget_usd,
+                                 max_rounds=max_iterations, tracker=tracker)
 
     # State-based mode selection (evaluated each iteration)
     def _pick_implement_mode() -> str:
@@ -1570,10 +1571,16 @@ def _implement_single(
     verbose: bool,
     dangerously_skip_permissions: bool,
     max_budget_usd: float | None,
+    max_rounds: int = 50,
+    tracker=None,
 ) -> PhaseState:
-    """Implement a single story by ID."""
-    stories = state.load_stories()
-    story = next((s for s in stories if s.id == story_id), None)
+    """Implement a single story by ID.
+
+    Like the backlog run, a story the review rejects is implemented again with
+    the review feedback, until the review approves it — at most ``max_rounds``
+    implementations. Compound learning runs once, after the approval.
+    """
+    story = next((s for s in state.load_stories() if s.id == story_id), None)
     if not story:
         click.echo(f"Error: Story '{story_id}' not found")
         return PhaseState(phase="implement", completed=True, completion_reason="story_not_found")
@@ -1585,50 +1592,67 @@ def _implement_single(
             "recovered_at": datetime.now().isoformat(),
         }
 
-    state.mark_story_status(story.id, StoryStatus.in_progress)
-    click.echo(f"  Implementing: {story.id} — {story.title}")
+    max_rounds = max(1, max_rounds)
+    for round_no in range(1, max_rounds + 1):
+        if round_no > 1:
+            # Rework round: the ticket may have been edited, taken or closed meanwhile.
+            if tracker is not None:
+                _sync_tracker(tracker)
+            story = next((s for s in state.load_stories() if s.id == story_id), None)
+            if story is None or story.status != StoryStatus.rework:
+                now = story.status.value if story is not None else "gone"
+                click.echo(click.style(f"  {story_id} is no longer waiting for rework ({now}) — stopping", fg='yellow'))
+                return PhaseState(phase="implement", completed=True, completion_reason="story_changed")
+            click.echo(click.style(f"  Reworking: {story.id}", fg='yellow', bold=True)
+                       + f" — round {round_no} of at most {max_rounds}")
+        else:
+            click.echo(f"  Implementing: {story.id} — {story.title}")
 
-    prompt = assemble_implement_prompt(state, story, user_prompt=user_prompt)
-    result = run_with_retry(
-        prompt,
-        model=model,
-        allowed_tools=tools,
-        system_prompt=system_prompt,
-        dangerously_skip_permissions=dangerously_skip_permissions,
-        max_budget_usd=max_budget_usd,
-        timeout=1800,
-        verbose=verbose,
-        project_dir=str(state.project_dir),
-    )
-
-    if not result.success:
-        if result.error in ("interrupted", "aborted"):
-            state.mark_story_status(story.id, StoryStatus.pending, summary=f"User {result.error}")
-            reason = "user_aborted" if result.error == "aborted" else "user_interrupted"
-            return PhaseState(phase="implement", completed=True, completion_reason=reason)
-        state.mark_story_status(
-            story.id, StoryStatus.error, summary=result.error[:200],
-            error_reason=result.error, error_output=result.result or "",
+        # `story` keeps the status it was loaded with, so a story in rework
+        # gets the review feedback in its prompt.
+        state.mark_story_status(story.id, StoryStatus.in_progress)
+        prompt = assemble_implement_prompt(state, story, user_prompt=user_prompt)
+        result = run_with_retry(
+            prompt,
+            model=model,
+            allowed_tools=tools,
+            system_prompt=system_prompt,
+            dangerously_skip_permissions=dangerously_skip_permissions,
+            max_budget_usd=max_budget_usd,
+            timeout=1800,
+            verbose=verbose,
+            project_dir=str(state.project_dir),
         )
-        click.echo(f"  Error: {result.error[:200]}")
-        return PhaseState(phase="implement", completed=True, completion_reason="error")
 
-    parsed = parse_implement_output(result.result)
-    status_str = parsed.get("status", "error")
-    summary = parsed.get("summary", "")
-    try:
-        new_status = StoryStatus(status_str)
-    except ValueError:
-        new_status = StoryStatus.implemented
+        if not result.success:
+            if result.error in ("interrupted", "aborted"):
+                state.mark_story_status(story.id, StoryStatus.pending, summary=f"User {result.error}")
+                reason = "user_aborted" if result.error == "aborted" else "user_interrupted"
+                return PhaseState(phase="implement", completed=True, completion_reason=reason)
+            state.mark_story_status(
+                story.id, StoryStatus.error, summary=result.error[:200],
+                error_reason=result.error, error_output=result.result or "",
+            )
+            click.echo(f"  Error: {result.error[:200]}")
+            return PhaseState(phase="implement", completed=True, completion_reason="error")
 
-    state.mark_story_status(
-        story.id, new_status, summary=summary, extra=parsed,
-        review_pending=review and new_status == StoryStatus.implemented,
-    )
-    click.echo(f"  → {story.id}: {new_status.value} — {summary[:120]}")
+        parsed = parse_implement_output(result.result)
+        status_str = parsed.get("status", "error")
+        summary = parsed.get("summary", "")
+        try:
+            new_status = StoryStatus(status_str)
+        except ValueError:
+            new_status = StoryStatus.implemented
 
-    # Review step for single story implementation
-    if new_status == StoryStatus.implemented and review:
+        state.mark_story_status(
+            story.id, new_status, summary=summary, extra=parsed,
+            review_pending=review and new_status == StoryStatus.implemented,
+        )
+        click.echo(f"  → {story.id}: {new_status.value} — {summary[:120]}")
+
+        if new_status != StoryStatus.implemented or not review:
+            break
+
         review_result = _run_review(
             state, story,
             model=model,
@@ -1637,8 +1661,15 @@ def _implement_single(
             dangerously_skip_permissions=dangerously_skip_permissions,
             max_budget_usd=max_budget_usd,
         )
-        if review_result is not None and not review_result.approved:
-            state.mark_story_status(story.id, StoryStatus.rework, summary="Review rejected")
+        if review_result is None or review_result.approved:
+            break
+
+        state.mark_story_status(story.id, StoryStatus.rework, summary="Review rejected")
+        if round_no == max_rounds:
+            click.echo(click.style(
+                f"  Review still rejects {story.id} after {max_rounds} "
+                f"{'round' if max_rounds == 1 else 'rounds'} — left in rework", fg='yellow',
+            ))
             return PhaseState(phase="implement", completed=True, completion_reason="review_rejected")
 
     # Compound learning: capture solutions after successful implementation

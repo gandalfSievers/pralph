@@ -487,7 +487,7 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 
 | Option | Default | Description |
 |---|---|---|
-| `--story-id` | — | Implement a specific story |
+| `--story-id` | — | Implement a specific story. If the review rejects it, it is reworked with the feedback until the review approves — at most `--max-iterations` rounds |
 | `--phase1` / `--no-phase1` | on | Architecture-first grouping |
 | `--review` / `--no-review` | on | Run reviewer after each implementation |
 | `--compound` / `--no-compound` | off | Capture learnings after each story |
