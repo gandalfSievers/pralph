@@ -1497,8 +1497,14 @@ def _run_review(
     verbose: bool,
     dangerously_skip_permissions: bool,
     max_budget_usd: float | None,
+    approve_on_error: bool = True,
 ) -> _ReviewResult | None:
-    """Run a review on a freshly implemented story. Returns None on review error."""
+    """Run a review on a freshly implemented story. Returns None on review error.
+
+    Inside the implementation loop a reviewer that fails must not hold the
+    story back, so the story counts as approved (``approve_on_error``). A
+    review that was asked for by itself reports the failure instead.
+    """
     click.echo(click.style(f"  🔍 Reviewing: {story.id}", fg='magenta', bold=True))
 
     review_prompt = assemble_review_prompt(state, story)
@@ -1516,8 +1522,9 @@ def _run_review(
 
     if not result.success:
         click.echo(click.style(f"  ⚠ Review failed (error): {result.error[:120]}", fg='yellow'))
-        click.echo(click.style("  → Auto-approving due to review error", fg='yellow'))
-        state.notify_review_passed(story.id)
+        if approve_on_error:
+            click.echo(click.style("  → Auto-approving due to review error", fg='yellow'))
+            state.notify_review_passed(story.id)
         return None
 
     parsed = parse_review_output(result.result)
@@ -1555,6 +1562,53 @@ def _run_review(
         cache_read_input_tokens=result.cache_read_input_tokens,
         cache_creation_input_tokens=result.cache_creation_input_tokens,
     )
+
+
+def run_review(
+    state: StateManager,
+    *,
+    story_id: str,
+    model: str = "sonnet",
+    verbose: bool = False,
+    dangerously_skip_permissions: bool = False,
+    max_budget_usd: float | None = None,
+) -> PhaseState:
+    """Review one story's implementation without implementing it.
+
+    An approval makes a story that was waiting for rework ``implemented``; a
+    rejection puts it into ``rework`` with the feedback, where the next
+    ``implement`` picks it up.
+    """
+    story = next((s for s in state.load_stories() if s.id == story_id), None)
+    if not story:
+        click.echo(f"Error: Story '{story_id}' not found")
+        return PhaseState(phase="review", completed=True, completion_reason="story_not_found")
+    if story.status not in (StoryStatus.implemented, StoryStatus.rework):
+        click.echo(f"Error: {story.id} is {story.status.value} — there is no implementation to review yet")
+        return PhaseState(phase="review", completed=True, completion_reason="not_implemented")
+
+    result = _run_review(
+        state, story,
+        model=model,
+        system_prompt=build_guardrails_system_prompt("implement", state),
+        verbose=verbose,
+        dangerously_skip_permissions=dangerously_skip_permissions,
+        max_budget_usd=max_budget_usd,
+        approve_on_error=False,
+    )
+    if result is None:
+        return PhaseState(phase="review", completed=True, completion_reason="review_error")
+
+    ps = PhaseState(phase="review", completed=True, total_cost_usd=result.cost_usd)
+    if result.approved:
+        if story.status == StoryStatus.rework:
+            state.mark_story_status(story.id, StoryStatus.implemented, summary=f"Review approved: {result.feedback}"[:200])
+        ps.completion_reason = "review_approved"
+    else:
+        if story.status != StoryStatus.rework:
+            state.mark_story_status(story.id, StoryStatus.rework, summary="Review rejected")
+        ps.completion_reason = "review_rejected"
+    return ps
 
 
 def _implement_single(

@@ -133,3 +133,60 @@ def test_review_error_does_not_trigger_rework(state) -> None:
     assert claude.calls == ["implement", "review"]
     assert ps.completion_reason == "single_story_done"
     assert status_of(state) == StoryStatus.implemented
+
+
+# ── pralph review ─────────────────────────────────────────────────────
+
+
+def run_review_cli(state: StateManager, claude: FakeClaude, story_id: str = "API-001"):
+    from click.testing import CliRunner
+
+    from pralph.cli import main
+
+    with patch("pralph.loop.run_with_retry", side_effect=claude):
+        return CliRunner().invoke(main, ["--project-dir", str(state.project_dir), "review", "-s", story_id])
+
+
+def test_review_rejects_an_implemented_story_into_rework(state) -> None:
+    state.mark_story_status("API-001", StoryStatus.implemented)
+    claude = FakeClaude(rejections=1)
+    result = run_review_cli(state, claude)
+    assert claude.calls == ["review"], "nothing is implemented"
+    assert result.exit_code == 1 and "pralph implement --story-id API-001" in result.output
+    assert status_of(state) == StoryStatus.rework
+    assert "Pagination is missing" in state.read_review_feedback("API-001")
+
+    fix = FakeClaude()
+    assert run_single(state, fix).completion_reason == "single_story_done"
+    assert "Pagination is missing" in fix.implement_prompts[0]
+
+
+def test_review_approval_finishes_a_story_in_rework(state) -> None:
+    state.mark_story_status("API-001", StoryStatus.rework)
+    state.write_review_feedback("API-001", "old feedback")
+    result = run_review_cli(state, FakeClaude())
+    assert result.exit_code == 0, result.output
+    assert status_of(state) == StoryStatus.implemented
+    assert state.read_review_feedback("API-001") == ""
+
+
+def test_review_of_an_approved_story_changes_nothing(state) -> None:
+    state.mark_story_status("API-001", StoryStatus.implemented)
+    history = state.status_path.read_text()
+    assert run_review_cli(state, FakeClaude()).exit_code == 0
+    assert state.status_path.read_text() == history
+
+
+def test_review_error_is_reported_not_approved(state) -> None:
+    state.mark_story_status("API-001", StoryStatus.rework)
+    result = run_review_cli(state, FakeClaude(review_error=True))
+    assert result.exit_code == 1 and "Auto-approving" not in result.output
+    assert status_of(state) == StoryStatus.rework
+
+
+def test_review_needs_an_implementation(state) -> None:
+    claude = FakeClaude()
+    result = run_review_cli(state, claude)
+    assert result.exit_code == 1 and "no implementation to review" in result.output
+    assert claude.calls == []
+    assert run_review_cli(state, claude, "NOPE-1").exit_code == 1

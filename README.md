@@ -65,6 +65,8 @@ Manage stories on the fly:
 
 Autonomously implements stories one at a time from the backlog. Optionally runs a review loop after each implementation. Includes crash recovery — orphaned in-progress stories reset to pending on restart.
 
+`pralph review --story-id AUTH-001` runs the reviewer by itself on a story that is already implemented — after changing `.pralph/review-prompt.md`, or after fixing something by hand. A rejection puts the story into rework, and `pralph implement --story-id AUTH-001` continues from the feedback.
+
 ### Linear
 
 The plan can be turned into a [Linear](https://linear.app) project — a parent issue per story category, a sub-issue per story, blocking relations for dependencies — and executed from there: `implement` picks up the tickets, moves them through the workflow and comments on them, and respects whatever people change in Linear in the meantime. See [Linear mode](#linear-mode).
@@ -511,6 +513,14 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `--team` | config `linear_team`, or the only team | Linear team key (e.g. `ENG`) |
 | `--project` | title of the plan | Name of the Linear project |
 | `--dry-run` | off | Show what would be created without calling Linear |
+
+#### `review`
+
+| Option | Default | Description |
+|---|---|---|
+| `--story-id`, `-s` | required | Story to review (story ID or Linear identifier). Must be implemented or in rework |
+
+Exits with 1 when the review rejects the story or cannot run.
 
 #### `justloop`
 

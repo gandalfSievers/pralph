@@ -9,7 +9,7 @@ from pralph import __version__
 from pralph import linear_sync
 from pralph import spec as spec_lib
 from pralph.linear import LinearClient, LinearError, resolve_api_key
-from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_spec_loop, run_stories_loop, run_webgen_loop
+from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_review, run_spec_loop, run_stories_loop, run_webgen_loop
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
 from pralph.state import StateManager
@@ -66,11 +66,20 @@ def _get_extra_tools(ctx: click.Context, state: StateManager) -> str:
     return ",".join(parts)
 
 
+def _resolve_story_ref(state: StateManager, story_id: str) -> str:
+    """Accept a Linear identifier (ENG-123) wherever a story ID is expected."""
+    for story in state.load_stories():
+        link = linear_sync.story_link(story)
+        if link and str(link.get("identifier", "")).upper() == story_id.upper():
+            return story.id
+    return story_id
+
+
 class OrderedGroup(click.Group):
     """Click group that shows commands in defined order with section headers."""
 
     SECTIONS = [
-        ("Workflow", ["plan", "spec", "stories", "webgen", "implement"]),
+        ("Workflow", ["plan", "spec", "stories", "webgen", "implement", "review"]),
         ("Replan", ["add", "ideate", "refine"]),
         ("Integration", ["linear"]),
         ("Tools", ["justloop", "compound", "compact-index", "spec-status", "reset-errors", "viewer"]),
@@ -478,12 +487,7 @@ def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, reset
     if state.spec_mode:
         click.echo(f"  spec-driven: {', '.join(sp.name for sp in spec_lib.list_specs(state)) or 'no specs yet'}")
     if story_id:
-        # Accept a Linear identifier (ENG-123) as well as a story ID.
-        for st in state.load_stories():
-            link = linear_sync.story_link(st)
-            if link and str(link.get("identifier", "")).upper() == story_id.upper():
-                story_id = st.id
-                break
+        story_id = _resolve_story_ref(state, story_id)
         click.echo(f"  story: {story_id}")
 
     run_implement_loop(
@@ -503,6 +507,39 @@ def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, reset
         max_budget_usd=ctx.obj["max_budget_usd"],
         tracker=tracker,
     )
+
+
+@main.command()
+@click.option("--story-id", "-s", required=True, help="Story to review (story ID or Linear identifier)")
+@click.pass_context
+def review(ctx, story_id):
+    """Review an implemented story without implementing it again.
+
+    Runs the same reviewer as 'implement'. An approval makes a story that was
+    waiting for rework implemented; a rejection puts the story into rework
+    with the feedback, where the next 'implement' picks it up. Exits with 1
+    when the review rejects the story or cannot run.
+    """
+    state = _state(ctx, linear="auto")
+    story_id = _resolve_story_ref(state, story_id)
+    click.echo("pralph review")
+    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  model: {ctx.obj['model']}")
+    click.echo(f"  story: {story_id}")
+
+    ps = run_review(
+        state,
+        story_id=story_id,
+        model=ctx.obj["model"],
+        verbose=ctx.obj["verbose"],
+        dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
+        max_budget_usd=ctx.obj["max_budget_usd"],
+    )
+    if ps.completion_reason == "review_rejected":
+        click.echo(click.style("  Next:", dim=True) + click.style(f" pralph implement --story-id {story_id}", fg='cyan')
+                   + click.style(" reworks it with this feedback", dim=True))
+    if ps.completion_reason != "review_approved":
+        sys.exit(1)
 
 
 @main.command()
