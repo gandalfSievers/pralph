@@ -69,7 +69,10 @@ VIEWER_HTML = r"""<!DOCTYPE html>
   .badge-status { background: var(--border); }
   .badge-status[data-v="pending"] { background: #1f2d40; color: var(--accent); }
   .badge-status[data-v="in_progress"] { background: #2d2300; color: var(--yellow); }
-  .badge-status[data-v="implemented"] { background: #0d2818; color: var(--green); }
+  .badge-status[data-v="implemented"],
+  .badge-status[data-v="merged"] { background: #0d2818; color: var(--green); }
+  .badge-status[data-v="shipped"] { background: #1f1633; color: var(--purple); }
+  .badge-status[data-v="needs_human"] { background: #2d2300; color: var(--yellow); }
   .badge-status[data-v="skipped"],
   .badge-status[data-v="duplicate"] { background: #1c1c1c; color: var(--muted); }
   .badge-status[data-v="error"] { background: #2d0f0f; color: var(--red); }
@@ -157,7 +160,10 @@ VIEWER_HTML = r"""<!DOCTYPE html>
   .tl-card.highlighted { border-color: var(--accent); box-shadow: 0 0 8px rgba(88,166,255,0.25); }
   .tl-card[data-status="pending"] { border-left: 3px solid var(--accent); }
   .tl-card[data-status="in_progress"] { border-left: 3px solid var(--yellow); }
-  .tl-card[data-status="implemented"] { border-left: 3px solid var(--green); }
+  .tl-card[data-status="implemented"],
+  .tl-card[data-status="merged"] { border-left: 3px solid var(--green); }
+  .tl-card[data-status="shipped"] { border-left: 3px solid var(--purple); }
+  .tl-card[data-status="needs_human"] { border-left: 3px solid var(--yellow); }
   .tl-card[data-status="skipped"],
   .tl-card[data-status="duplicate"] { border-left: 3px solid var(--muted); }
   .tl-card[data-status="error"] { border-left: 3px solid var(--red); }
@@ -362,7 +368,7 @@ function updateStats() {
 function updateProgress() {
   const total = stories.length;
   const done = stories.filter(s =>
-    ['implemented','skipped','duplicate','external'].includes(s.status)
+    ['implemented','merged','skipped','duplicate','external'].includes(s.status)
   ).length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   const fill = document.getElementById('progressFill');
@@ -580,7 +586,7 @@ window.addEventListener('resize', () => {
   if (currentTab === 'timeline' && timelineBuilt) renderTimeline();
 });
 
-const STORY_STATUSES = ['pending','in_progress','implemented','rework','skipped','duplicate','external','error'];
+const STORY_STATUSES = ['pending','in_progress','implemented','shipped','merged','needs_human','rework','skipped','duplicate','external','error'];
 
 function editStory(id) {
   const s = stories.find(x => x.id === id);

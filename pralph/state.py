@@ -1000,9 +1000,9 @@ class StateManager:
 
     # -- claude session validation --
 
-    def claude_session_exists(self, session_id: str) -> bool:
-        """Check if a Claude session file exists on disk."""
-        encoded = str(self.project_dir).replace("/", "-")
+    def claude_session_exists(self, session_id: str, cwd: Path | None = None) -> bool:
+        """Check if a Claude session file exists on disk (``cwd``: where the session ran)."""
+        encoded = str(cwd or self.project_dir).replace("/", "-")
         path = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
         return path.exists()
 

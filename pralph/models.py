@@ -14,6 +14,10 @@ class StoryStatus(enum.Enum):
     duplicate = "duplicate"
     external = "external"
     error = "error"
+    # Stories that work on their own branch (see pralph.ship):
+    shipped = "shipped"          # pull request open, waiting for the merge
+    merged = "merged"            # in the base branch — what a dependent story waits for
+    needs_human = "needs_human"  # paused: a person has to do something first
 
 
 @dataclass

@@ -310,6 +310,53 @@ def _build_spec_review_context(state: StateManager, story: Story) -> str:
     return section
 
 
+def _build_git_context(story: Story) -> str:
+    """Tell the implementer which branch it is on — and that shipping is not its job."""
+    info = story.metadata.get("git")
+    if not isinstance(info, dict) or not info.get("branch"):
+        return ""
+    lines = [
+        "\n## Branch\n",
+        f"This story has its own branch, `{info['branch']}`, started from `{info.get('base') or 'the base branch'}`. "
+        "It is checked out in your working directory.\n",
+        "- Commit your work to this branch",
+        "- Do not switch branches, push, or open a pull request — pralph ships the branch after its review",
+    ]
+    if info.get("pr_url"):
+        lines.append(f"- A pull request for it is already open ({info['pr_url']}); your commits will be added to it")
+    return "\n".join(lines) + "\n"
+
+
+_PAUSE_SECTION = """
+## When a person has to step in
+
+If the story cannot be finished without something only a person can do — apply
+infrastructure, check a deployment, make a decision — do everything that can
+be done in code, commit it, and return:
+
+```json
+{"status": "needs_human", "summary": "What is done so far", "reason": "Exactly what the person has to do"}
+```
+
+pralph pauses the story, passes your `reason` on, and continues it once the
+person says it is done. Use this only when you are truly stuck on a person.
+"""
+
+
+def _build_pause_context(story: Story) -> str:
+    """A story that was paused for a person and is now continued."""
+    pause = story.metadata.get("needs_human")
+    note = str(story.metadata.get("human_note") or "").strip()
+    if not isinstance(pause, dict) and not note:
+        return ""
+    lines = ["\n## Continuing after a pause\n", "You paused this story earlier because a person had to do something first:\n"]
+    reason = str((pause or {}).get("reason") or "").strip() if isinstance(pause, dict) else ""
+    lines.append(f"> {reason or '(no reason recorded)'}\n")
+    lines.append(f"They report: {note}\n" if note else "They report that it is done.\n")
+    lines.append("Your earlier work is committed. Check that what you asked for is in place, then finish the story.")
+    return "\n".join(lines) + "\n"
+
+
 def _build_linear_context(story: Story) -> str:
     """Tell the implementer which Linear issue it is working on."""
     link = story.metadata.get("linear")
@@ -573,6 +620,11 @@ def assemble_implement_prompt(
     # Linear: which issue this story is tracked as
     prompt += _build_linear_context(story)
 
+    # Its own branch, if stories have one; and how to hand over to a person
+    prompt += _build_git_context(story)
+    prompt += _PAUSE_SECTION
+    prompt += _build_pause_context(story)
+
     # Rework context: include reviewer feedback when retrying a rejected story
     rework_context = _build_rework_context(state, story)
 
@@ -636,6 +688,16 @@ def assemble_review_prompt(
     prompt = _safe_sub(prompt, "story_content", content)
     prompt = _safe_sub(prompt, "acceptance_criteria", ac_text)
     prompt = _safe_sub(prompt, "review_guidance", review_guidance)
+
+    info = story.metadata.get("git")
+    if isinstance(info, dict) and info.get("branch"):
+        base = info.get("base") or "main"
+        prompt += (
+            "\n## Branch under review\n\n"
+            f"The story's work is on the branch `{info['branch']}`, checked out in your working directory. "
+            f"Everything on it since `{base}` belongs to the story — look at `git diff {base}...HEAD` "
+            f"(or `origin/{base}...HEAD`) rather than at the last commit alone.\n"
+        )
     return prompt
 
 

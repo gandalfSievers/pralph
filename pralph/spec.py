@@ -120,11 +120,12 @@ class RequirementCoverage:
         if not active:
             return "dropped"
         statuses = {s.status for s in active}
-        if statuses == {StoryStatus.implemented}:
+        if statuses <= {StoryStatus.implemented, StoryStatus.merged}:
             return "done"
         if StoryStatus.error in statuses:
             return "error"
-        if statuses & {StoryStatus.in_progress, StoryStatus.rework, StoryStatus.implemented}:
+        if statuses & {StoryStatus.in_progress, StoryStatus.rework, StoryStatus.implemented,
+                       StoryStatus.shipped, StoryStatus.merged, StoryStatus.needs_human}:
             return "in_progress"
         return "pending"
 
@@ -525,7 +526,7 @@ _TERMINAL_LABELS = {
 def task_line(story: Story, req_ids: list[str]) -> str:
     """One checklist line. Only the checkbox changes when a story is implemented,
     so an implementer ticking the box produces exactly what pralph would write."""
-    done = story.status == StoryStatus.implemented or story.status in _TERMINAL_LABELS
+    done = story.status in (StoryStatus.implemented, StoryStatus.merged) or story.status in _TERMINAL_LABELS
     details = [", ".join(req_ids), f"P{story.priority}", story.complexity or "medium"]
     if story.dependencies:
         details.append("after " + ", ".join(story.dependencies))

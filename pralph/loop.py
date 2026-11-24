@@ -6,10 +6,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 import click
 
+from pralph import ship as ship_lib
 from pralph import spec as spec_lib
 from pralph.assembler import (
     assemble_add_prompt,
@@ -136,7 +138,9 @@ def _run_loop(
 
     # Check for resumable session from previous crash
     if ps.active_session_id and resume_fn:
-        if not state.claude_session_exists(ps.active_session_id):
+        # A story with a worktree of its own ran there, and so did its session.
+        session_dir = ship_lib.story_workdir(state, ps.active_story_id) if ps.active_story_id else state.project_dir
+        if not state.claude_session_exists(ps.active_session_id, session_dir):
             click.echo("  Previous session not found on disk, starting fresh")
             _clear_session_tracking(ps)
             state.save_phase_state(ps)
@@ -155,7 +159,7 @@ def _run_loop(
                     return ps
                 state.save_phase_state(ps)
             elif choice == "interactive":
-                resume_interactive(ps.active_session_id, str(state.project_dir), dangerously_skip_permissions)
+                resume_interactive(ps.active_session_id, str(session_dir), dangerously_skip_permissions)
                 _clear_session_tracking(ps)
                 state.save_phase_state(ps)
             elif choice == "abort":
@@ -1076,13 +1080,50 @@ def run_implement_loop(
     dangerously_skip_permissions: bool = False,
     max_budget_usd: float | None = None,
     tracker=None,
+    wait: bool = True,
 ) -> PhaseState:
     """Run the implementation loop.
 
     With a ``tracker`` (Linear) the tickets are the source of truth: the
     backlog is refreshed from the tracker before every story, so work that
     was re-prioritized, added, taken or closed there is respected.
+
+    With a branch per story (see ``pralph.ship``) a story waits until the
+    stories it depends on are merged. When nothing else can be worked on the
+    loop waits for the open pull requests — or stops, with ``wait=False``.
     """
+    flow = ship_lib.Flow(state)
+    try:
+        return _run_implement_loop(
+            state, flow, model=model, max_iterations=max_iterations, cooldown=cooldown, story_id=story_id,
+            phase1=phase1, review=review, compound=compound, save_global=save_global, user_prompt=user_prompt,
+            extra_tools=extra_tools, verbose=verbose, dangerously_skip_permissions=dangerously_skip_permissions,
+            max_budget_usd=max_budget_usd, tracker=tracker, wait=wait,
+        )
+    finally:
+        flow.restore()
+
+
+def _run_implement_loop(
+    state: StateManager,
+    flow: ship_lib.Flow,
+    *,
+    model: str,
+    max_iterations: int,
+    cooldown: int,
+    story_id: str | None,
+    phase1: bool,
+    review: bool,
+    compound: bool,
+    save_global: bool,
+    user_prompt: str,
+    extra_tools: str,
+    verbose: bool,
+    dangerously_skip_permissions: bool,
+    max_budget_usd: float | None,
+    tracker,
+    wait: bool,
+) -> PhaseState:
     # Recover any stories orphaned by a previous crash
     recovered = state.recover_orphaned_stories()
     if recovered:
@@ -1115,7 +1156,7 @@ def run_implement_loop(
                                  compound=compound, save_global=save_global, verbose=verbose,
                                  dangerously_skip_permissions=dangerously_skip_permissions,
                                  max_budget_usd=max_budget_usd,
-                                 max_rounds=max_iterations, tracker=tracker)
+                                 max_rounds=max_iterations, tracker=tracker, flow=flow)
 
     # State-based mode selection (evaluated each iteration)
     def _pick_implement_mode() -> str:
@@ -1130,9 +1171,12 @@ def run_implement_loop(
         return "implement"
 
     story_queue: list[Story] = []
+    blocked: dict[str, list[str]] = {}  # actionable stories → the dependencies they wait for
+    announced: tuple = ()
 
     def _refresh_queue() -> list[Story]:
-        actionable = state.get_actionable_stories()
+        nonlocal blocked
+        actionable, blocked = flow.split(state.get_actionable_stories())
         # Rework stories are already at the front from get_actionable_stories()
         rework = [s for s in actionable if s.status == StoryStatus.rework]
         pending = [s for s in actionable if s.status == StoryStatus.pending]
@@ -1149,12 +1193,14 @@ def run_implement_loop(
         return rework + _sort_stories(pending)
 
     def iteration_fn(i: int, ps: PhaseState) -> IterationResult:
-        nonlocal story_queue, tracker_fresh
+        nonlocal story_queue, tracker_fresh, announced
         if tracker is not None:
             if not tracker_fresh:
                 _sync_tracker(tracker)
             tracker_fresh = False
             story_queue = []  # tickets may have been re-prioritized, added or closed
+        if _report_flow_changes(flow.refresh()) or flow.enabled:
+            story_queue = []  # a merge frees dependents; a new pull request holds them back
         mode = _pick_implement_mode()
 
         # ── phase1_analyze: identify foundation stories ──
@@ -1211,15 +1257,51 @@ def run_implement_loop(
         if not story_queue:
             story_queue = _refresh_queue()
 
-        if not story_queue:
-            return IterationResult(
-                iteration=i, phase="implement", mode="implement",
-                success=True, impl_status="all_done",
-            )
+        while not story_queue:
+            # Nothing to work on. Is anything still on its way (a pull request, a person)?
+            waiting = flow.waiting()
+            if not waiting:
+                if blocked:
+                    _report_blocked(state, blocked)
+                    return IterationResult(
+                        iteration=i, phase="implement", mode="implement", success=True, impl_status="blocked",
+                    )
+                return IterationResult(
+                    iteration=i, phase="implement", mode="implement",
+                    success=True, impl_status="all_done",
+                )
+            signature = tuple((s.id, s.status) for s in waiting)
+            if signature != announced:
+                announced = signature
+                _report_waiting(waiting, blocked)
+            if not wait:
+                return IterationResult(
+                    iteration=i, phase="implement", mode="implement", success=True, impl_status="waiting",
+                )
+            click.echo(click.style(
+                f"  Looking again in {flow.settings.poll_interval}s (Ctrl-C to stop) ...", dim=True,
+            ))
+            flow.sleep()
+            if tracker is not None:
+                _sync_tracker(tracker)
+            _report_flow_changes(flow.refresh())
+            story_queue = _refresh_queue()
 
         story = story_queue.pop(0)
+        try:
+            workdir = flow.prepare(story)
+        except ship_lib.GitError as e:
+            # Not the story's fault, and the next one would fail the same way.
+            click.echo(click.style(f"  Cannot set up the branch for {story.id}: {e}", fg='red'))
+            story_queue.clear()
+            return IterationResult(
+                iteration=i, phase="implement", mode="implement", success=False,
+                error=str(e), impl_status="workspace_error", story_id=story.id,
+            )
         state.mark_story_status(story.id, StoryStatus.in_progress)
         click.echo(click.style(f"  Implementing: {story.id}", fg='yellow', bold=True) + f" — {story.title}")
+        if flow.enabled:
+            click.echo(click.style(f"  on {ship_lib.git_info(story).get('branch')} in {workdir}", dim=True))
 
         # Log iteration start
         state.log_iteration(IterationResult(
@@ -1244,7 +1326,7 @@ def run_implement_loop(
             max_budget_usd=max_budget_usd,
             timeout=1800,
             verbose=verbose,
-            project_dir=str(state.project_dir),
+            project_dir=str(workdir),
             session_id=sid,
         )
 
@@ -1277,11 +1359,8 @@ def run_implement_loop(
         status_str = parsed.get("status", "error")
         summary = parsed.get("summary", "")
 
-        try:
-            new_status = StoryStatus(status_str)
-        except ValueError:
-            new_status = StoryStatus.implemented if status_str == "completed" else StoryStatus.error
-
+        new_status = _reported_status(status_str, default=StoryStatus.error)
+        _note_pause(state, story, new_status, parsed)
         state.mark_story_status(
             story.id, new_status, summary=summary, extra=parsed,
             error_reason=parsed.get("reason", "") if new_status == StoryStatus.error else "",
@@ -1306,6 +1385,7 @@ def run_implement_loop(
                 verbose=verbose,
                 dangerously_skip_permissions=dangerously_skip_permissions,
                 max_budget_usd=max_budget_usd,
+                cwd=workdir,
             )
             if review_result is not None:
                 total_cost += review_result.cost_usd
@@ -1318,6 +1398,23 @@ def run_implement_loop(
                     state.mark_story_status(story.id, StoryStatus.rework, summary="Review rejected")
                     story_queue.clear()  # Force refresh to pick up rework story
 
+        if new_status == StoryStatus.needs_human:
+            story_queue.clear()  # stories that depend on it wait
+
+        # Ship step: hand the reviewed branch to the project's own way of opening a pull request
+        if new_status == StoryStatus.implemented:
+            ship_result = _run_ship(
+                state, flow, story, workdir,
+                model=model, system_prompt=system_prompt, verbose=verbose,
+                dangerously_skip_permissions=dangerously_skip_permissions, max_budget_usd=max_budget_usd,
+            )
+            if ship_result is not None:
+                total_cost += ship_result.cost_usd
+                total_input += ship_result.input_tokens
+                total_output += ship_result.output_tokens
+                total_cache_read += ship_result.cache_read_input_tokens
+                total_cache_create += ship_result.cache_creation_input_tokens
+
         # Compound learning: capture solutions after successful implementation
         if new_status == StoryStatus.implemented and compound:
             compound_result = _run_compound_capture(
@@ -1328,6 +1425,7 @@ def run_implement_loop(
                 dangerously_skip_permissions=dangerously_skip_permissions,
                 max_budget_usd=max_budget_usd,
                 save_global=save_global,
+                cwd=workdir,
             )
             total_cost += compound_result.cost_usd
             total_input += compound_result.input_tokens
@@ -1366,11 +1464,12 @@ def run_implement_loop(
                 success=False, error=f"Story '{ps.active_story_id}' not found for resume",
             )
 
+        workdir = ship_lib.story_workdir(state, story.id)
         result = run_with_retry(
             "Continue implementing the story.",
             resume_session_id=session_id,
             timeout=1800,
-            project_dir=str(state.project_dir),
+            project_dir=str(workdir),
             dangerously_skip_permissions=dangerously_skip_permissions,
             verbose=verbose,
         )
@@ -1390,11 +1489,8 @@ def run_implement_loop(
         parsed = parse_implement_output(result.result)
         status_str = parsed.get("status", "error")
         summary = parsed.get("summary", "")
-        try:
-            new_status = StoryStatus(status_str)
-        except ValueError:
-            new_status = StoryStatus.implemented if status_str == "completed" else StoryStatus.error
-
+        new_status = _reported_status(status_str, default=StoryStatus.error)
+        _note_pause(state, story, new_status, parsed)
         state.mark_story_status(
             story.id, new_status, summary=summary, extra=parsed,
             error_reason=parsed.get("reason", "") if new_status == StoryStatus.error else "",
@@ -1418,6 +1514,7 @@ def run_implement_loop(
                 verbose=verbose,
                 dangerously_skip_permissions=dangerously_skip_permissions,
                 max_budget_usd=max_budget_usd,
+                cwd=workdir,
             )
             if review_result is not None:
                 total_cost += review_result.cost_usd
@@ -1428,6 +1525,19 @@ def run_implement_loop(
                 if not review_result.approved:
                     new_status = StoryStatus.rework
                     state.mark_story_status(story.id, StoryStatus.rework, summary="Review rejected")
+
+        if new_status == StoryStatus.implemented:
+            ship_result = _run_ship(
+                state, flow, story, workdir,
+                model=model, system_prompt=system_prompt, verbose=verbose,
+                dangerously_skip_permissions=dangerously_skip_permissions, max_budget_usd=max_budget_usd,
+            )
+            if ship_result is not None:
+                total_cost += ship_result.cost_usd
+                total_input += ship_result.input_tokens
+                total_output += ship_result.output_tokens
+                total_cache_read += ship_result.cache_read_input_tokens
+                total_cache_create += ship_result.cache_creation_input_tokens
 
         return IterationResult(
             iteration=ps.current_iteration, phase="implement", mode="resume",
@@ -1443,6 +1553,10 @@ def run_implement_loop(
     def completion_fn(result: IterationResult, ps: PhaseState) -> bool:
         if result.impl_status == "all_done":
             ps.completion_reason = "all_stories_done"
+            return True
+        if result.impl_status in ("waiting", "blocked", "workspace_error"):
+            # Not done: the next run picks up where the merges (or the person) left it.
+            ps.completion_reason = result.impl_status
             return True
         if ps.consecutive_errors >= 5:
             ps.completion_reason = "consecutive_errors"
@@ -1479,6 +1593,160 @@ def _sync_tracker(tracker, *, push_missing: bool = False) -> None:
         click.echo(click.style("  [linear] ", fg='blue') + f"{report.updated} stories updated from their tickets")
 
 
+def _reported_status(status_str: str, *, default: StoryStatus) -> StoryStatus:
+    """The status an implementation reported. Shipping and merging are not its to claim."""
+    try:
+        status = StoryStatus(status_str)
+    except ValueError:
+        return StoryStatus.implemented if status_str == "completed" else default
+    if status in (StoryStatus.shipped, StoryStatus.merged):
+        return StoryStatus.implemented
+    return status
+
+
+def _note_pause(state: StateManager, story: Story, status: StoryStatus, parsed: dict) -> None:
+    """Remember why a story waits for a person — and forget it once the story is through."""
+    if status == StoryStatus.needs_human:
+        reason = str(parsed.get("reason") or parsed.get("summary") or "").strip()
+        pause = {"reason": reason, "at": datetime.now().isoformat()}
+
+        def mutate(s: Story) -> None:
+            s.metadata["needs_human"] = pause
+            s.metadata.pop("human_note", None)
+
+        state.update_story(story.id, mutate, notify=False)
+        click.echo(click.style(f"  ⏸ {story.id} needs a person: ", fg='yellow', bold=True) + reason[:300])
+        click.echo(f"    When that is done: pralph unblock {story.id}")
+    elif status == StoryStatus.implemented and (story.metadata.get("needs_human") or story.metadata.get("human_note")):
+        def clear(s: Story) -> None:
+            s.metadata.pop("needs_human", None)
+            s.metadata.pop("human_note", None)
+
+        state.update_story(story.id, clear, notify=False)
+
+
+def _report_flow_changes(changes: list[tuple[str, str, str, str]]) -> bool:
+    for story_id, old, new, note in changes:
+        color = 'green' if new == StoryStatus.merged.value else 'yellow'
+        click.echo(click.style("  [git] ", fg='blue') + f"{story_id}: {old} → {click.style(new, fg=color)} ({note})")
+    return bool(changes)
+
+
+def _report_waiting(waiting: list[Story], blocked: dict[str, list[str]]) -> None:
+    click.echo(click.style(f"  Waiting for {len(waiting)} {'story' if len(waiting) == 1 else 'stories'}:", bold=True))
+    for story in waiting:
+        click.echo(f"    {click.style(story.id, fg='blue')}: {ship_lib.waiting_reason(story)[:200]}")
+    if blocked:
+        held = ", ".join(f"{sid} (after {', '.join(deps)})" for sid, deps in sorted(blocked.items()))
+        click.echo(f"    held back until then: {held}")
+
+
+def _report_blocked(state: StateManager, blocked: dict[str, list[str]]) -> None:
+    """Stories that cannot start, and nothing is on its way that would free them."""
+    by_id = {s.id: s for s in state.load_stories()}
+    click.echo(click.style("  Nothing left that can be worked on:", fg='yellow', bold=True))
+    for story_id, deps in sorted(blocked.items()):
+        why = ", ".join(f"{d} ({by_id[d].status.value})" if d in by_id else d for d in deps)
+        click.echo(f"    {click.style(story_id, fg='blue')} waits for {why}")
+
+
+def _run_ship(
+    state: StateManager,
+    flow: ship_lib.Flow,
+    story: Story,
+    workdir: Path,
+    *,
+    model: str,
+    system_prompt: str,
+    verbose: bool,
+    dangerously_skip_permissions: bool,
+    max_budget_usd: float | None,
+) -> ClaudeResult | None:
+    """Run the project's ship step (.pralph/ship.md) for a story that is through its review.
+
+    The step pushes the branch and opens the pull request; pralph only takes
+    note of the URL and marks the story ``shipped``. Without a ship step
+    nothing is pushed and the story stays ``implemented``. Returns the run
+    (for its cost), or None if there was nothing to run.
+    """
+    if not flow.ships or not ship_lib.on_branch(story):
+        return None
+    branch = ship_lib.git_info(story)["branch"]
+    click.echo(click.style(f"  🚢 Shipping: {story.id}", fg='magenta', bold=True) + f" — {branch}")
+
+    result = run_with_retry(
+        flow.ship_prompt(story, workdir),
+        model=model,
+        allowed_tools=flow.settings.ship_tools,
+        system_prompt=system_prompt,
+        dangerously_skip_permissions=dangerously_skip_permissions,
+        max_budget_usd=max_budget_usd,
+        timeout=flow.settings.ship_timeout,
+        verbose=verbose,
+        project_dir=str(workdir),
+    )
+    error = ""
+    pr_url = ""
+    if not result.success:
+        error = result.error or "the ship step failed"
+    else:
+        pr_url = ship_lib.find_pr_url(result.result) or flow.pr_for_branch(workdir, branch)
+        if not pr_url:
+            error = "the ship step did not report a pull request"
+    if error:
+        flow.record_ship_failure(story, error)
+        click.echo(click.style(f"  ⚠ Not shipped: {error[:200]}", fg='yellow'))
+        click.echo(f"    {story.id} stays implemented on {branch} — try again with: pralph ship -s {story.id}")
+        return result
+
+    flow.record_shipped(story, pr_url)
+    click.echo(click.style("  ✓ Shipped", fg='green', bold=True) + f" — {pr_url}")
+    return result
+
+
+def run_ship(
+    state: StateManager,
+    *,
+    story_id: str,
+    model: str = "sonnet",
+    verbose: bool = False,
+    dangerously_skip_permissions: bool = False,
+    max_budget_usd: float | None = None,
+) -> PhaseState:
+    """Run the ship step for one story that is implemented on its branch."""
+    flow = ship_lib.Flow(state)
+    story = next((s for s in state.load_stories() if s.id == story_id), None)
+    if not story:
+        click.echo(f"Error: Story '{story_id}' not found")
+        return PhaseState(phase="ship", completed=True, completion_reason="story_not_found")
+    if not flow.ships:
+        click.echo("Error: there is no ship step — write the prompt for it to .pralph/ship.md")
+        return PhaseState(phase="ship", completed=True, completion_reason="no_ship_step")
+    if story.status not in (StoryStatus.implemented, StoryStatus.shipped) or not ship_lib.on_branch(story):
+        click.echo(f"Error: {story.id} is {story.status.value} — only a story implemented on its own branch can be shipped")
+        return PhaseState(phase="ship", completed=True, completion_reason="not_implemented")
+
+    result = None
+    try:
+        workdir = flow.prepare(story)
+        result = _run_ship(
+            state, flow, story, workdir,
+            model=model, system_prompt=build_guardrails_system_prompt("implement", state), verbose=verbose,
+            dangerously_skip_permissions=dangerously_skip_permissions, max_budget_usd=max_budget_usd,
+        )
+    except ship_lib.GitError as e:
+        click.echo(f"Error: {e}")
+        return PhaseState(phase="ship", completed=True, completion_reason="workspace_error")
+    finally:
+        flow.restore()
+
+    shipped = next(s for s in state.load_stories() if s.id == story_id).status == StoryStatus.shipped
+    return PhaseState(
+        phase="ship", completed=True, total_cost_usd=result.cost_usd if result else 0.0,
+        completion_reason="shipped" if shipped else "ship_failed",
+    )
+
+
 @dataclass
 class _ReviewResult:
     approved: bool
@@ -1501,6 +1769,7 @@ def _run_review(
     dangerously_skip_permissions: bool,
     max_budget_usd: float | None,
     approve_on_error: bool = True,
+    cwd: Path | None = None,
 ) -> _ReviewResult | None:
     """Run a review on a freshly implemented story. Returns None on review error.
 
@@ -1520,7 +1789,7 @@ def _run_review(
         max_budget_usd=max_budget_usd,
         timeout=600,
         verbose=verbose,
-        project_dir=str(state.project_dir),
+        project_dir=str(cwd or state.project_dir),
     )
 
     if not result.success:
@@ -1590,15 +1859,26 @@ def run_review(
         click.echo(f"Error: {story.id} is {story.status.value} — there is no implementation to review yet")
         return PhaseState(phase="review", completed=True, completion_reason="not_implemented")
 
-    result = _run_review(
-        state, story,
-        model=model,
-        system_prompt=build_guardrails_system_prompt("implement", state),
-        verbose=verbose,
-        dangerously_skip_permissions=dangerously_skip_permissions,
-        max_budget_usd=max_budget_usd,
-        approve_on_error=False,
-    )
+    # A story on its own branch is reviewed there, not on whatever is checked out.
+    flow = ship_lib.Flow(state)
+    try:
+        on_own_branch = flow.enabled and ship_lib.on_branch(story)
+        cwd = flow.prepare(story) if on_own_branch else ship_lib.story_workdir(state, story.id)
+        result = _run_review(
+            state, story,
+            model=model,
+            system_prompt=build_guardrails_system_prompt("implement", state),
+            verbose=verbose,
+            dangerously_skip_permissions=dangerously_skip_permissions,
+            max_budget_usd=max_budget_usd,
+            approve_on_error=False,
+            cwd=cwd,
+        )
+    except ship_lib.GitError as e:
+        click.echo(f"Error: {e}")
+        return PhaseState(phase="review", completed=True, completion_reason="workspace_error")
+    finally:
+        flow.restore()
     if result is None:
         return PhaseState(phase="review", completed=True, completion_reason="review_error")
 
@@ -1630,6 +1910,7 @@ def _implement_single(
     max_budget_usd: float | None,
     max_rounds: int = 50,
     tracker=None,
+    flow: ship_lib.Flow | None = None,
 ) -> PhaseState:
     """Implement a single story by ID.
 
@@ -1649,6 +1930,7 @@ def _implement_single(
             "recovered_at": datetime.now().isoformat(),
         }
 
+    flow = flow or ship_lib.Flow(state)
     max_rounds = max(1, max_rounds)
     for round_no in range(1, max_rounds + 1):
         if round_no > 1:
@@ -1665,6 +1947,14 @@ def _implement_single(
         else:
             click.echo(f"  Implementing: {story.id} — {story.title}")
 
+        try:
+            workdir = flow.prepare(story)
+        except ship_lib.GitError as e:
+            click.echo(click.style(f"  Cannot set up the branch for {story.id}: {e}", fg='red'))
+            return PhaseState(phase="implement", completed=True, completion_reason="workspace_error")
+        if flow.enabled:
+            click.echo(click.style(f"  on {ship_lib.git_info(story).get('branch')} in {workdir}", dim=True))
+
         # `story` keeps the status it was loaded with, so a story in rework
         # gets the review feedback in its prompt.
         state.mark_story_status(story.id, StoryStatus.in_progress)
@@ -1678,7 +1968,7 @@ def _implement_single(
             max_budget_usd=max_budget_usd,
             timeout=1800,
             verbose=verbose,
-            project_dir=str(state.project_dir),
+            project_dir=str(workdir),
         )
 
         if not result.success:
@@ -1696,11 +1986,8 @@ def _implement_single(
         parsed = parse_implement_output(result.result)
         status_str = parsed.get("status", "error")
         summary = parsed.get("summary", "")
-        try:
-            new_status = StoryStatus(status_str)
-        except ValueError:
-            new_status = StoryStatus.implemented
-
+        new_status = _reported_status(status_str, default=StoryStatus.implemented)
+        _note_pause(state, story, new_status, parsed)
         state.mark_story_status(
             story.id, new_status, summary=summary, extra=parsed,
             review_pending=review and new_status == StoryStatus.implemented,
@@ -1717,6 +2004,7 @@ def _implement_single(
             verbose=verbose,
             dangerously_skip_permissions=dangerously_skip_permissions,
             max_budget_usd=max_budget_usd,
+            cwd=workdir,
         )
         if review_result is None or review_result.approved:
             break
@@ -1729,6 +2017,13 @@ def _implement_single(
             ))
             return PhaseState(phase="implement", completed=True, completion_reason="review_rejected")
 
+    if new_status == StoryStatus.implemented:
+        _run_ship(
+            state, flow, story, workdir,
+            model=model, system_prompt=system_prompt, verbose=verbose,
+            dangerously_skip_permissions=dangerously_skip_permissions, max_budget_usd=max_budget_usd,
+        )
+
     # Compound learning: capture solutions after successful implementation
     if new_status == StoryStatus.implemented and compound:
         _run_compound_capture(
@@ -1739,6 +2034,7 @@ def _implement_single(
             dangerously_skip_permissions=dangerously_skip_permissions,
             max_budget_usd=max_budget_usd,
             save_global=save_global,
+            cwd=workdir,
         )
 
     _suggest_compact(state)
@@ -1774,6 +2070,7 @@ def _run_compound_capture(
     dangerously_skip_permissions: bool,
     max_budget_usd: float | None,
     save_global: bool = False,
+    cwd: Path | None = None,
 ) -> _CompoundResult:
     """Run compound learning capture after a successful implementation. Returns result with cost and tokens."""
     click.echo(click.style(f"  Capturing learnings: {story.id}", fg='magenta', bold=True))
@@ -1788,7 +2085,7 @@ def _run_compound_capture(
         max_budget_usd=max_budget_usd,
         timeout=300,
         verbose=verbose,
-        project_dir=str(state.project_dir),
+        project_dir=str(cwd or state.project_dir),
     )
 
     if not result.success:

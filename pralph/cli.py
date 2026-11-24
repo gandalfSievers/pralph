@@ -8,9 +8,10 @@ import click
 from pralph import __version__
 from pralph import linear_oauth
 from pralph import linear_sync
+from pralph import ship as ship_lib
 from pralph import spec as spec_lib
 from pralph.linear import LinearClient, LinearError
-from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_review, run_spec_loop, run_stories_loop, run_webgen_loop
+from pralph.loop import run_add, run_compound, run_ideate_loop, run_implement_loop, run_justloop, run_plan_loop, run_refine, run_review, run_ship, run_spec_loop, run_stories_loop, run_webgen_loop
 from pralph.viewer import run_viewer
 from pralph.models import PhaseState, Story, StoryStatus
 from pralph.state import StateManager
@@ -80,7 +81,7 @@ class OrderedGroup(click.Group):
     """Click group that shows commands in defined order with section headers."""
 
     SECTIONS = [
-        ("Workflow", ["plan", "spec", "stories", "webgen", "implement", "review"]),
+        ("Workflow", ["plan", "spec", "stories", "webgen", "implement", "review", "ship", "unblock"]),
         ("Replan", ["add", "ideate", "refine"]),
         ("Integration", ["linear"]),
         ("Tools", ["justloop", "compound", "compact-index", "spec-status", "reset-errors", "viewer"]),
@@ -458,9 +459,10 @@ def refine(ctx, instruction, prompt, story_ids, id_pattern):
 @click.option("--compound/--no-compound", default=False, help="Capture learnings after each story (compound learning)")
 @click.option("--prompt", default=None, help="Guidance for implementation (e.g. 'use FastAPI', 'use MCP for DB access')")
 @click.option("--linear/--no-linear", "use_linear", default=None, help="Work off the linked Linear project [default: on when linked]")
+@click.option("--wait/--no-wait", default=True, help="With a branch per story: wait for open pull requests to be merged when nothing else can be worked on")
 @click.option("--reset", is_flag=True, help="Reset phase state and start fresh")
 @click.pass_context
-def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, reset):
+def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, wait, reset):
     """Phase 3: Implement stories from backlog."""
     linear_mode = {None: "auto", True: "required", False: "off"}[use_linear]
     if linear_mode == "auto" and linear_sync.LinearLink.load(
@@ -491,6 +493,9 @@ def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, reset
             click.echo(f"  linear mode: {_READ_MOSTLY}")
     if state.spec_mode:
         click.echo(f"  spec-driven: {', '.join(sp.name for sp in spec_lib.list_specs(state)) or 'no specs yet'}")
+    branches = ship_lib.Flow(state).describe()
+    if branches:
+        click.echo(f"  git: {branches}")
     if story_id:
         story_id = _resolve_story_ref(state, story_id)
         click.echo(f"  story: {story_id}")
@@ -511,7 +516,67 @@ def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, reset
         dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
         max_budget_usd=ctx.obj["max_budget_usd"],
         tracker=tracker,
+        wait=wait,
     )
+
+
+@main.command()
+@click.option("--story-id", "-s", required=True, help="Story to ship (story ID or Linear identifier)")
+@click.pass_context
+def ship(ctx, story_id):
+    """Run the ship step (.pralph/ship.md) for a story implemented on its own branch.
+
+    'implement' does this by itself after an approved review. Use it when the
+    ship step failed, or was added after the story was implemented. Exits
+    with 1 when no pull request came out of it.
+    """
+    state = _state(ctx, linear="auto")
+    story_id = _resolve_story_ref(state, story_id)
+    click.echo("pralph ship")
+    click.echo(f"  project: {ctx.obj['project_dir']}")
+    click.echo(f"  story: {story_id}")
+    ps = run_ship(
+        state,
+        story_id=story_id,
+        model=ctx.obj["model"],
+        verbose=ctx.obj["verbose"],
+        dangerously_skip_permissions=ctx.obj["dangerously_skip_permissions"],
+        max_budget_usd=ctx.obj["max_budget_usd"],
+    )
+    if ps.completion_reason != "shipped":
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("story_id")
+@click.option("--message", "-m", default="", help="What was done, for the implementation to go on from")
+@click.pass_context
+def unblock(ctx, story_id, message):
+    """Continue a story that was paused because it needs a person.
+
+    The story goes back into the queue; the next 'implement' picks it up on
+    the same branch, with what the implementation asked for and your message.
+    """
+    state = _state(ctx, linear="auto")
+    story_id = _resolve_story_ref(state, story_id)
+    story = next((s for s in state.load_stories() if s.id == story_id), None)
+    if story is None or story.status != StoryStatus.needs_human:
+        paused = [s for s in state.load_stories() if s.status == StoryStatus.needs_human]
+        now = f"is {story.status.value}" if story is not None else "is not a story"
+        lines = [f"{story_id} {now} — nothing to unblock."]
+        if paused:
+            lines.append("Waiting for a person:")
+            lines += [f"  {s.id}: {(s.metadata.get('needs_human') or {}).get('reason') or s.title}" for s in paused]
+        raise click.ClickException("\n".join(lines))
+
+    message = message.strip()
+
+    def note(s: Story) -> None:
+        s.metadata["human_note"] = message
+
+    state.update_story(story_id, note, notify=False)
+    state.mark_story_status(story_id, StoryStatus.pending, summary=(f"Unblocked: {message}" if message else "Unblocked")[:200])
+    click.echo(f"  {story_id} is back in the queue — 'pralph implement' continues it.")
 
 
 @main.command()
