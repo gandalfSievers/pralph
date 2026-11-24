@@ -393,6 +393,53 @@ class TestDescription:
         assert parse_description("") == ("", [])
         assert parse_description(None) == ("", [])  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("heading", [
+        "## Done when", "### Done when:", "**Done when**", "**Done when:**", "Done when:",
+        "## Definition of Done", "## DONE  WHEN",
+    ])
+    def test_done_when_is_an_acceptance_criteria_heading(self, heading) -> None:
+        text = f"Ship the export.\n\n{heading}\n\n- CSV downloads\n- [ ] Empty state is handled\n\n## Notes\n\nAsk Sam."
+        content, criteria = parse_description(text)
+        assert criteria == ["CSV downloads", "Empty state is handled"]
+        assert content == "Ship the export.\n\n## Notes\n\nAsk Sam."
+
+    def test_done_when_in_a_sentence_is_not_a_heading(self) -> None:
+        text = "This is done when the export works.\n\n- not a criterion"
+        assert parse_description(text) == (text, [])
+
+    def test_criteria_section_ends_at_a_bold_heading(self) -> None:
+        text = "**Done when**\n- Export works\n\n**Out of scope**\n- PDF export"
+        assert parse_description(text) == ("**Out of scope**\n- PDF export", ["Export works"])
+
+    def test_text_in_the_criteria_section_is_kept(self) -> None:
+        text = (
+            "Ship the export.\n\n## Done when\n\nAll of these hold on staging:\n\n"
+            "- CSV downloads\n  with a header row\n- Empty state is handled\n\nAsk Sam about quotas."
+        )
+        content, criteria = parse_description(text)
+        assert criteria == ["CSV downloads with a header row", "Empty state is handled"]
+        assert content == "Ship the export.\n\nAll of these hold on staging:\nAsk Sam about quotas."
+
+    def test_configured_heading(self) -> None:
+        headings = linear_sync.ac_headings("## Fertig wenn:")
+        assert headings == ("Fertig wenn", "Acceptance criteria", "Done when", "Definition of done")
+        assert parse_description("Export.\n\n### Fertig wenn\n- CSV lädt", headings) == ("Export.", ["CSV lädt"])
+        assert parse_description("Export.\n\n## Done when\n- CSV", headings)[1] == ["CSV"], "built-ins stay"
+        assert parse_description("Export.\n\n### Fertig wenn\n- CSV lädt")[1] == []
+        assert linear_sync.ac_headings(["Done when", "Checks"])[:2] == ("Done when", "Checks")
+        assert "## Fertig wenn\n\n- [ ] Migration exists" in render_description(backlog()[0], heading=headings[0])
+
+    def test_configured_heading_is_used_by_push_and_pull(self, state, fake) -> None:
+        (state.state_dir / "config.json").write_text(json.dumps({"linear_ac_heading": "Done when"}))
+        state.append_stories(backlog())
+        sync = make_sync(state, fake)
+        sync.push()
+        assert "## Done when\n\n- [ ] Migration exists" in fake.find("DB-001")["description"]
+        fake.find("API-002")["description"] = "Details.\n\n**Checks**\n- one\n\n**Done when**\n- Returns 404 for unknown ids"
+        sync.pull()
+        assert stories_by_id(state)["API-002"].acceptance_criteria == ["Returns 404 for unknown ids"]
+        assert stories_by_id(state)["DB-001"].acceptance_criteria == ["Migration exists", "Indexes on sku"]
+
 
 # ── push ──────────────────────────────────────────────────────────────
 

@@ -42,15 +42,18 @@ EPIC_NAMES = {
 }
 _GENERAL = "GENERAL"
 
-AC_HEADING = "## Acceptance criteria"
+# Headings that introduce the acceptance criteria in an issue description.
+# The first one is what pralph writes; all of them are read. More can be
+# configured with ``linear_ac_heading`` (see ``ac_headings``).
+DEFAULT_AC_HEADINGS = ("Acceptance criteria", "Done when", "Definition of done")
 _FOOTER_MARK = "pralph story"
 _PROJECT_CONTENT_LIMIT = 60_000
 
 _TITLE_ID_RE = re.compile(r"^([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-\d+\w*):\s+(.+)$")
 _EPIC_TITLE_RE = re.compile(r"^([A-Z][A-Z0-9_]*)\s+[—–-]\s+\S")
 _HR_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
-_AC_HEADING_RE = re.compile(r"^\s*(?:#{1,6}\s*|\*\*)acceptance criteria:?(?:\*\*)?:?\s*$", re.IGNORECASE)
-_ANY_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
+# A markdown heading, or a line that is nothing but bold text ("**Notes**").
+_ANY_HEADING_RE = re.compile(r"^(?:#{1,6}\s+\S|\s*\*\*[^*]+\*\*:?\s*$)")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(.*\S)\s*$")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 # The slug ID closes the project segment of a project URL, whatever follows:
@@ -186,12 +189,41 @@ def priority_from_linear(linear_priority: int, current: int) -> int:
     return min(4, linear_priority)
 
 
-def render_description(story: Story, trace: tuple[str | None, list[str]] | None = None) -> str:
+def ac_headings(configured: object = None) -> tuple[str, ...]:
+    """Acceptance-criteria headings: the configured ones, then the built-in ones.
+
+    ``configured`` is the ``linear_ac_heading`` config value — one heading or
+    a list. Markdown around it ("## Done when:") is ignored.
+    """
+    if isinstance(configured, str):
+        configured = [configured]
+    names: list[str] = []
+    for raw in list(configured or []) + list(DEFAULT_AC_HEADINGS):
+        name = " ".join(str(raw).strip().strip("#*").strip().rstrip(":").split())
+        if name and name.lower() not in {n.lower() for n in names}:
+            names.append(name)
+    return tuple(names)
+
+
+def _ac_heading_re(headings: tuple[str, ...]) -> re.Pattern[str]:
+    """Matches a criteria heading as people write it: ``## Done when``, ``**Done when:**``, ``Done when:``."""
+    names = "|".join(r"\s+".join(re.escape(word) for word in h.split()) for h in headings)
+    return re.compile(
+        rf"^\s*(?:#{{1,6}}\s*(?:{names})\s*:?\s*#*|\*\*(?:{names})\s*:?\s*\*\*\s*:?|(?:{names})\s*:)\s*$",
+        re.IGNORECASE,
+    )
+
+
+def render_description(
+    story: Story,
+    trace: tuple[str | None, list[str]] | None = None,
+    heading: str = DEFAULT_AC_HEADINGS[0],
+) -> str:
     parts: list[str] = []
     if story.content.strip():
         parts.append(story.content.strip())
     if story.acceptance_criteria:
-        parts.append(AC_HEADING + "\n\n" + "\n".join(f"- [ ] {c}" for c in story.acceptance_criteria))
+        parts.append(f"## {heading}\n\n" + "\n".join(f"- [ ] {c}" for c in story.acceptance_criteria))
     footer = [f"{_FOOTER_MARK} `{story.id}`"]
     if story.complexity:
         footer.append(f"complexity: {story.complexity}")
@@ -201,12 +233,16 @@ def render_description(story: Story, trace: tuple[str | None, list[str]] | None 
     return "\n\n".join(parts)
 
 
-def parse_description(text: str) -> tuple[str, list[str]]:
+def parse_description(
+    text: str, headings: tuple[str, ...] = DEFAULT_AC_HEADINGS,
+) -> tuple[str, list[str]]:
     """Split an issue description into (story content, acceptance criteria).
 
     Inverse of ``render_description`` but tolerant of what people (and
-    Linear's editor) do to the markdown: any heading level or a bold line for
-    the criteria heading, ``*``/``-`` bullets, ticked boxes, extra sections.
+    Linear's editor) do to the markdown: any heading level, a bold line or a
+    plain "Done when:" line for the criteria heading (any of ``headings``),
+    ``*``/``-`` bullets, ticked boxes, extra sections. Text in the criteria
+    section that is not a list item stays part of the content.
     """
     lines = (text or "").replace("\r\n", "\n").split("\n")
 
@@ -217,7 +253,8 @@ def parse_description(text: str) -> tuple[str, list[str]]:
                 lines = lines[:i]
             break
 
-    heading_at = next((i for i, line in enumerate(lines) if _AC_HEADING_RE.match(line)), None)
+    heading_re = _ac_heading_re(headings)
+    heading_at = next((i for i, line in enumerate(lines) if heading_re.match(line)), None)
     if heading_at is None:
         return "\n".join(lines).strip(), []
 
@@ -225,12 +262,22 @@ def parse_description(text: str) -> tuple[str, list[str]]:
         (j for j in range(heading_at + 1, len(lines)) if _ANY_HEADING_RE.match(lines[j])),
         len(lines),
     )
-    criteria = []
+    criteria: list[str] = []
+    prose: list[str] = []
+    in_item = False
     for line in lines[heading_at + 1:section_end]:
         m = _BULLET_RE.match(line)
         if m:
             criteria.append(m.group(1).strip())
-    content = "\n".join(lines[:heading_at] + lines[section_end:]).strip()
+            in_item = True
+        elif not line.strip():
+            in_item = False
+        elif in_item and line[:1] in (" ", "\t"):
+            criteria[-1] += " " + line.strip()  # wrapped list item
+        else:
+            prose.append(line)
+            in_item = False
+    content = "\n".join(lines[:heading_at] + prose + ([""] if prose else []) + lines[section_end:]).strip()
     return content, criteria
 
 
@@ -271,6 +318,7 @@ class LinearSync:
         self.link = link or LinearLink()
         self._echo = echo
         self._states: list[dict] | None = None
+        self._ac_headings = ac_headings(state.get_config("linear_ac_heading", None))
         # Implemented stories whose review verdict is still out: story id → status info.
         self._awaiting_review: dict[str, dict] = {}
 
@@ -473,7 +521,9 @@ class LinearSync:
         issue = self.client.create_issue(
             team_id=self.link.team_id,
             title=issue_title(story),
-            description=render_description(story, spec_lib.story_trace(story, specs) if specs else None),
+            description=render_description(
+                story, spec_lib.story_trace(story, specs) if specs else None, self._ac_headings[0],
+            ),
             project_id=self.link.project_id,
             parent_id=epic["id"],
             priority=priority_to_linear(story.priority),
@@ -794,7 +844,7 @@ class LinearSync:
         """Copy an issue onto its story. Returns the reason if the status changed."""
         title_id, bare_title = split_title(issue["title"])
         story.title = bare_title if title_id == story.id else issue["title"].strip()
-        story.content, story.acceptance_criteria = parse_description(issue["description"])
+        story.content, story.acceptance_criteria = parse_description(issue["description"], self._ac_headings)
         story.priority = priority_from_linear(int(issue["priority"] or 0), story.priority)
 
         if is_new or not story.category:

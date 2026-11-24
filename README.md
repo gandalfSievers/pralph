@@ -321,6 +321,8 @@ And pralph reports back on the ticket:
 | Fails | Stays In Progress, comment with the error. Move it to Todo (or run `pralph reset-errors`) to retry |
 | Skips it / finds a duplicate | Issue → Canceled, comment with the reason (and what it duplicates) |
 
+Acceptance criteria are read from the list under an `Acceptance criteria`, `Done when` or `Definition of done` heading in the issue description — a markdown heading, a bold line or a plain `Done when:` line. If your tickets use another heading, name it in the [configuration](#configuration): `"linear_ac_heading": "Fertig wenn"` (or a list of headings). The first configured heading is also the one pralph writes into the tickets it creates.
+
 The implementation is told to mention the issue identifier (`ENG-123`) in its commit message, so Linear's GitHub/GitLab integration links the commits to the ticket.
 
 If Linear cannot be reached during a run, pralph continues with the backlog as last synced and catches up on the missed updates at the next sync.
@@ -652,6 +654,7 @@ pralph uses JSON config files for persistent settings. Config is resolved in ord
 | `spec_dir` | `string` | `"specs"` | Directory (inside the project) that holds the specs |
 | `spec_driven` | `bool` | auto | Force spec-driven mode on or off. By default it is on when `<spec_dir>/<name>/spec.md` exists |
 | `linear_team` | `string` | — | Default Linear team key for `pralph linear push` |
+| `linear_ac_heading` | `string` or list | — | Heading(s) that introduce the acceptance criteria in a Linear issue, in addition to `Acceptance criteria`, `Done when` and `Definition of done` |
 | `linear_api_key` | `string` | — | Linear API key, if not set via `LINEAR_API_KEY`. Keep it in `~/.pralph/config.json`, not in the project |
 
 Set user-wide defaults in `~/.pralph/config.json`. Override per-project in `.pralph/config.json` (e.g. disable global saving for a throwaway project).
