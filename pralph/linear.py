@@ -5,7 +5,9 @@ project with issues / sub-issues / blocking relations, moving issues through
 the workflow, commenting, and reading a project's issues back.
 
 Authentication: a personal API key (``lin_api_...``, sent as-is) or an OAuth
-access token (sent as ``Bearer``). See https://linear.app/developers/graphql
+access token (sent as ``Bearer``) — either given directly, or taken from an
+OAuth login (``pralph.linear_oauth``) that is refreshed as needed.
+See https://linear.app/developers/graphql
 """
 
 from __future__ import annotations
@@ -39,10 +41,18 @@ class LinearError(Exception):
     connection, 5xx) — repeating a mutation then risks doing it twice.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False, outcome_unknown: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        outcome_unknown: bool = False,
+        auth_failed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.outcome_unknown = outcome_unknown
+        self.auth_failed = auth_failed  # Linear did not accept the credentials; nothing was done
 
 
 def resolve_api_key(config_get: Callable[[str, Any], Any] | None = None) -> str:
@@ -179,8 +189,12 @@ class LinearClient:
         timeout: int = 30,
         max_retries: int = 3,
         sleep: Callable[[float], None] = time.sleep,
+        oauth: Any = None,
     ) -> None:
         self.api_key = api_key
+        # An OAuth login (linear_oauth.OAuthSession) instead of a key: asked
+        # for the access token before every request, so it can refresh it.
+        self.oauth = oauth
         self.url = url
         self.timeout = timeout
         self.max_retries = max_retries
@@ -193,7 +207,7 @@ class LinearClient:
         key = self.api_key
         if key.lower().startswith("bearer "):
             return key
-        if key.startswith("lin_oauth_"):
+        if self.oauth is not None or key.startswith("lin_oauth_"):
             return f"Bearer {key}"
         return key
 
@@ -238,9 +252,34 @@ class LinearClient:
         idempotent, so repeating one that did go through would leave a second
         issue or comment behind. Those surface to the caller, which catches up
         on its next sync.
+
+        With an OAuth login, a rejected access token is refreshed and the
+        request sent once more (a rejected request was not carried out).
         """
+        if self.oauth is None:
+            return self._graphql(query, variables)
+        self.api_key = self.oauth.access_token()
+        try:
+            return self._graphql(query, variables)
+        except LinearError as e:
+            if not e.auth_failed:
+                raise
+        self.api_key = self.oauth.access_token(force_refresh=True)
+        try:
+            return self._graphql(query, variables)
+        except LinearError as e:
+            if e.auth_failed:
+                raise LinearError(
+                    "Linear rejected the OAuth login — run 'pralph linear oauth' again", auth_failed=True,
+                ) from e
+            raise
+
+    def _graphql(self, query: str, variables: dict | None = None) -> dict:
         if not self.api_key:
-            raise LinearError("No Linear API key — set LINEAR_API_KEY (Linear → Settings → Security & access)")
+            raise LinearError(
+                "No Linear API key — set LINEAR_API_KEY (Linear → Settings → Security & access) "
+                "or run 'pralph linear oauth'"
+            )
         is_mutation = query.lstrip().startswith("mutation")
         last: LinearError | None = None
         for attempt in range(self.max_retries + 1):
@@ -449,7 +488,8 @@ def _error_from_graphql(errors: list) -> LinearError:
         if code == "AUTHENTICATION_ERROR":
             return LinearError(
                 "Linear rejected the API key — check LINEAR_API_KEY "
-                "(Linear → Settings → Security & access → Personal API keys)"
+                "(Linear → Settings → Security & access → Personal API keys)",
+                auth_failed=True,
             )
         messages.append(str(ext.get("userPresentableMessage") or err.get("message") or code or "unknown error"))
     return LinearError("Linear API error: " + "; ".join(messages or ["unknown error"]), retryable=retryable)

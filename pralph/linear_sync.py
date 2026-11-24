@@ -36,7 +36,8 @@ from typing import Callable
 import click
 
 from pralph import spec as spec_lib
-from pralph.linear import LinearClient, LinearError, resolve_api_key
+from pralph import linear_oauth
+from pralph.linear import LinearClient, LinearError
 from pralph.models import Story, StoryStatus
 from pralph.state import StateManager
 
@@ -1288,22 +1289,28 @@ def attach(
 
     With ``required`` a missing link or API key is an error; otherwise the
     project simply runs without Linear (with a warning if it is linked but
-    no key is available).
+    no key is available). An OAuth login (``pralph linear oauth``) stands in
+    for the key.
     """
     link = LinearLink.load(state.linear_link_path)
     if link is None:
         if required:
             raise LinearError("This project is not linked to Linear — run 'pralph linear push' first")
         return None
-    api_key = resolve_api_key(state.get_config)
-    if not api_key:
+    api_key, oauth = linear_oauth.credentials(state.get_config, state.home_dir)
+    if not api_key and oauth is None:
         if required:
-            raise LinearError("LINEAR_API_KEY is not set — it is needed to work off the linked Linear project")
+            raise LinearError(
+                "LINEAR_API_KEY is not set and there is no OAuth login ('pralph linear oauth') — "
+                "one of them is needed to work off the linked Linear project"
+            )
         echo(click.style(
-            "  [linear] project is linked to Linear but LINEAR_API_KEY is not set — changes will not be synced",
+            "  [linear] project is linked to Linear but LINEAR_API_KEY is not set "
+            "(and there is no 'pralph linear oauth' login) — changes will not be synced",
             fg="yellow",
         ))
         return None
-    sync = LinearSync(state, LinearClient(api_key), link, echo=echo)
+    client = LinearClient(api_key) if api_key else LinearClient("", oauth=oauth)
+    sync = LinearSync(state, client, link, echo=echo)
     state.add_story_listener(sync.on_story_event)
     return sync
