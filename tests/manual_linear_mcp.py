@@ -5,8 +5,8 @@ every tool must exist and take every argument pralph passes, and the fields
 pralph asks for must be on offer. A failure means Linear changed a tool and
 ``pralph/linear.py`` needs to follow. Read-only — it calls no tool.
 
-Not part of the test suite (it talks to mcp.linear.app and needs a login:
-``pralph linear oauth`` or LINEAR_API_KEY). Run it by hand:
+Not part of the test suite (it talks to mcp.linear.app and needs the login
+of ``pralph linear oauth``). Run it by hand:
 
     python tests/manual_linear_mcp.py
 """
@@ -29,11 +29,11 @@ FIELDS = {
 
 
 def main() -> int:
-    api_key, oauth = linear_oauth.credentials(lambda key, default=None: default, Path.home() / ".pralph")
-    if not api_key and oauth is None:
-        print("No Linear login — run 'pralph linear oauth' or set LINEAR_API_KEY")
+    oauth = linear_oauth.stored_login(Path.home() / ".pralph")
+    if oauth is None:
+        print("Not logged in to Linear — run 'pralph linear oauth'")
         return 2
-    client = linear.LinearClient(api_key, oauth=oauth)
+    client = linear.LinearClient(oauth=oauth)
     try:
         client.viewer()  # logs in, refreshing the token if needed
         tools = {tool["name"]: tool for tool in client._transport.list_tools()}

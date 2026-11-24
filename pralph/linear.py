@@ -9,15 +9,14 @@ Covers exactly what pralph needs: teams and workflow states, creating a
 project with issues / sub-issues / blocking relations, moving issues through
 the workflow, commenting, and reading a project's issues back.
 
-Authentication: an OAuth login that is refreshed as needed, or a personal API
-key — the MCP server takes either as a bearer token.
+Authentication: the OAuth login of ``pralph linear oauth``, refreshed as
+needed. API keys are not used.
 See https://linear.app/docs/mcp
 """
 
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.error
 import urllib.request
@@ -82,14 +81,6 @@ class LinearError(Exception):
         self.retryable = retryable
         self.outcome_unknown = outcome_unknown
         self.auth_failed = auth_failed  # Linear did not accept the credentials; nothing was done
-
-
-def resolve_api_key(config_get: Callable[[str, Any], Any] | None = None) -> str:
-    """API key from ``LINEAR_API_KEY``, falling back to the ``linear_api_key`` config value."""
-    key = os.environ.get("LINEAR_API_KEY", "").strip()
-    if not key and config_get is not None:
-        key = str(config_get("linear_api_key", "") or "").strip()
-    return key
 
 
 def is_write(tool: str) -> bool:
@@ -308,22 +299,23 @@ def _tool_result(tool: str, result: dict) -> Any:
 class LinearClient:
     def __init__(
         self,
-        api_key: str,
+        token: str = "",
         *,
+        oauth: Any = None,
         transport: Transport | None = None,
         url: str = MCP_URL,
         timeout: int = 60,
         max_retries: int = 3,
         sleep: Callable[[float], None] = time.sleep,
-        oauth: Any = None,
     ) -> None:
-        self.api_key = api_key
-        # An OAuth login (linear_oauth.OAuthSession) instead of a key: asked
-        # for the access token before every call, so it can refresh it.
+        # The login (linear_oauth.OAuthSession) is asked for the access token
+        # before every call, so it can refresh it. ``token`` is a fixed access
+        # token for use without a login to refresh it from.
+        self.token = token
         self.oauth = oauth
         self.max_retries = max_retries
         self._sleep = sleep
-        self._transport = transport or McpTransport(lambda: self.api_key, url=url, timeout=timeout)
+        self._transport = transport or McpTransport(lambda: self.token, url=url, timeout=timeout)
 
     # -- calling tools --
 
@@ -342,13 +334,13 @@ class LinearClient:
         arguments = {k: v for k, v in arguments.items() if v is not None}
         if self.oauth is None:
             return self._call(tool, arguments)
-        self.api_key = self.oauth.access_token()
+        self.token = self.oauth.access_token()
         try:
             return self._call(tool, arguments)
         except LinearError as e:
             if not e.auth_failed:
                 raise
-        self.api_key = self.oauth.access_token(force_refresh=True)
+        self.token = self.oauth.access_token(force_refresh=True)
         try:
             return self._call(tool, arguments)
         except LinearError as e:
@@ -359,23 +351,14 @@ class LinearClient:
             raise
 
     def _call(self, tool: str, arguments: dict) -> Any:
-        if not self.api_key:
-            raise LinearError(
-                "No Linear credentials — run 'pralph linear oauth', or set LINEAR_API_KEY "
-                "(Linear → Settings → Security & access)"
-            )
+        if not self.token:
+            raise LinearError("Not logged in to Linear — run 'pralph linear oauth'")
         last: LinearError | None = None
         for attempt in range(self.max_retries + 1):
             try:
                 return self._transport(tool, arguments)
             except LinearError as e:
                 last = e
-                if e.auth_failed and self.oauth is None:
-                    raise LinearError(
-                        "Linear rejected the API key — check LINEAR_API_KEY "
-                        "(Linear → Settings → Security & access → Personal API keys)",
-                        auth_failed=True,
-                    ) from e
                 if not e.retryable or attempt >= self.max_retries or (is_write(tool) and e.outcome_unknown):
                     raise
                 self._sleep(2.0 ** attempt)

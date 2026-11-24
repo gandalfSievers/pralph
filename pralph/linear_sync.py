@@ -417,7 +417,7 @@ class LinearSync:
         wanted = team_key or self.state.get_config("linear_team", None)
         teams = self.client.teams()
         if not teams:
-            raise LinearError("No Linear teams are visible to this API key")
+            raise LinearError("No Linear teams are visible to this login")
         if wanted:
             match = [t for t in teams if str(t.get("key", "")).upper() == str(wanted).upper()
                      or str(t.get("name", "")).lower() == str(wanted).lower()]
@@ -564,7 +564,7 @@ class LinearSync:
         if reference.lower() == "me":
             viewer = self.client.viewer()
             if not viewer.get("id"):
-                raise LinearError("Linear did not say who this API key belongs to")
+                raise LinearError("Linear did not say who this login belongs to")
             return {"id": viewer["id"], "name": viewer.get("name") or "me"}
         users = self.client.find_users(reference)
         if not users:
@@ -1363,30 +1363,29 @@ def attach(
 ) -> LinearSync | None:
     """Hook Linear sync into the backlog if this project is linked.
 
-    With ``required`` a missing link or API key is an error; otherwise the
+    With ``required`` a missing link or login is an error; otherwise the
     project simply runs without Linear (with a warning if it is linked but
-    no key is available). An OAuth login (``pralph linear oauth``) stands in
-    for the key.
+    nobody is logged in — see ``pralph linear oauth``).
     """
     link = LinearLink.load(state.linear_link_path)
     if link is None:
         if required:
             raise LinearError("This project is not linked to Linear — run 'pralph linear push' first")
         return None
-    api_key, oauth = linear_oauth.credentials(state.get_config, state.home_dir)
-    if not api_key and oauth is None:
+    oauth = linear_oauth.stored_login(state.home_dir)
+    if oauth is None:
         if required:
             raise LinearError(
-                "Not logged in to Linear — run 'pralph linear oauth' (or set LINEAR_API_KEY) "
+                "Not logged in to Linear — run 'pralph linear oauth' "
                 "to work off the linked Linear project"
             )
         echo(click.style(
             "  [linear] project is linked to Linear but there is no Linear login — "
-            "run 'pralph linear oauth' (or set LINEAR_API_KEY); changes will not be synced",
+            "run 'pralph linear oauth'; changes will not be synced",
             fg="yellow",
         ))
         return None
-    client = LinearClient(api_key) if api_key else LinearClient("", oauth=oauth)
+    client = LinearClient(oauth=oauth)
     sync = LinearSync(state, client, link, echo=echo)
     state.add_story_listener(sync.on_story_event)
     return sync

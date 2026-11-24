@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from pralph import __version__
-from pralph.linear import MCP_URL, LinearError, resolve_api_key
+from pralph.linear import MCP_URL, LinearError
 
 ISSUER = "https://mcp.linear.app"
 METADATA_URL = f"{ISSUER}/.well-known/oauth-authorization-server"
@@ -240,14 +240,9 @@ def token_path(home_dir: Path) -> Path:
     return home_dir / TOKEN_FILE
 
 
-def credentials(
-    config_get: Callable[[str, Any], Any], home_dir: Path,
-) -> tuple[str, OAuthSession | None]:
-    """How to authenticate: (API key, OAuth login). An API key, if one is set, wins."""
-    api_key = resolve_api_key(config_get)
-    if api_key:
-        return api_key, None
-    return "", OAuthSession.load(token_path(home_dir))
+def stored_login(home_dir: Path) -> OAuthSession | None:
+    """The login of ``pralph linear oauth``, if there is one."""
+    return OAuthSession.load(token_path(home_dir))
 
 
 # ── login ────────────────────────────────────────────────────────────

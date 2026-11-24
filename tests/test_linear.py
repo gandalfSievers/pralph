@@ -312,8 +312,15 @@ def fake() -> FakeLinear:
     return FakeLinear()
 
 
+def log_in() -> None:
+    """Leave a login in the (isolated) home directory, as 'pralph linear oauth' does."""
+    path = Path.home() / ".pralph" / "linear-oauth.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"access_token": "token", "refresh_token": "refresh", "client_id": "c"}))
+
+
 def make_sync(state: StateManager, fake: FakeLinear, *, listen: bool = True) -> LinearSync:
-    client = LinearClient("lin_api_test", transport=fake, sleep=lambda s: None)
+    client = LinearClient("token", transport=fake, sleep=lambda s: None)
     sync = LinearSync(state, client, LinearLink.load(state.linear_link_path), echo=lambda msg: None)
     if listen:
         state.add_story_listener(sync.on_story_event)
@@ -460,7 +467,7 @@ class TestMcpTransport:
     def test_rejected_credentials(self) -> None:
         server = FakeMcpServer()
         server.status_for = [401]
-        with pytest.raises(LinearError, match="rejected the API key") as caught:
+        with pytest.raises(LinearError, match="Linear rejected the credentials") as caught:
             self.call(server)
         assert caught.value.auth_failed and len(server.requests) == 1
 
@@ -496,15 +503,9 @@ class TestMcpTransport:
 
 class TestClient:
     def test_missing_credentials_fail_before_any_request(self, fake) -> None:
-        with pytest.raises(LinearError, match="pralph linear oauth.*LINEAR_API_KEY"):
-            LinearClient("", transport=fake).teams()
+        with pytest.raises(LinearError, match="Not logged in to Linear — run 'pralph linear oauth'"):
+            LinearClient(transport=fake).teams()
         assert fake.calls == []
-
-    def test_key_resolution_prefers_the_environment(self, monkeypatch) -> None:
-        config = {"linear_api_key": "from-config"}
-        assert L.resolve_api_key(config.get) == "from-config"
-        monkeypatch.setenv("LINEAR_API_KEY", "from-env")
-        assert L.resolve_api_key(config.get) == "from-env"
 
     def test_rate_limits_are_retried(self, fake) -> None:
         fake.failures = [LinearError("Linear rate limit reached", retryable=True)] * 2
@@ -526,10 +527,11 @@ class TestClient:
             LinearClient("k", transport=fake).teams()
         assert len(fake.calls) == 1
 
-    def test_bad_key_gets_a_helpful_message(self, fake) -> None:
+    def test_rejected_credentials_are_not_retried(self, fake) -> None:
         fake.failures = [LinearError("Linear rejected the credentials", auth_failed=True)]
-        with pytest.raises(LinearError, match="rejected the API key — check LINEAR_API_KEY"):
+        with pytest.raises(LinearError, match="Linear rejected the credentials") as caught:
             LinearClient("k", transport=fake).teams()
+        assert caught.value.auth_failed and len(fake.calls) == 1
 
     def test_writes_with_an_unknown_outcome_are_not_repeated(self, fake) -> None:
         """A create that timed out may have gone through — sending it again makes a twin."""
@@ -1658,41 +1660,42 @@ class TestWiring:
         with pytest.raises(LinearError, match="not linked"):
             linear_sync.attach(state, required=True)
 
-    def test_attach_needs_a_key_for_linked_projects(self, state, fake, pushed, monkeypatch) -> None:
+    def test_attach_needs_a_login_for_linked_projects(self, state, fake, pushed, monkeypatch) -> None:
         other = StateManager(str(state.project_dir))
         messages: list[str] = []
         assert linear_sync.attach(other, echo=messages.append) is None
         assert "there is no Linear login — run 'pralph linear oauth'" in messages[0]
-        with pytest.raises(LinearError, match="LINEAR_API_KEY"):
+        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")  # an API key is not a login
+        with pytest.raises(LinearError, match="Not logged in to Linear — run 'pralph linear oauth'"):
             linear_sync.attach(other, required=True)
 
-        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")
+        log_in()
         sync = linear_sync.attach(other)
-        assert sync is not None and sync.link.team_key == "ENG"
+        assert sync is not None and sync.link.team_key == "ENG" and sync.client.oauth is not None
 
-    def test_cli_dry_run_needs_no_key(self, state) -> None:
+    def test_cli_dry_run_needs_no_login(self, state) -> None:
         state.append_stories(backlog())
         result = CliRunner().invoke(main, ["--project-dir", str(state.project_dir), "linear", "push", "--dry-run"])
         assert result.exit_code == 0, result.output
         assert "project: Shop (would create)" in result.output
         assert "would create: 3 sub-issues, 3 blocking relations" in result.output
 
-    def test_cli_push_without_key_explains_what_to_do(self, state) -> None:
+    def test_cli_push_without_a_login_explains_what_to_do(self, state) -> None:
         state.append_stories(backlog())
         result = CliRunner().invoke(main, ["--project-dir", str(state.project_dir), "linear", "push"])
         assert result.exit_code == 1 and "Not logged in to Linear. Run 'pralph linear oauth'" in result.output
 
     def test_cli_implement_refuses_to_bypass_a_linked_project_silently(self, state, fake, pushed) -> None:
         result = CliRunner().invoke(main, ["--project-dir", str(state.project_dir), "implement"])
-        assert result.exit_code == 1 and "LINEAR_API_KEY" in result.output
+        assert result.exit_code == 1 and "Not logged in to Linear — run 'pralph linear oauth'" in result.output
 
     def test_cli_link_with_scope_and_scope_command(self, state, fake, shared, tmp_path, monkeypatch) -> None:
-        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")
+        log_in()
         clone = tmp_path / "clone"
         clone.mkdir()
         url = next(iter(fake.projects.values()))["url"]
         cli = ["--project-dir", str(clone), "linear"]
-        with patch("pralph.cli.LinearClient", lambda key: LinearClient(key, transport=fake)):
+        with patch("pralph.cli.LinearClient", lambda oauth: LinearClient(oauth=oauth, transport=fake)):
             bad = CliRunner().invoke(main, [*cli, "link", url, "--milestone", "Beta"])
             assert bad.exit_code == 1 and "no milestone 'Beta'" in bad.output
             assert not (clone / ".pralph" / "linear.json").exists(), "no unscoped link is left behind"
@@ -1716,12 +1719,12 @@ class TestWiring:
             assert "scope: the whole project" in cleared.output and "4 issues: 2 new" in cleared.output
 
     def test_cli_read_mostly(self, state, fake, shared, tmp_path, monkeypatch) -> None:
-        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")
+        log_in()
         clone = tmp_path / "clone"
         clone.mkdir()
         url = next(iter(fake.projects.values()))["url"]
         cli = ["--project-dir", str(clone), "linear"]
-        with patch("pralph.cli.LinearClient", lambda key: LinearClient(key, transport=fake)):
+        with patch("pralph.cli.LinearClient", lambda oauth: LinearClient(oauth=oauth, transport=fake)):
             result = CliRunner().invoke(main, [*cli, "link", url, "--label", "repo:shop", "--read-mostly"])
             assert result.exit_code == 0, result.output
             assert "mode: read-mostly (comments and In Progress only)" in result.output

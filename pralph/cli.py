@@ -782,17 +782,14 @@ def spec_status(ctx):
 # ── Linear ───────────────────────────────────────────────────────────
 
 
-def _linear_sync(ctx: click.Context, *, need_key: bool = True) -> tuple[StateManager, linear_sync.LinearSync]:
+def _linear_sync(ctx: click.Context, *, need_login: bool = True) -> tuple[StateManager, linear_sync.LinearSync]:
     """State + sync object for the `pralph linear` commands (linked or not)."""
     state = _state(ctx)
-    api_key, oauth = linear_oauth.credentials(state.get_config, state.home_dir)
-    if need_key and not api_key and oauth is None:
-        raise click.ClickException(
-            "Not logged in to Linear. Run 'pralph linear oauth' "
-            "(or set LINEAR_API_KEY to a personal API key)."
-        )
+    oauth = linear_oauth.stored_login(state.home_dir)
+    if need_login and oauth is None:
+        raise click.ClickException("Not logged in to Linear. Run 'pralph linear oauth'.")
     link = linear_sync.LinearLink.load(state.linear_link_path)
-    client = LinearClient("", oauth=oauth) if oauth is not None else LinearClient(api_key)
+    client = LinearClient(oauth=oauth)
     return state, linear_sync.LinearSync(state, client, link)
 
 
@@ -839,7 +836,7 @@ def linear_push(ctx, team, project_name, dry_run):
     per story category, a sub-issue per story and blocking relations for
     dependencies. Safe to re-run: only what is missing gets created.
     """
-    state, sync = _linear_sync(ctx, need_key=not dry_run)
+    state, sync = _linear_sync(ctx, need_login=not dry_run)
     if not state.load_stories():
         raise click.ClickException("No stories to push. Run 'pralph stories' first.")
     click.echo("pralph linear push" + (" (dry run)" if dry_run else ""))
@@ -945,7 +942,7 @@ def linear_scope(ctx, milestone, assignee, label, clear, read_mostly):
     """
     changing_scope = bool(milestone or assignee or label or clear)
     changing = changing_scope or read_mostly is not None
-    state, sync = _linear_sync(ctx, need_key=changing)
+    state, sync = _linear_sync(ctx, need_login=changing)
     if not sync.linked:
         raise click.ClickException("Not linked to a Linear project. Run 'pralph linear push' or 'pralph linear link'.")
 
@@ -982,7 +979,7 @@ def linear_oauth_login(ctx, port, no_browser, logout):
     your approval and receives the answer on a local port.
 
     The login is stored in ~/.pralph/linear-oauth.json and refreshed
-    automatically. A LINEAR_API_KEY, if set, takes precedence over it.
+    automatically.
     """
     state = _state(ctx)
     path = linear_oauth.token_path(state.home_dir)
@@ -1003,7 +1000,7 @@ def linear_oauth_login(ctx, port, no_browser, logout):
             open_browser=None if no_browser else linear_oauth.webbrowser.open,
             echo=click.echo,
         )
-        viewer = LinearClient("", oauth=session).viewer()
+        viewer = LinearClient(oauth=session).viewer()
     except LinearError as e:
         raise click.ClickException(str(e))
     except KeyboardInterrupt:
@@ -1012,19 +1009,12 @@ def linear_oauth_login(ctx, port, no_browser, logout):
     workspace = (viewer.get("organization") or {}).get("name") or "?"
     click.echo(click.style("  Logged in", fg='green') + f" as {viewer.get('name') or '?'} ({workspace})")
     click.echo(f"  stored in {path} — refreshed automatically")
-    if os.environ.get("LINEAR_API_KEY", "").strip() or state.get_config("linear_api_key", None):
-        click.echo(click.style(
-            "  A Linear API key is configured and takes precedence — unset LINEAR_API_KEY / linear_api_key to use this login",
-            fg='yellow',
-        ))
 
 
 def _linear_auth_text(state: StateManager) -> str:
-    api_key, oauth = linear_oauth.credentials(state.get_config, state.home_dir)
-    if api_key:
-        return "API key"
+    oauth = linear_oauth.stored_login(state.home_dir)
     if oauth is None:
-        return "none — run 'pralph linear oauth' (or set LINEAR_API_KEY)"
+        return "not logged in — run 'pralph linear oauth'"
     from datetime import datetime
 
     until = f"access token valid until {datetime.fromtimestamp(oauth.expires_at):%Y-%m-%d %H:%M}, " if oauth.expires_at else ""
@@ -1035,7 +1025,7 @@ def _linear_auth_text(state: StateManager) -> str:
 @click.pass_context
 def linear_status(ctx):
     """Show the Linear link and how the backlog maps onto it (as of the last sync)."""
-    state, sync = _linear_sync(ctx, need_key=False)
+    state, sync = _linear_sync(ctx, need_login=False)
     click.echo(f"  auth: {_linear_auth_text(state)}")
     if not sync.linked:
         click.echo("Not linked to a Linear project. Run 'pralph linear push' or 'pralph linear link'.")

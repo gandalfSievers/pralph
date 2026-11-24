@@ -353,10 +353,10 @@ class TestClientWithOAuth:
         seen: list[str] = []
 
         def transport(tool: str, arguments: dict) -> dict:
-            seen.append(client.api_key)
+            seen.append(client.token)
             return {"teams": [], "hasNextPage": False}
 
-        client = LinearClient("", transport=transport, oauth=session)
+        client = LinearClient(transport=transport, oauth=session)
         client.teams()
         assert seen == ["token-1"]
 
@@ -366,12 +366,12 @@ class TestClientWithOAuth:
         tokens: list[str] = []
 
         def transport(tool: str, arguments: dict) -> dict:
-            tokens.append(client.api_key)
-            if client.api_key == "token-1":  # revoked early on Linear's side
+            tokens.append(client.token)
+            if client.token == "token-1":  # revoked early on Linear's side
                 raise LinearError("Linear rejected the credentials", auth_failed=True)
             return {"teams": [{"id": "t", "key": "ENG", "name": "Eng"}], "hasNextPage": False}
 
-        client = LinearClient("", transport=transport, oauth=session)
+        client = LinearClient(transport=transport, oauth=session)
         assert [t["key"] for t in client.teams()] == ["ENG"]
         assert tokens == ["token-1", "token-2"]
 
@@ -382,17 +382,29 @@ class TestClientWithOAuth:
         def transport(tool: str, arguments: dict) -> dict:
             raise LinearError("Linear rejected the credentials", auth_failed=True)
 
-        client = LinearClient("", transport=transport, oauth=session)
+        client = LinearClient(transport=transport, oauth=session)
         with pytest.raises(LinearError, match="rejected the OAuth login — run 'pralph linear oauth' again"):
             client.teams()
 
-    def test_api_key_takes_precedence_over_the_login(self, token_file, monkeypatch, tmp_path) -> None:
-        do_login(token_file, FakeAuthServer())
+    def test_an_api_key_is_ignored(self, token_file, monkeypatch, tmp_path) -> None:
         home = tmp_path / "home" / ".pralph"
-        key, session = O.credentials({}.get, home)
-        assert key == "" and session is not None and session.access_token() == "token-1"
-        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")
-        assert O.credentials({}.get, home) == ("lin_api_x", None)
+        home.mkdir()
+        (home / "config.json").write_text(json.dumps({"linear_api_key": "lin_api_config"}))
+        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_env")
+        assert O.stored_login(home) is None, "a key is not a login"
+
+        do_login(token_file, FakeAuthServer())
+        session = O.stored_login(home)
+        assert session is not None and session.access_token() == "token-1"
+        state = StateManager(str(tmp_path))
+        linear_sync.LinearLink(team_id="t", team_key="ENG", project_id="p", project_name="Shop").save(
+            state.linear_link_path)
+        client = linear_sync.attach(state, required=True).client
+        assert client.oauth is not None and client.token == ""
+        seen: list[str] = []
+        client._transport = lambda tool, arguments: seen.append(client.token) or {"teams": []}
+        client.teams()
+        assert seen == ["token-1"]
 
 
 # ── wiring / CLI ──────────────────────────────────────────────────────
@@ -420,7 +432,7 @@ class TestCli:
         monkeypatch.setattr(L.McpTransport, "__call__", whoami)
         cli = ["--project-dir", str(self.project(tmp_path)), "linear"]
 
-        assert "auth: none — run 'pralph linear oauth'" in CliRunner().invoke(main, [*cli, "status"]).output
+        assert "auth: not logged in — run 'pralph linear oauth'" in CliRunner().invoke(main, [*cli, "status"]).output
 
         result = CliRunner().invoke(main, [*cli, "oauth", "--port", port])
         assert result.exit_code == 0, result.output
@@ -436,17 +448,14 @@ class TestCli:
         assert again.exit_code == 0 and json.loads(token_file.read_text())["access_token"] == "token-2"
         assert len(server.clients) == 1, "the registration is reused"
 
-        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")
-        assert "auth: API key" in CliRunner().invoke(main, [*cli, "status"]).output
-        warned = CliRunner().invoke(main, [*cli, "oauth", "--port", port])
-        assert "API key is configured and takes precedence" in warned.output
-        monkeypatch.delenv("LINEAR_API_KEY")
+        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")  # ignored
+        assert "auth: OAuth login" in CliRunner().invoke(main, [*cli, "status"]).output
 
         out = CliRunner().invoke(main, [*cli, "oauth", "--logout"])
         assert "Logged out" in out.output and "locally" not in out.output and not token_file.exists()
-        assert server.revoked == ["refresh-3", "token-3"]
+        assert server.revoked == ["refresh-2", "token-2"]
         assert "Not logged in" in CliRunner().invoke(main, [*cli, "oauth", "--logout"]).output
-        assert "auth: none" in CliRunner().invoke(main, [*cli, "status"]).output
+        assert "auth: not logged in" in CliRunner().invoke(main, [*cli, "status"]).output
 
     def test_no_browser_prints_the_url_and_waits(self, tmp_path, monkeypatch) -> None:
         server = FakeAuthServer()
@@ -457,7 +466,8 @@ class TestCli:
         assert result.exit_code == 1 and "Timed out waiting for the approval" in result.output
         assert "Open this URL to approve the access" in result.output
 
-    def test_commands_that_need_linear_say_how_to_log_in(self, tmp_path) -> None:
+    def test_commands_that_need_linear_say_how_to_log_in(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")  # no longer a way in
         result = CliRunner().invoke(main, ["--project-dir", str(self.project(tmp_path)), "linear", "pull"])
         assert result.exit_code == 1 and "Not logged in to Linear. Run 'pralph linear oauth'" in result.output
 
@@ -470,4 +480,4 @@ class TestCli:
 
         do_login(token_file, FakeAuthServer())
         sync = linear_sync.attach(state, required=True)
-        assert sync is not None and sync.client.oauth is not None and sync.client.api_key == ""
+        assert sync is not None and sync.client.oauth is not None

@@ -401,7 +401,7 @@ There is nothing to set up in Linear first — no API key, no OAuth application.
 
 The login is stored in `~/.pralph/linear-oauth.json` (readable by you only) and is yours: what pralph does in Linear appears under your name, and it can see and change what you can. Access tokens last about a day; pralph refreshes them on its own, also in the middle of a long run. If Linear stops accepting the login — after a long break, or when you revoke the access in Linear — log in again.
 
-A personal API key works too (Linear → Settings → Security & access → Personal API keys): set `LINEAR_API_KEY`, or `linear_api_key` in `~/.pralph/config.json` — don't put it in a config file that gets committed. A key, if set, takes precedence over the login.
+Personal API keys are not used: `LINEAR_API_KEY` and a `linear_api_key` setting are ignored.
 
 The link is stored in `.pralph/linear.json`.
 
@@ -735,7 +735,6 @@ pralph uses JSON config files for persistent settings. Config is resolved in ord
 | `spec_driven` | `bool` | auto | Force spec-driven mode on or off. By default it is on when `<spec_dir>/<name>/spec.md` exists |
 | `linear_team` | `string` | — | Default Linear team key for `pralph linear push` |
 | `linear_ac_heading` | `string` or list | — | Heading(s) that introduce the acceptance criteria in a Linear issue, in addition to `Acceptance criteria`, `Done when` and `Definition of done` |
-| `linear_api_key` | `string` | — | Linear API key, used instead of the `pralph linear oauth` login (also `LINEAR_API_KEY`). Keep it in `~/.pralph/config.json`, not in the project |
 
 Set user-wide defaults in `~/.pralph/config.json`. Override per-project in `.pralph/config.json` (e.g. disable global saving for a throwaway project).
 
