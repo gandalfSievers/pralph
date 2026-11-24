@@ -15,6 +15,10 @@ The link can be scoped to a milestone, an assignee and/or a label
 outside the scope is ever written to — the way to share a Linear project with
 other repositories and other people.
 
+A link can also be read-mostly (``LinearLink.read_mostly``), for projects that
+people run: pralph then only comments and moves tickets to In Progress. It
+never closes or cancels a ticket and never creates issues or relations.
+
 State sync is three-way. Each story remembers the Linear state it last saw
 (``metadata.linear.state_type``). If Linear differs from that, somebody moved
 the ticket and Linear wins; if it doesn't, any local change (an update that
@@ -102,6 +106,9 @@ class LinearLink:
     #   milestone {id, name} · assignee {id, name} · label {ids, name}
     # Empty: every issue of the project.
     scope: dict[str, dict] = field(default_factory=dict)
+    # Read-mostly: comment and move to In Progress, nothing else. Tickets are
+    # closed by people (or the GitHub integration, on merge), never by pralph.
+    read_mostly: bool = False
 
     @classmethod
     def load(cls, path: Path) -> LinearLink | None:
@@ -120,6 +127,7 @@ class LinearLink:
         if not isinstance(link.scope, dict):
             link.scope = {}
         link.scope = {k: v for k, v in link.scope.items() if k in _SCOPE_KINDS and isinstance(v, dict)}
+        link.read_mostly = link.read_mostly is True
         return link
 
     def save(self, path: Path) -> None:
@@ -521,6 +529,11 @@ class LinearSync:
         self.link.scope = scope
         self._save_link()
 
+    def set_read_mostly(self, read_mostly: bool) -> None:
+        self._require_link()
+        self.link.read_mostly = bool(read_mostly)
+        self._save_link()
+
     def _resolve_milestone(self, name: str) -> dict:
         milestones = self.client.project_milestones(self.link.project_id)
         wanted = name.strip().lower()
@@ -682,6 +695,8 @@ class LinearSync:
         (``metadata.linear.pending_deps``): until it exists there, the next
         pull must not read its absence as "removed in Linear", and tries again.
         """
+        if self.link.read_mostly:
+            return 0  # relations are the project owners' to draw
         # Not for tickets outside the project or scope: a relation writes to both ends.
         links = {s.id: None if is_outside(s) else story_link(s) for s in stories}
         created = 0
@@ -724,7 +739,9 @@ class LinearSync:
         return created
 
     def unpushed(self) -> list[Story]:
-        """Stories of the plan that have no Linear issue yet."""
+        """Stories of the plan that have no Linear issue yet (and should get one)."""
+        if self.link.read_mostly:
+            return []  # they stay local: a read-mostly link creates nothing
         return [
             s for s in self.state.load_stories()
             if s.status not in _NOT_IN_PLAN and not story_link(s)
@@ -740,6 +757,11 @@ class LinearSync:
         dry_run: bool = False,
     ) -> PushReport:
         """Create everything in Linear that the local plan has and Linear doesn't. Idempotent."""
+        if self.link.read_mostly:
+            raise LinearError(
+                "This Linear link is read-mostly: pralph does not create issues. "
+                "Run 'pralph linear scope --read-write' to let it."
+            )
         plan = [s for s in self.state.load_stories() if s.status not in _NOT_IN_PLAN]
         todo = self.unpushed()
         report = PushReport(dry_run=dry_run, already_linked=len(plan) - len(todo))
@@ -1071,6 +1093,10 @@ class LinearSync:
         cls = desired_class(story)
         if cls is None or state_class(link.get("state_type")) == cls:
             return False
+        if self.link.read_mostly and cls != "started":
+            # Read-mostly: starting work is the one transition pralph makes.
+            # Done, Canceled and back to Todo are for people (or the merge).
+            return False
         target = self._state_for(cls, story.status)
         issue = self.client.update_issue(link["id"], stateId=target["id"])
         self._remember(story.id, issue)
@@ -1082,14 +1108,14 @@ class LinearSync:
             return
         try:
             if event == "added":
-                if not story_link(story) and story.status not in _NOT_IN_PLAN:
+                if not story_link(story) and story.status not in _NOT_IN_PLAN and not self.link.read_mostly:
                     self._create_ticket(story)
             elif event == "status":
                 self._on_status(story, info)
             elif event == "reviewed":
                 held = self._awaiting_review.pop(story.id, None)
                 if held is not None and story.status == StoryStatus.implemented:
-                    self._sync_ticket(story, held)
+                    self._sync_ticket(story, {**held, "review": info})
         except LinearError as e:
             self._warn(f"{story.id} not synced ({e}) — will be retried on the next pull")
 
@@ -1101,7 +1127,7 @@ class LinearSync:
 
     def _on_status(self, story: Story, info: dict) -> None:
         if not story_link(story):
-            if story.status not in _NOT_IN_PLAN:
+            if story.status not in _NOT_IN_PLAN and not self.link.read_mostly:
                 self._create_ticket(story)
             return
         if story.status == StoryStatus.implemented and info.get("review_pending"):
@@ -1117,14 +1143,20 @@ class LinearSync:
         """Move the ticket to where the story's status puts it, and say why."""
         if is_outside(story):
             return  # left the project or the scope: not pralph's ticket any more
-        self._push_state(story)
-        body = _comment_for(self.state, story, info)
+        moved = self._push_state(story)
+        # Say what happened to the ticket only if it did: "closed" would be
+        # wrong on a ticket a read-mostly link (or a claim) left open.
+        # (`story` is the listener's copy: its link still has the state from before the move.)
+        now = desired_class(story) if moved else state_class((story_link(story) or {}).get("state_type"))
+        body = _comment_for(self.state, story, info, closed=now in ("completed", "canceled"))
         if body:
             self.client.create_comment(story_link(story)["id"], body)  # type: ignore[index]
         self._rollup_epics(self.state.load_stories(), only=story_category(story))
 
     def _rollup_epics(self, stories: list[Story], only: str | None = None) -> None:
         """Start a parent issue when work on its stories starts; close it when all are done."""
+        if self.link.read_mostly:
+            return  # parent issues are run by people
         for category, epic in list(self.link.epics.items()):
             if only is not None and category != only:
                 continue
@@ -1185,8 +1217,12 @@ def _status_from_linear(
     return StoryStatus.pending, "" if current == StoryStatus.pending else "Reopened in Linear", False
 
 
-def _comment_for(state: StateManager, story: Story, info: dict) -> str:
-    """Comment to leave on the ticket for a status change ('' for none)."""
+def _comment_for(state: StateManager, story: Story, info: dict, *, closed: bool = True) -> str:
+    """Comment to leave on the ticket for a status change ('' for none).
+
+    ``closed``: the ticket is completed/canceled in Linear. When pralph does
+    not close tickets (read-mostly), the comment must not claim it did.
+    """
     summary = (info.get("summary") or "").strip()
     extra = info.get("extra") or {}
     reason = (info.get("error_reason") or extra.get("reason") or summary or "").strip()
@@ -1199,6 +1235,13 @@ def _comment_for(state: StateManager, story: Story, info: dict) -> str:
         files = [f for f in extra.get("files_changed") or [] if isinstance(f, str)]
         if files:
             lines += ["", "Files changed:"] + [f"- `{f}`" for f in files[:40]]
+        review = info.get("review")
+        if isinstance(review, dict):
+            if review.get("error"):
+                lines += ["", f"Not reviewed: the reviewer failed ({str(review['error'])[:200]})."]
+            else:
+                feedback = str(review.get("feedback") or "").strip()
+                lines += ["", "Review: approved" + (f" — {feedback[:500]}" if feedback else "") ]
         return "\n".join(lines)
     if status == StoryStatus.rework:
         feedback = state.read_review_feedback(story.id)
@@ -1212,8 +1255,12 @@ def _comment_for(state: StateManager, story: Story, info: dict) -> str:
             "Move the issue back to Todo (or run `pralph reset-errors`) to retry."
         )
     if status == StoryStatus.duplicate:
-        of = extra.get("duplicate_of")
-        return f"**pralph** closed this as a duplicate{f' of {of}' if of else ''}." + (f"\n\n{reason}" if reason else "")
+        of = f" of {extra['duplicate_of']}" if extra.get("duplicate_of") else ""
+        head = (
+            f"**pralph** closed this as a duplicate{of}." if closed
+            else f"**pralph** considers this a duplicate{of} and will not work on it. The issue was left open."
+        )
+        return head + (f"\n\n{reason}" if reason else "")
     if status == StoryStatus.external:
         system = extra.get("external_system")
         return (
@@ -1221,7 +1268,10 @@ def _comment_for(state: StateManager, story: Story, info: dict) -> str:
             + (f"\n\n{reason}" if reason else "")
         )
     if status == StoryStatus.skipped:
-        return "**pralph** skipped this story." + (f"\n\n{reason}" if reason else "")
+        head = "**pralph** skipped this story." if closed else (
+            "**pralph** skipped this story and will not work on it. The issue was left open."
+        )
+        return head + (f"\n\n{reason}" if reason else "")
     return ""  # pending / in_progress: the state change says it all
 
 

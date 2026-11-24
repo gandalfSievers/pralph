@@ -486,6 +486,8 @@ def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, reset
         click.echo(f"  linear: {tracker.link.project_name} ({tracker.link.team_key}) {tracker.link.project_url}")
         if tracker.link.scope:
             click.echo(f"  linear scope: {tracker.scope_text()}")
+        if tracker.link.read_mostly:
+            click.echo(f"  linear mode: {_READ_MOSTLY}")
     if state.spec_mode:
         click.echo(f"  spec-driven: {', '.join(sp.name for sp in spec_lib.list_specs(state)) or 'no specs yet'}")
     if story_id:
@@ -804,6 +806,9 @@ def _echo_pull(report: linear_sync.PullReport) -> None:
         click.echo(click.style(f"  {report.out_of_scope} issues outside the scope left alone", dim=True))
 
 
+_READ_MOSTLY = "read-mostly (comments and In Progress only)"
+
+
 def _scope_options(fn):
     """--milestone / --assignee / --label, shared by 'linear link' and 'linear scope'."""
     for decorator in reversed([
@@ -872,8 +877,10 @@ def linear_pull(ctx):
 @click.argument("project")
 @click.option("--team", default=None, help="Linear team key, if the project belongs to several teams")
 @_scope_options
+@click.option("--read-mostly", is_flag=True,
+              help="Only comment and move issues to In Progress: never close or cancel them, never create issues")
 @click.pass_context
-def linear_link(ctx, project, team, milestone, assignee, label):
+def linear_link(ctx, project, team, milestone, assignee, label, read_mostly):
     """Attach this checkout to an existing Linear project (URL, ID or name).
 
     Use this on a fresh clone: the backlog is rebuilt from the tickets.
@@ -881,6 +888,9 @@ def linear_link(ctx, project, team, milestone, assignee, label):
     If the project is shared with other repositories or other people, scope
     the link with --milestone, --assignee and/or --label: only matching issues
     become work, and nothing outside the scope is written to.
+
+    With --read-mostly pralph only comments on issues and moves them to In
+    Progress. Closing them is left to people, or to the merge.
     """
     state, sync = _linear_sync(ctx)
     if sync.linked:
@@ -899,6 +909,9 @@ def linear_link(ctx, project, team, milestone, assignee, label):
                 state.linear_link_path.unlink(missing_ok=True)
                 raise
             click.echo(f"  scope: {sync.scope_text()}")
+        if read_mostly:
+            sync.set_read_mostly(True)
+            click.echo(f"  mode: {_READ_MOSTLY}")
         report = sync.pull()
     except LinearError as e:
         raise click.ClickException(str(e))
@@ -908,30 +921,46 @@ def linear_link(ctx, project, team, milestone, assignee, label):
 @linear.command("scope")
 @_scope_options
 @click.option("--clear", is_flag=True, help="Drop the current scope first (alone: back to the whole project)")
+@click.option("--read-mostly/--read-write", "read_mostly", default=None,
+              help="Read-mostly: only comment and move issues to In Progress. Read-write: the full sync")
 @click.pass_context
-def linear_scope(ctx, milestone, assignee, label, clear):
+def linear_scope(ctx, milestone, assignee, label, clear, read_mostly):
     """Show or change which issues of the linked project are this checkout's work.
 
     An issue is in scope when it matches every criterion. Issues outside the
     scope are never turned into stories and never written to. Criteria that
     are not given stay as they are; --clear drops them.
 
+    --read-mostly limits what pralph writes to the issues that are in scope:
+    comments, and the move to In Progress. It then never closes or cancels an
+    issue and never creates issues, parent issues or relations.
+
     \b
       pralph linear scope --label pralph
       pralph linear scope --milestone "Base work" --assignee me
       pralph linear scope --clear
+      pralph linear scope --read-mostly
     """
-    changing = bool(milestone or assignee or label or clear)
+    changing_scope = bool(milestone or assignee or label or clear)
+    changing = changing_scope or read_mostly is not None
     state, sync = _linear_sync(ctx, need_key=changing)
     if not sync.linked:
         raise click.ClickException("Not linked to a Linear project. Run 'pralph linear push' or 'pralph linear link'.")
-    if not changing:
+
+    def show() -> None:
         click.echo(f"  scope: {sync.scope_text() or 'the whole project'}")
+        click.echo(f"  mode: {_READ_MOSTLY if sync.link.read_mostly else 'read-write'}")
+
+    if not changing:
+        show()
         return
     click.echo("pralph linear scope")
     try:
-        sync.set_scope(milestone=milestone, assignee=assignee, label=label, clear=clear)
-        click.echo(f"  scope: {sync.scope_text() or 'the whole project'}")
+        if changing_scope:
+            sync.set_scope(milestone=milestone, assignee=assignee, label=label, clear=clear)
+        if read_mostly is not None:
+            sync.set_read_mostly(read_mostly)
+        show()
         report = sync.pull()
     except LinearError as e:
         raise click.ClickException(str(e))
@@ -950,6 +979,8 @@ def linear_status(ctx):
     click.echo(f"  team: {sync.link.team_key}")
     if sync.link.scope:
         click.echo(f"  scope: {sync.scope_text()}")
+    if sync.link.read_mostly:
+        click.echo(f"  mode: {_READ_MOSTLY}")
     click.echo(f"  parent issues: {', '.join(sorted(sync.link.epics)) or 'none'}")
     by_state: dict[str, int] = {}
     for story in state.load_stories():

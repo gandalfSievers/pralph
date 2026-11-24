@@ -316,7 +316,8 @@ And pralph reports back on the ticket:
 | pralph | In Linear |
 |---|---|
 | Starts a story | Issue → In Progress (and its parent issue, if not started yet) |
-| Implements it and the review passes | Issue → Done, comment with the summary and changed files. The parent closes with its last sub-issue |
+| Implements it and the review passes | Issue → Done, comment with the summary, changed files and review verdict. The parent closes with its last sub-issue |
+| Implements it but the reviewer itself fails | As above, and the comment says the story was **not reviewed** and why |
 | Review rejects it | Stays In Progress, comment with the review feedback |
 | Fails | Stays In Progress, comment with the error. Move it to Todo (or run `pralph reset-errors`) to retry |
 | Skips it / finds a duplicate | Issue → Canceled, comment with the reason (and what it duplicates) |
@@ -359,6 +360,28 @@ An issue has to match every criterion that is set. Everything else in the projec
 An issue that leaves the scope — reassigned, moved to another milestone, label removed — is dropped from the run (its story is skipped locally) and its ticket is not touched again; if it comes back, so does the story. Tickets pralph creates for new stories get the milestone, assignee and label of the scope, so they are part of it.
 
 `pralph implement --story-id ENG-123` works with a scope as well, and accepts a ticket this checkout has not seen yet.
+
+#### Someone else's project: read-mostly
+
+In a project that people run, closing and canceling tickets is theirs to do — typically Done happens when the pull request merges. A read-mostly link keeps pralph to two things: **comments**, and the move to **In Progress**.
+
+```bash
+pralph linear link https://linear.app/acme/project/platform-1a2b3c4d5e6f --label repo:shop --read-mostly
+pralph linear scope --read-mostly      # or switch an existing link
+pralph linear scope --read-write       # back to the full sync
+```
+
+| pralph | In Linear, read-mostly |
+|---|---|
+| Starts a story | Issue → In Progress |
+| Implements it and the review passes | Comment with the summary, changed files and review verdict. The issue **stays In Progress** — Linear's GitHub integration (or a person) closes it on merge |
+| Review rejects it / it fails | Comment with the feedback or the error |
+| Skips it / finds a duplicate | Comment saying so. The issue is **not canceled** |
+| Is interrupted | Nothing — the issue is not moved back to Todo |
+| New story (`add`, `ideate`, ...) | Stays local. No issue, no parent issue, no blocking relation is ever created, and `pralph linear push` refuses |
+| Parent issues | Never moved |
+
+Everything in the first table still applies: what people change in Linear is respected. A ticket moved to Done counts as implemented, one moved back to Todo is implemented again.
 
 The link is stored in `.pralph/linear.json`. The API key is read from `LINEAR_API_KEY`, or from `linear_api_key` in `~/.pralph/config.json` — don't put it in a config file that gets committed.
 
@@ -529,7 +552,7 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `linear push` | Create the Linear project, parent issues, sub-issues and blocking relations for everything not in Linear yet |
 | `linear pull` | Sync the backlog from the Linear project |
 | `linear link PROJECT` | Attach to an existing Linear project (URL, ID or name) and rebuild the backlog from it. Takes the scope options below |
-| `linear scope` | Show or change which issues of the project are this checkout's work |
+| `linear scope` | Show or change which issues of the project are this checkout's work, and whether the link is read-mostly |
 | `linear status` | Show the link and the ticket states as of the last sync |
 
 `linear push` options:
@@ -548,6 +571,7 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `--assignee` | — | Only issues assigned to this user: `me`, a name or an email |
 | `--label` | — | Only issues with this label |
 | `--clear` | off | `linear scope` only: drop the current scope first |
+| `--read-mostly` | off | Only comment and move issues to In Progress. `linear scope` also takes `--read-write` to switch back |
 | `--team` | — | `linear link` only: team key, if the project belongs to several teams |
 
 #### `review`

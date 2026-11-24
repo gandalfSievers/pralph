@@ -711,10 +711,26 @@ class TestStatusSync:
         state.mark_story_status("API-002", StoryStatus.duplicate, extra={"duplicate_of": "API-001"})
         # Not "Duplicate": Linear only allows that state together with a duplicate-of relation.
         assert fake.state_of("API-002") == "Canceled"
-        assert "duplicate of API-001" in fake.comments_on("API-002")[0]
+        assert "closed this as a duplicate of API-001" in fake.comments_on("API-002")[0]
         state.mark_story_status("API-001", StoryStatus.skipped, summary="Refined into: API-003")
         assert fake.state_of("API-001") == "Canceled"
-        assert "Refined into: API-003" in fake.comments_on("API-001")[0]
+        (comment,) = fake.comments_on("API-001")
+        assert comment.startswith("**pralph** skipped this story.\n") and "Refined into: API-003" in comment
+
+    def test_comment_carries_the_review_verdict(self, state, fake, pushed) -> None:
+        state.mark_story_status("API-001", StoryStatus.implemented, summary="Built it", review_pending=True)
+        state.notify_review_passed("API-001", "Clean and tested")
+        assert "Review: approved — Clean and tested" in fake.comments_on("API-001")[0]
+
+        # A reviewer that failed is not an approval — the ticket must say so.
+        state.mark_story_status("API-002", StoryStatus.implemented, summary="Built it", review_pending=True)
+        state.notify_review_passed("API-002", error="unknown slash command /dev:vet")
+        (comment,) = fake.comments_on("API-002")
+        assert "Not reviewed: the reviewer failed (unknown slash command /dev:vet)" in comment
+        assert "approved" not in comment
+
+        state.mark_story_status("DB-001", StoryStatus.implemented, summary="Built it")  # --no-review
+        assert "Review" not in fake.comments_on("DB-001")[0] and "review" not in fake.comments_on("DB-001")[0]
 
     def test_new_stories_get_a_ticket(self, state, fake, pushed) -> None:
         state.append_stories([Story(id="API-003", title="Search", content="c", category="API",
@@ -1185,6 +1201,144 @@ class TestScope:
         assert len(comments) == 2 and "No tests" in comments[0] and "implemented this story" in comments[1]
 
 
+# ── read-mostly: a project that people run ────────────────────────────
+
+
+@pytest.fixture
+def guest(state, fake, shared) -> LinearSync:
+    """Read-mostly link to the shared project, scoped to this repo's label."""
+    shared.set_scope(label="repo:shop")
+    shared.set_read_mostly(True)
+    shared.pull()
+    fake.calls.clear()
+    fake.mutation_log.clear()
+    return shared
+
+
+class TestReadMostly:
+    def cart(self, fake) -> str:
+        return fake.find("Cart API")["identifier"]
+
+    def state_writes(self, fake) -> set[str]:
+        return {v["input"]["stateId"] for name, v in fake.mutation_log if name == "issue_update"}
+
+    def test_work_starts_the_ticket_and_never_closes_it(self, state, fake, guest) -> None:
+        cart = self.cart(fake)
+        state.mark_story_status(cart, StoryStatus.in_progress)
+        assert fake.state_of("Cart API") == "In Progress"
+
+        state.mark_story_status(cart, StoryStatus.implemented, summary="Built it",
+                                extra={"files_changed": ["cart.py"]}, review_pending=True)
+        assert fake.comments == [], "the comment waits for the review, like Done does in a read-write link"
+        state.notify_review_passed(cart, "looks good")
+        assert fake.state_of("Cart API") == "In Progress", "Done is for the merge"
+        (comment,) = fake.comments_on("Cart API")
+        assert "implemented this story" in comment and "`cart.py`" in comment and "Review: approved" in comment
+
+        guest.pull()
+        assert fake.state_of("Cart API") == "In Progress", "the sync does not catch up on it either"
+        assert self.state_writes(fake) == {"st-progress"}
+        assert stories_by_id(state)[cart].status == StoryStatus.implemented
+
+    def test_merge_closing_the_ticket_is_taken_as_done(self, state, fake, guest) -> None:
+        cart = self.cart(fake)
+        state.mark_story_status(cart, StoryStatus.in_progress)
+        state.mark_story_status(cart, StoryStatus.implemented, summary="Built it")
+        fake.move("Cart API", "In Review")   # the GitHub integration: PR opened …
+        guest.pull()
+        assert stories_by_id(state)[cart].status == StoryStatus.implemented
+        fake.move("Cart API", "Done")        # … and merged
+        report = guest.pull()
+        assert report.status_changes == [] and stories_by_id(state)[cart].status == StoryStatus.implemented
+
+    def test_rejected_in_linear_by_moving_it_back(self, state, fake, guest) -> None:
+        cart = self.cart(fake)
+        state.mark_story_status(cart, StoryStatus.in_progress)
+        state.mark_story_status(cart, StoryStatus.implemented, summary="Built it")
+        fake.move("Cart API", "Todo")
+        guest.pull()
+        assert stories_by_id(state)[cart].status == StoryStatus.pending
+
+    def test_never_canceled(self, state, fake, guest) -> None:
+        cart = self.cart(fake)
+        state.mark_story_status(cart, StoryStatus.skipped, summary="Not needed after all")
+        assert fake.state_of("Cart API") == "Todo"
+        (comment,) = fake.comments_on("Cart API")
+        assert "will not work on it. The issue was left open." in comment and "Not needed after all" in comment
+
+        payment = fake.find("Payment API")["identifier"]
+        state.mark_story_status(payment, StoryStatus.duplicate, extra={"duplicate_of": cart})
+        assert fake.state_of("Payment API") == "Todo"
+        assert f"considers this a duplicate of {cart}" in fake.comments_on("Payment API")[0]
+        assert "closed" not in fake.comments_on("Payment API")[0]
+
+        guest.pull()
+        assert fake.state_of("Cart API") == "Todo" and self.state_writes(fake) == set()
+        assert stories_by_id(state)[cart].status == StoryStatus.skipped, "the local decision stands"
+
+    def test_interrupted_story_keeps_its_ticket_and_is_picked_up_again(self, state, fake, guest) -> None:
+        cart = self.cart(fake)
+        state.mark_story_status(cart, StoryStatus.in_progress)
+        state.mark_story_status(cart, StoryStatus.pending, summary="User interrupted")
+        assert fake.state_of("Cart API") == "In Progress", "no move back to Todo"
+        guest.pull()
+        assert stories_by_id(state)[cart].status == StoryStatus.pending, \
+            "its own In Progress is not read as 'taken by someone else'"
+
+    def test_failure_is_a_comment(self, state, fake, guest) -> None:
+        cart = self.cart(fake)
+        state.mark_story_status(cart, StoryStatus.in_progress)
+        state.mark_story_status(cart, StoryStatus.error, error_reason="tests would not pass")
+        assert fake.state_of("Cart API") == "In Progress"
+        assert "tests would not pass" in fake.comments_on("Cart API")[0]
+
+    def test_nothing_is_created(self, state, fake, guest) -> None:
+        state.append_stories([
+            Story(id="LOCAL-001", title="Local chore", content="c", category="LOCAL",
+                  dependencies=[self.cart(fake)]),
+        ])
+        state.mark_story_status("LOCAL-001", StoryStatus.in_progress)
+        state.mark_story_status("LOCAL-001", StoryStatus.implemented)
+        guest.pull()
+        assert guest.unpushed() == []
+        with pytest.raises(LinearError, match="read-mostly"):
+            guest.push()
+        with pytest.raises(LinearError, match="read-mostly"):
+            guest.push(dry_run=True)
+        assert fake.mutations() == [] and fake.relations == []
+        assert len(fake.issues) == 5
+
+    def test_parent_issues_are_not_moved(self, state, fake, guest) -> None:
+        fake.find("Checkout flow")["labelIds"] = ["lb-shop"]  # even one that is in scope
+        guest.pull()
+        state.mark_story_status(self.cart(fake), StoryStatus.in_progress)
+        assert fake.state_of("Checkout flow") == "Todo" and fake.writes_to("Checkout flow") == []
+
+    def test_a_run_only_comments_and_starts(self, state, fake, guest) -> None:
+        state.append_stories([Story(id="LOCAL-001", title="Local chore", content="c", category="LOCAL")])
+        patcher, implemented = fake_claude(reject_once="Cart API")
+        with patcher:
+            ps = run_implement_loop(state, max_iterations=10, cooldown=0, phase1=False, tracker=guest)
+        assert ps.completion_reason == "all_stories_done"
+        assert sorted(implemented) == ["Cart API", "Cart API", "Local chore", "Payment API"]
+        assert set(fake.mutations()) == {"issue_update", "comment_create"}
+        assert self.state_writes(fake) == {"st-progress"}
+        assert fake.state_of("Cart API") == "In Progress" and fake.state_of("Payment API") == "In Progress"
+        for other in ("Cart page", "Push notifications", "Checkout flow"):
+            assert fake.writes_to(other) == []
+        assert len(fake.comments_on("Cart API")) == 2, "review feedback, then the result"
+        assert len(fake.issues) == 5, "the local story stays local"
+
+    def test_setting_survives_a_restart_and_can_be_lifted(self, state, fake, guest) -> None:
+        again = make_sync(StateManager(str(state.project_dir)), fake, listen=False)
+        assert again.link.read_mostly is True
+        again.set_read_mostly(False)
+        cart = self.cart(fake)
+        state.mark_story_status(cart, StoryStatus.implemented)
+        make_sync(StateManager(str(state.project_dir)), fake, listen=False).pull()
+        assert fake.state_of("Cart API") == "Done"
+
+
 # ── execution off Linear ──────────────────────────────────────────────
 
 
@@ -1356,6 +1510,30 @@ class TestWiring:
 
             cleared = CliRunner().invoke(main, [*cli, "scope", "--clear"])
             assert "scope: the whole project" in cleared.output and "4 issues: 2 new" in cleared.output
+
+    def test_cli_read_mostly(self, state, fake, shared, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")
+        clone = tmp_path / "clone"
+        clone.mkdir()
+        url = next(iter(fake.projects.values()))["url"]
+        cli = ["--project-dir", str(clone), "linear"]
+        with patch("pralph.cli.LinearClient", lambda key: LinearClient(key, transport=fake)):
+            result = CliRunner().invoke(main, [*cli, "link", url, "--label", "repo:shop", "--read-mostly"])
+            assert result.exit_code == 0, result.output
+            assert "mode: read-mostly (comments and In Progress only)" in result.output
+            assert LinearLink.load(clone / ".pralph" / "linear.json").read_mostly is True
+
+            status = CliRunner().invoke(main, [*cli, "status"])
+            assert "mode: read-mostly" in status.output and "not in Linear yet" not in status.output
+
+            push = CliRunner().invoke(main, [*cli, "push"])
+            assert push.exit_code == 1 and "read-mostly: pralph does not create issues" in push.output
+            assert fake.mutations() == []
+
+            lifted = CliRunner().invoke(main, [*cli, "scope", "--read-write"])
+            assert lifted.exit_code == 0 and "mode: read-write" in lifted.output
+            assert "scope: label 'repo:shop'" in lifted.output, "the scope is kept"
+            assert LinearLink.load(clone / ".pralph" / "linear.json").read_mostly is False
 
     def test_cli_status(self, state, fake, pushed) -> None:
         state.mark_story_status("DB-001", StoryStatus.in_progress)

@@ -1058,7 +1058,8 @@ class StateManager:
           - ``added``   — a story was appended to the backlog
           - ``status``  — a story changed status; info has ``previous``, ``summary``,
                           ``extra``, ``error_reason`` and ``review_pending``
-          - ``reviewed`` — an implemented story passed review
+          - ``reviewed`` — an implemented story passed review; info has ``feedback``,
+                          and ``error`` if the reviewer failed and it was accepted unreviewed
           - ``updated`` — story fields/metadata were changed via update_story()
           - ``synced``  — the backlog was replaced wholesale (story is None)
 
@@ -1275,11 +1276,15 @@ class StateManager:
                 "review_pending": review_pending,
             })
 
-    def notify_review_passed(self, story_id: str, feedback: str = "") -> None:
-        """Tell listeners a story passed review, i.e. its ``implemented`` status is final."""
+    def notify_review_passed(self, story_id: str, feedback: str = "", error: str = "") -> None:
+        """Tell listeners a story passed review, i.e. its ``implemented`` status is final.
+
+        ``error``: the reviewer failed and the story was accepted without a
+        verdict — listeners should not present that as an approval.
+        """
         story = next((s for s in self.load_stories() if s.id == story_id), None)
         if story is not None:
-            self._notify("reviewed", story, {"feedback": feedback})
+            self._notify("reviewed", story, {"feedback": feedback, "error": error})
 
     def _rewrite_stories(self, stories: list[Story]) -> None:
         with open(self.stories_path, "w") as f:

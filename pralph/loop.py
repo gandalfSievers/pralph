@@ -1527,7 +1527,7 @@ def _run_review(
         click.echo(click.style(f"  ⚠ Review failed (error): {result.error[:120]}", fg='yellow'))
         if approve_on_error:
             click.echo(click.style("  → Auto-approving due to review error", fg='yellow'))
-            state.notify_review_passed(story.id)
+            state.notify_review_passed(story.id, error=result.error or "unknown error")
         return None
 
     parsed = parse_review_output(result.result)
