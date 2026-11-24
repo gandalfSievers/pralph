@@ -18,6 +18,7 @@ from click.testing import CliRunner
 
 from pralph import linear as L
 from pralph import linear_sync
+from pralph import ship as ship_lib
 from pralph import spec as spec_lib
 from pralph.assembler import assemble_implement_prompt
 from pralph.cli import main
@@ -153,6 +154,7 @@ class FakeLinear:
             "projectMilestone": dict(milestone) if milestone else None,
             "parentId": self.issues[issue["parentId"]]["identifier"] if issue.get("parentId") else None,
             "archivedAt": "2026-01-01T00:00:00.000Z" if issue.get("trashed") else None,
+            "gitBranchName": f"dev/{issue['identifier'].lower()}",
             # Linear touches updatedAt on every change, relations included.
             "updatedAt": hashlib.sha1(json.dumps([issue, blockers], sort_keys=True).encode()).hexdigest()[:12],
         }
@@ -1649,6 +1651,92 @@ class TestImplementOffLinear:
         prompt = assemble_implement_prompt(state, story)
         assert f"tracked in Linear as **{identifier}**" in prompt
         assert f"Mention `{identifier}` in your commit message" in prompt
+
+
+# ── stories on their own branch (pralph.ship) ─────────────────────────
+
+
+class TestBranchStates:
+    PR = "https://github.com/acme/shop/pull/7"
+
+    def on_branch(self, state, story_id: str = "DB-001") -> None:
+        def mutate(s: Story) -> None:
+            s.metadata["git"] = {"branch": s.metadata["linear"]["branch"], "base": "main"}
+        state.update_story(story_id, mutate, notify=False)
+
+    def test_the_ticket_carries_linears_branch_name(self, state, fake, pushed) -> None:
+        identifier = fake.find("DB-001")["identifier"].lower()
+        assert stories_by_id(state)["DB-001"].metadata["linear"]["branch"] == f"dev/{identifier}", "known from the push"
+        fake.add_issue("Checkout", parent="API —")
+        pushed.pull()
+        new = next(s for s in state.load_stories() if s.title == "Checkout")
+        assert new.metadata["linear"]["branch"] == f"dev/{new.id.lower()}"
+        assert ship_lib.branch_name(new) == f"dev/{new.id.lower()}"
+
+    def test_ticket_is_done_when_the_story_is_merged_not_when_it_is_implemented(self, state, fake, pushed) -> None:
+        self.on_branch(state)
+        state.mark_story_status("DB-001", StoryStatus.in_progress)
+        state.mark_story_status("DB-001", StoryStatus.implemented, summary="Built it", review_pending=True)
+        state.notify_review_passed("DB-001", "fine")
+        assert fake.state_of("DB-001") == "In Progress", "on a branch: not done yet"
+        assert "not merged yet" in fake.comments_on("DB-001")[-1]
+
+        state.mark_story_status("DB-001", StoryStatus.shipped, extra={"pr_url": self.PR})
+        assert fake.state_of("DB-001") == "In Progress"
+        assert fake.comments_on("DB-001")[-1] == f"**pralph** opened a pull request: {self.PR}"
+        pushed.pull()
+        assert fake.state_of("DB-001") == "In Progress" and stories_by_id(state)["DB-001"].status == StoryStatus.shipped
+
+        state.mark_story_status("DB-001", StoryStatus.rework, summary="Changes requested", extra={"pr_url": self.PR})
+        state.mark_story_status("DB-001", StoryStatus.shipped, extra={"pr_url": self.PR, "pr_updated": True})
+        assert "pushed the requested changes" in fake.comments_on("DB-001")[-1]
+
+        state.mark_story_status("DB-001", StoryStatus.merged, summary="merged")
+        assert fake.state_of("DB-001") == "Done"
+
+    def test_merge_seen_in_linear_first(self, state, fake, pushed) -> None:
+        """Linear's GitHub integration closes the ticket when the pull request is merged."""
+        self.on_branch(state)
+        state.mark_story_status("DB-001", StoryStatus.in_progress)
+        state.mark_story_status("DB-001", StoryStatus.shipped, extra={"pr_url": self.PR})
+        fake.move("DB-001", "In Review")
+        pushed.pull()
+        assert stories_by_id(state)["DB-001"].status == StoryStatus.shipped, "In Review is still in progress"
+
+        fake.move("DB-001", "Done")
+        report = pushed.pull()
+        assert stories_by_id(state)["DB-001"].status == StoryStatus.merged
+        assert ("DB-001", "shipped", "merged", "Completed in Linear (merged)") in report.status_changes
+
+    def test_done_in_linear_without_a_branch_is_implemented_as_before(self, state, fake, pushed) -> None:
+        fake.move("DB-001", "Done")
+        pushed.pull()
+        assert stories_by_id(state)["DB-001"].status == StoryStatus.implemented
+
+    def test_story_that_needs_a_person(self, state, fake, pushed) -> None:
+        state.mark_story_status("DB-001", StoryStatus.in_progress)
+        state.mark_story_status("DB-001", StoryStatus.needs_human, summary="Migration written",
+                                extra={"reason": "Apply the migration to staging"})
+        assert fake.state_of("DB-001") == "In Progress"
+        comment = fake.comments_on("DB-001")[-1]
+        assert "needs a person" in comment and "Apply the migration to staging" in comment
+        assert "pralph unblock DB-001" in comment
+        pushed.pull()
+        assert stories_by_id(state)["DB-001"].status == StoryStatus.needs_human, "it stays paused"
+
+        fake.move("DB-001", "Todo")  # the person's way of saying: go on
+        pushed.pull()
+        assert stories_by_id(state)["DB-001"].status == StoryStatus.pending
+
+    def test_read_mostly_leaves_done_to_the_merge(self, state, fake, guest) -> None:
+        cart = fake.find("Cart API")["identifier"]
+        self.on_branch(state, cart)
+        state.mark_story_status(cart, StoryStatus.in_progress)
+        state.mark_story_status(cart, StoryStatus.shipped, extra={"pr_url": self.PR})
+        state.mark_story_status(cart, StoryStatus.merged, summary="merged")
+        guest.pull()
+        assert fake.state_of("Cart API") == "In Progress", "pralph saw the merge; closing the ticket is GitHub's part"
+        assert {v["state"] for name, v in fake.mutation_log if name == "issue_update"} == {"st-progress"}
 
 
 # ── wiring / CLI ──────────────────────────────────────────────────────

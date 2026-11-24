@@ -83,6 +83,12 @@ _STATUS_CLASS = {
     StoryStatus.skipped: "canceled",
     StoryStatus.duplicate: "canceled",
     StoryStatus.external: "canceled",
+    # A branch per story (pralph.ship): the ticket stays in progress while the
+    # pull request is open — Linear's GitHub integration moves it to In Review —
+    # and is done once the work is merged.
+    StoryStatus.shipped: "started",
+    StoryStatus.needs_human: "started",
+    StoryStatus.merged: "completed",
 }
 # Stories that were dropped from the plan are not worth a ticket.
 _NOT_IN_PLAN = (StoryStatus.skipped, StoryStatus.duplicate)
@@ -190,7 +196,19 @@ def desired_class(story: Story) -> str | None:
         # into sub-issues in Linear. Outside: it left the project or the scope.
         # Either way people own the ticket's state.
         return None
+    return status_class(story)
+
+
+def status_class(story: Story) -> str:
+    """Workflow state class a story's status stands for."""
+    if story.status == StoryStatus.implemented and _on_branch(story):
+        return "started"  # implemented on its own branch: not done before it is merged
     return _STATUS_CLASS[story.status]
+
+
+def _on_branch(story: Story) -> bool:
+    info = story.metadata.get("git")
+    return isinstance(info, dict) and bool(info.get("branch"))
 
 
 def is_outside(story: Story) -> bool:
@@ -667,6 +685,8 @@ class LinearSync:
                 "state": issue["state_name"],
                 "state_type": issue["state_type"],
             })
+            if issue.get("branch"):
+                link["branch"] = issue["branch"]
             link.update(extra)
             s.metadata["linear"] = link
 
@@ -1108,6 +1128,7 @@ class LinearSync:
             # The ticket moved in Linear (or we see it for the first time): Linear wins.
             new_status, reason, claimed = _status_from_linear(
                 remote_cls, story.status, claimed, duplicate=issue["state_type"] == "duplicate",
+                on_branch=_on_branch(story),
             )
             if new_status != story.status:
                 if new_status == StoryStatus.pending:
@@ -1115,7 +1136,7 @@ class LinearSync:
                         story.metadata.pop(key, None)
                 story.status = new_status
         else:
-            wanted = _STATUS_CLASS[story.status] if not claimed else None
+            wanted = status_class(story) if not claimed else None
             if wanted is not None and wanted != remote_cls:
                 to_push.append(story)
 
@@ -1123,6 +1144,9 @@ class LinearSync:
             "id": issue["id"], "identifier": issue["identifier"], "url": issue["url"],
             "state": issue["state_name"], "state_type": issue["state_type"],
         }
+        if issue.get("branch") or link.get("branch"):
+            # Linear's name for the issue's branch: a pull request from it is linked to the issue.
+            new_link["branch"] = issue.get("branch") or link["branch"]
         if claimed:
             new_link["claimed"] = True
         if pending_deps:
@@ -1269,13 +1293,17 @@ def _relations_stale(issue: dict, story: Story) -> bool:
 
 
 def _status_from_linear(
-    remote_cls: str, current: StoryStatus, claimed: bool, *, duplicate: bool = False,
+    remote_cls: str, current: StoryStatus, claimed: bool, *, duplicate: bool = False, on_branch: bool = False,
 ) -> tuple[StoryStatus, str, bool]:
     """Local status for a ticket that moved in Linear → (status, reason, claimed elsewhere).
 
     ``duplicate``: the ticket was closed in Linear as a duplicate of another issue.
+    ``on_branch``: the story's work is on a branch of its own.
     """
     if remote_cls == "completed":
+        if current in (StoryStatus.shipped, StoryStatus.merged) or on_branch:
+            # Done in Linear is what the merge of the pull request leaves behind.
+            return StoryStatus.merged, "" if current == StoryStatus.merged else "Completed in Linear (merged)", False
         return StoryStatus.implemented, "Completed in Linear", False
     if remote_cls == "canceled":
         if current in (StoryStatus.skipped, StoryStatus.duplicate) or (current == StoryStatus.external and not claimed):
@@ -1284,7 +1312,9 @@ def _status_from_linear(
             return StoryStatus.duplicate, "Marked as duplicate in Linear", False
         return StoryStatus.skipped, "Canceled in Linear", False
     if remote_cls == "started":
-        if current in (StoryStatus.in_progress, StoryStatus.rework, StoryStatus.error):
+        if current in (StoryStatus.in_progress, StoryStatus.rework, StoryStatus.error,
+                       StoryStatus.shipped, StoryStatus.needs_human) or (
+                current == StoryStatus.implemented and on_branch):
             return current, "", False
         # Someone took the ticket in Linear. Hands off until they finish or put it back.
         return StoryStatus.external, "In progress in Linear (picked up outside pralph)", True
@@ -1305,8 +1335,25 @@ def _comment_for(state: StateManager, story: Story, info: dict, *, closed: bool 
     reason = (info.get("error_reason") or extra.get("reason") or summary or "").strip()
     status = story.status
 
+    git = story.metadata.get("git") if isinstance(story.metadata.get("git"), dict) else {}
+    if status == StoryStatus.shipped:
+        url = extra.get("pr_url") or git.get("pr_url") or ""
+        if extra.get("pr_updated"):
+            return f"**pralph** pushed the requested changes to the pull request: {url}"
+        return f"**pralph** opened a pull request: {url}"
+    if status == StoryStatus.merged:
+        return "**pralph** saw this merged" + (f": {git['pr_url']}" if git.get("pr_url") else ".")
+    if status == StoryStatus.needs_human:
+        return (
+            "**pralph** paused this story — it needs a person.\n\n"
+            f"{reason[:1500] or 'No reason captured.'}\n\n"
+            f"When that is done, run `pralph unblock {story.id}` (or move the issue back to Todo) "
+            "and pralph continues the story."
+        )
     if status == StoryStatus.implemented:
         lines = ["**pralph** implemented this story."]
+        if git.get("branch"):
+            lines[0] += f" It is on the branch `{git['branch']}`, not merged yet."
         if summary:
             lines += ["", summary]
         files = [f for f in extra.get("files_changed") or [] if isinstance(f, str)]
@@ -1321,6 +1368,9 @@ def _comment_for(state: StateManager, story: Story, info: dict, *, closed: bool 
                 lines += ["", "Review: approved" + (f" — {feedback[:500]}" if feedback else "") ]
         return "\n".join(lines)
     if status == StoryStatus.rework:
+        if extra.get("pr_url"):
+            # The feedback is on the pull request already; no need to repeat it here.
+            return f"**pralph** will rework this story: changes were requested on {extra['pr_url']}"
         feedback = state.read_review_feedback(story.id)
         return "**pralph** review requested changes — the story will be reworked." + (
             f"\n\n{feedback}" if feedback else ""

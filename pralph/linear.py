@@ -35,7 +35,7 @@ Transport = Callable[[str, dict], Any]
 # What pralph asks for on every issue it lists (``fields`` of list_issues).
 ISSUE_FIELDS = [
     "id", "uuid", "title", "description", "priority", "url", "status", "statusType",
-    "labels", "assigneeId", "projectMilestone", "parentId", "updatedAt", "archivedAt",
+    "labels", "assigneeId", "projectMilestone", "parentId", "updatedAt", "archivedAt", "gitBranchName",
 ]
 
 # Every tool the client calls, with the arguments it passes — lets a check
@@ -511,7 +511,7 @@ class LinearClient:
         if not all(k in node for k in ("uuid", "status", "statusType", "url")):
             # The save answered with less than we track: read the rest.
             node = {**node, **(self.call("get_issue", id=node.get("uuid") or node["id"],
-                                         fields=["id", "uuid", "title", "url", "status", "statusType"]) or {})}
+                                         fields=["id", "uuid", "title", "url", "status", "statusType", "gitBranchName"]) or {})}
         return _flatten_issue(node)
 
     def create_comment(self, issue_id: str, body: str) -> None:
@@ -561,6 +561,7 @@ def _flatten_issue(node: dict) -> dict:
         # An issue's labels come as bare names.
         "labels": [str(lb.get("name", "")) if isinstance(lb, dict) else str(lb) for lb in labels],
         "updated_at": node.get("updatedAt") or "",
+        "branch": node.get("gitBranchName") or "",
         "blocked_by": [],
         "relations_truncated": True,
     }
