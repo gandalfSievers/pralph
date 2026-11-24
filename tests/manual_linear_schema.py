@@ -25,12 +25,15 @@ from pralph.linear import API_URL, DOCUMENTS  # noqa: E402
 # Input fields pralph puts into variables — document validation doesn't cover those.
 INPUT_FIELDS = {
     "ProjectCreateInput": ["name", "teamIds", "description", "content"],
-    "IssueCreateInput": ["teamId", "title", "description", "projectId", "parentId", "priority", "stateId"],
+    "IssueCreateInput": ["teamId", "title", "description", "projectId", "parentId", "priority", "stateId",
+                         "assigneeId", "projectMilestoneId", "labelIds"],
     "IssueUpdateInput": ["stateId"],
     "CommentCreateInput": ["issueId", "body"],
     "IssueRelationCreateInput": ["issueId", "relatedIssueId", "type"],
     "ProjectFilter": ["name", "slugId"],
     "StringComparator": ["eq", "eqIgnoreCase"],
+    "IssueLabelFilter": ["name"],
+    "UserFilter": ["name", "displayName", "email", "or"],
 }
 
 

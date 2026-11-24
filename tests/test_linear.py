@@ -47,11 +47,24 @@ class FakeLinear:
             {"id": "st-canceled", "name": "Canceled", "type": "canceled", "position": 6},
         ]
         self.projects: dict[str, dict] = {}
+        self.milestones = [{"id": "ms-base", "name": "Base work"}, {"id": "ms-launch", "name": "Launch"}]
+        self.labels = [
+            {"id": "lb-shop", "name": "repo:shop", "team": None},
+            {"id": "lb-shop-eng", "name": "repo:shop", "team": {"id": "team-eng"}},
+            {"id": "lb-shop-ops", "name": "repo:shop", "team": {"id": "team-ops"}},
+            {"id": "lb-app", "name": "repo:app", "team": None},
+        ]
+        self.users = [
+            {"id": "u1", "name": "Dev", "displayName": "dev", "email": "dev@example.com"},
+            {"id": "u2", "name": "Sam Lee", "displayName": "sam", "email": "sam@example.com"},
+            {"id": "u3", "name": "Sam Lee", "displayName": "samuel", "email": "samuel@example.com"},
+        ]
         self.issues: dict[str, dict] = {}       # id → issue
         self.relations: list[tuple[str, str]] = []  # (blocker id, blocked id)
         self.comments: list[tuple[str, str]] = []   # (issue identifier, body)
         self.page_size = page_size
         self.calls: list[str] = []
+        self.mutation_log: list[tuple[str, dict]] = []
         self.failures: list[dict | Exception] = []  # consumed one per call
         self.truncated: set[str] = set()  # issue ids whose relation list is cut off
         self._counter = 0
@@ -61,6 +74,8 @@ class FakeLinear:
     def __call__(self, query: str, variables: dict) -> dict:
         name = next(k for k, doc in L.DOCUMENTS.items() if doc == query)
         self.calls.append(name)
+        if name.endswith(("_create", "_update")):
+            self.mutation_log.append((name, variables))
         if self.failures:
             failure = self.failures.pop(0)
             if isinstance(failure, Exception):
@@ -109,6 +124,9 @@ class FakeLinear:
             "trashed": issue.get("trashed"),
             "state": {"id": state["id"], "name": state["name"], "type": state["type"]},
             "parent": {"id": issue["parentId"]} if issue.get("parentId") else None,
+            "assignee": {"id": issue["assigneeId"]} if issue.get("assigneeId") else None,
+            "projectMilestone": {"id": issue["projectMilestoneId"]} if issue.get("projectMilestoneId") else None,
+            "labels": {"nodes": [{"id": lb} for lb in issue.get("labelIds") or []]},
             "inverseRelations": {
                 "nodes": [] if issue["id"] in self.truncated else [
                     {"type": "blocks", "issue": {"id": blocker}}
@@ -129,6 +147,23 @@ class FakeLinear:
             "nodes": [self._issue_node(i) for i in page],
             "pageInfo": {"hasNextPage": end < len(issues), "endCursor": str(end)},
         }}}
+
+    def _milestones(self, v: dict) -> dict:
+        if v["id"] not in self.projects:
+            return {"project": None}
+        return {"project": {"projectMilestones": {"nodes": self.milestones}}}
+
+    def _labels(self, v: dict) -> dict:
+        name = v["filter"]["name"]["eqIgnoreCase"].lower()
+        return {"issueLabels": {"nodes": [lb for lb in self.labels if lb["name"].lower() == name]}}
+
+    def _users(self, v: dict) -> dict:
+        found = [
+            u for u in self.users
+            if any(str(u[field]).lower() == cond[field]["eqIgnoreCase"].lower()
+                   for cond in v["filter"]["or"] for field in cond)
+        ]
+        return {"users": {"nodes": found}}
 
     # -- mutations --
 
@@ -153,6 +188,8 @@ class FakeLinear:
             "id": f"issue-{self._counter}", "identifier": identifier, "title": inp["title"],
             "description": inp.get("description", ""), "priority": inp.get("priority", 0),
             "projectId": inp.get("projectId"), "parentId": inp.get("parentId"),
+            "assigneeId": inp.get("assigneeId"), "projectMilestoneId": inp.get("projectMilestoneId"),
+            "labelIds": list(inp.get("labelIds") or []),
             "stateId": inp.get("stateId") or "st-backlog",  # team default for new issues
             "url": f"https://linear.app/acme/issue/{identifier}",
         }
@@ -192,14 +229,21 @@ class FakeLinear:
         self.find(title_part)["stateId"] = next(s["id"] for s in self.states if s["name"] == state_name)
 
     def add_issue(self, title: str, *, description: str = "", parent: str | None = None,
-                  state: str = "Todo", priority: int = 0) -> dict:
+                  state: str = "Todo", priority: int = 0, assignee: str | None = None,
+                  milestone: str | None = None, labels: tuple[str, ...] = ()) -> dict:
         project_id = next(iter(self.projects))
         self._issue_create({"input": {
             "teamId": self.teams[0]["id"], "title": title, "description": description,
             "projectId": project_id, "parentId": self.find(parent)["id"] if parent else None,
             "stateId": next(s["id"] for s in self.states if s["name"] == state), "priority": priority,
+            "assigneeId": assignee, "projectMilestoneId": milestone, "labelIds": list(labels),
         }})
         return self.find(title)
+
+    def writes_to(self, title_part: str) -> list[str]:
+        """Mutations that touched an issue (by ID in the variables), in order."""
+        issue_id = self.find(title_part)["id"]
+        return [name for name, variables in self.mutation_log if issue_id in json.dumps(variables)]
 
     def comments_on(self, title_part: str) -> list[str]:
         identifier = self.find(title_part)["identifier"]
@@ -950,6 +994,197 @@ class TestPull:
             make_sync(state, fake).pull()
 
 
+# ── scope: a project shared with other repositories and people ────────
+
+
+@pytest.fixture
+def shared(state, fake) -> LinearSync:
+    """A project that people run in Linear: this repo's tickets carry a label,
+    the rest belongs to other repositories."""
+    sync = make_sync(state, fake)
+    sync._ensure_team(None)
+    sync._ensure_project("Platform")
+    fake.add_issue("Checkout flow")                                          # parent, written by a PM
+    fake.add_issue("Cart API", parent="Checkout flow", labels=("lb-shop",), assignee="u1",
+                   milestone="ms-base", description="Carts.\n\n## Done when\n- POST /cart works")
+    fake.add_issue("Cart page", parent="Checkout flow", labels=("lb-app",), assignee="u2", milestone="ms-base")
+    fake.add_issue("Payment API", labels=("lb-shop-eng",), assignee="u2", milestone="ms-launch")
+    fake.add_issue("Push notifications", labels=("lb-app",), assignee="u1", milestone="ms-launch")
+    fake.calls.clear()
+    fake.mutation_log.clear()
+    return sync
+
+
+class TestScope:
+    def titles(self, state) -> set[str]:
+        return {s.title for s in state.load_stories() if s.status != StoryStatus.skipped}
+
+    def test_unscoped_link_takes_every_issue(self, state, fake, shared) -> None:
+        report = shared.pull()
+        assert self.titles(state) == {"Cart API", "Cart page", "Payment API", "Push notifications"}
+        assert report.out_of_scope == 0
+
+    def test_label_scope(self, state, fake, shared) -> None:
+        shared.set_scope(label="repo:shop")
+        assert shared.link.scope["label"] == {"ids": ["lb-shop", "lb-shop-eng"], "name": "repo:shop"}, \
+            "the workspace label and this team's label, not another team's"
+        report = shared.pull()
+        assert self.titles(state) == {"Cart API", "Payment API"}
+        assert report.total == 2 and report.out_of_scope == 2
+        assert stories_by_id(state)[fake.find("Cart API")["identifier"]].acceptance_criteria == ["POST /cart works"]
+
+    def test_milestone_and_assignee_scope(self, state, fake, shared) -> None:
+        shared.set_scope(milestone="base WORK")
+        shared.pull()
+        assert self.titles(state) == {"Cart API", "Cart page"}
+
+        shared.set_scope(assignee="me")
+        assert shared.scope_text() == "milestone 'Base work', assigned to Dev"
+        shared.pull()
+        assert self.titles(state) == {"Cart API"}, "criteria combine"
+
+        shared.set_scope(assignee="sam@example.com", clear=True)
+        shared.pull()
+        assert self.titles(state) == {"Cart page", "Payment API"}
+
+    def test_scope_survives_a_restart(self, state, fake, shared) -> None:
+        shared.set_scope(label="repo:shop", milestone="Launch")
+        again = make_sync(StateManager(str(state.project_dir)), fake, listen=False)
+        assert again.scope_text() == "milestone 'Launch', label 'repo:shop'"
+
+    def test_unknown_scope_values_are_refused(self, state, fake, shared) -> None:
+        with pytest.raises(LinearError, match="no milestone 'Beta' .*'Base work', 'Launch'"):
+            shared.set_scope(milestone="Beta")
+        with pytest.raises(LinearError, match="No label 'nope'"):
+            shared.set_scope(label="nope")
+        with pytest.raises(LinearError, match="No Linear user"):
+            shared.set_scope(assignee="nobody")
+        with pytest.raises(LinearError, match="Several Linear users match 'Sam Lee' .*use the email"):
+            shared.set_scope(assignee="Sam Lee")
+        assert shared.link.scope == {}
+
+    def test_nothing_outside_the_scope_is_written_to(self, state, fake, shared) -> None:
+        shared.set_scope(label="repo:shop")
+        patcher, implemented = fake_claude()
+        with patcher:
+            ps = run_implement_loop(state, max_iterations=10, cooldown=0, phase1=False, tracker=shared)
+        assert ps.completion_reason == "all_stories_done"
+        assert sorted(implemented) == ["Cart API", "Payment API"]
+        assert fake.state_of("Cart API") == "Done" and fake.state_of("Payment API") == "Done"
+        for other in ("Cart page", "Push notifications", "Checkout flow"):
+            assert fake.writes_to(other) == [], f"{other} is not this repo's ticket"
+        assert fake.state_of("Checkout flow") == "Todo", "a parent outside the scope is left to its owners"
+        assert set(fake.mutations()) == {"issue_update", "comment_create"}, "nothing was created"
+
+    def test_issue_leaving_the_scope_is_dropped_and_left_alone(self, state, fake, shared) -> None:
+        shared.set_scope(assignee="me")
+        shared.pull()
+        cart = fake.find("Cart API")
+        state.mark_story_status(cart["identifier"], StoryStatus.in_progress)
+        state.mark_story_status(cart["identifier"], StoryStatus.pending, summary="User interrupted")
+        assert fake.state_of("Cart API") == "Todo"
+
+        cart["assigneeId"] = "u2"  # reassigned to a colleague
+        fake.mutation_log.clear()
+        report = shared.pull()
+        story = stories_by_id(state)[cart["identifier"]]
+        assert story.status == StoryStatus.skipped
+        assert (cart["identifier"], "pending", "skipped",
+                "Issue is outside the Linear scope (assigned to Dev)") in report.status_changes
+        assert fake.writes_to("Cart API") == [], "skipping it locally must not cancel the colleague's ticket"
+
+        # Whatever happens to the story locally, the ticket is not pralph's any more.
+        state.mark_story_status(story.id, StoryStatus.implemented, summary="done anyway")
+        state.mark_story_status(story.id, StoryStatus.error, error_reason="boom")
+        shared.pull()
+        assert fake.writes_to("Cart API") == []
+
+        cart["assigneeId"] = "u1"  # and back
+        shared.pull()
+        assert stories_by_id(state)[cart["identifier"]].status == StoryStatus.pending
+        assert not linear_sync.is_outside(stories_by_id(state)[cart["identifier"]])
+
+    def test_new_stories_are_created_inside_the_scope(self, state, fake, shared) -> None:
+        shared.set_scope(label="repo:shop", milestone="Launch", assignee="me")
+        shared.pull()
+        state.append_stories([Story(id="PAY-001", title="Refunds", content="c", category="PAY")])
+        for title in ("PAY-001", "PAY — Pay stories"):
+            issue = fake.find(title)
+            assert (issue["labelIds"], issue["projectMilestoneId"], issue["assigneeId"]) == (["lb-shop"], "ms-launch", "u1")
+        shared.pull()
+        assert stories_by_id(state)["PAY-001"].status == StoryStatus.pending, "its own ticket is in scope"
+        state.mark_story_status("PAY-001", StoryStatus.implemented)
+        assert fake.state_of("PAY — Pay stories") == "Done", "pralph's own parent issue is in scope too"
+
+    def test_parent_with_open_work_outside_the_scope_is_not_closed(self, state, fake, shared) -> None:
+        fake.find("Checkout flow")["labelIds"] = ["lb-shop"]  # the parent itself is ours
+        shared.set_scope(label="repo:shop")
+        shared.pull()
+        cart = fake.find("Cart API")["identifier"]
+        state.mark_story_status(cart, StoryStatus.in_progress)
+        assert fake.state_of("Checkout flow") == "In Progress"
+        state.mark_story_status(cart, StoryStatus.implemented)
+        assert fake.state_of("Checkout flow") == "In Progress", "'Cart page' (another repo) is still open"
+
+        fake.move("Cart page", "Done")
+        shared.pull()
+        assert fake.state_of("Checkout flow") == "Done"
+
+    def test_relations_to_issues_outside_the_scope_are_not_created(self, state, fake, shared) -> None:
+        shared.pull()  # unscoped: every issue is a story
+        ids = {s.title: s.id for s in state.load_stories()}
+        state.update_story(ids["Cart API"], lambda s: s.dependencies.append(ids["Cart page"]), notify=False)
+        shared.set_scope(label="repo:shop")
+        shared.pull()
+        assert fake.relations == []
+
+    def test_empty_scope_match_is_called_out(self, state, fake) -> None:
+        messages: list[str] = []
+        sync = make_sync(state, fake)
+        sync._echo = messages.append
+        sync._ensure_team(None)
+        sync._ensure_project("Platform")
+        fake.add_issue("Cart API", labels=("lb-app",))
+        sync.set_scope(label="repo:shop")
+        sync.pull()
+        assert any("no issue of the project matches the scope (label 'repo:shop')" in m for m in messages)
+
+    def test_story_id_names_a_ticket_this_checkout_has_not_seen(self, state, fake, shared) -> None:
+        shared.set_scope(label="repo:shop")
+        identifier = fake.find("Payment API")["identifier"]
+        patcher, implemented = fake_claude()
+        with patcher:
+            ps = run_implement_loop(state, story_id=identifier.lower(), cooldown=0, phase1=False, tracker=shared)
+        assert ps.completion_reason == "single_story_done" and implemented == ["Payment API"]
+        assert fake.state_of("Payment API") == "Done" and fake.state_of("Cart API") == "Todo"
+
+    def test_story_id_outside_the_scope_warns_and_does_not_write(self, state, fake, shared) -> None:
+        shared.pull()
+        shared.set_scope(label="repo:shop")
+        messages: list[str] = []
+        shared._echo = messages.append
+        patcher, implemented = fake_claude()
+        with patcher:
+            run_implement_loop(state, story_id=fake.find("Cart page")["identifier"], cooldown=0,
+                               phase1=False, tracker=shared)
+        assert implemented == ["Cart page"], "an explicit request is carried out"
+        assert any("outside the scope (label 'repo:shop') — its ticket will not be updated" in m for m in messages)
+        assert fake.writes_to("Cart page") == []
+
+    def test_rejected_single_story_is_reworked_with_the_ticket_in_progress(self, state, fake, shared) -> None:
+        shared.set_scope(label="repo:shop")
+        seen: list[str] = []
+        patcher, implemented = fake_claude(on_story=lambda t: seen.append(fake.state_of("Cart API")),
+                                           reject_once="Cart API")
+        with patcher:
+            ps = run_implement_loop(state, story_id=fake.find("Cart API")["identifier"], cooldown=0,
+                                    phase1=False, tracker=shared)
+        assert ps.completion_reason == "single_story_done" and implemented == ["Cart API", "Cart API"]
+        assert seen == ["In Progress", "In Progress"] and fake.state_of("Cart API") == "Done"
+        comments = fake.comments_on("Cart API")
+        assert len(comments) == 2 and "No tests" in comments[0] and "implemented this story" in comments[1]
+
+
 # ── execution off Linear ──────────────────────────────────────────────
 
 
@@ -1092,6 +1327,35 @@ class TestWiring:
     def test_cli_implement_refuses_to_bypass_a_linked_project_silently(self, state, fake, pushed) -> None:
         result = CliRunner().invoke(main, ["--project-dir", str(state.project_dir), "implement"])
         assert result.exit_code == 1 and "LINEAR_API_KEY" in result.output
+
+    def test_cli_link_with_scope_and_scope_command(self, state, fake, shared, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("LINEAR_API_KEY", "lin_api_x")
+        clone = tmp_path / "clone"
+        clone.mkdir()
+        url = next(iter(fake.projects.values()))["url"]
+        cli = ["--project-dir", str(clone), "linear"]
+        with patch("pralph.cli.LinearClient", lambda key: LinearClient(key, transport=fake)):
+            bad = CliRunner().invoke(main, [*cli, "link", url, "--milestone", "Beta"])
+            assert bad.exit_code == 1 and "no milestone 'Beta'" in bad.output
+            assert not (clone / ".pralph" / "linear.json").exists(), "no unscoped link is left behind"
+
+            result = CliRunner().invoke(main, [*cli, "link", url, "--label", "repo:shop", "--assignee", "me"])
+            assert result.exit_code == 0, result.output
+            assert "scope: assigned to Dev, label 'repo:shop'" in result.output
+            assert "1 issues: 1 new" in result.output and "3 issues outside the scope left alone" in result.output
+
+            shown = CliRunner().invoke(main, [*cli, "scope"])
+            assert "scope: assigned to Dev, label 'repo:shop'" in shown.output
+
+            widened = CliRunner().invoke(main, [*cli, "scope", "--clear", "--label", "repo:shop"])
+            assert widened.exit_code == 0, widened.output
+            assert "scope: label 'repo:shop'" in widened.output and "2 issues: 1 new" in widened.output
+
+            status = CliRunner().invoke(main, [*cli, "status"])
+            assert "scope: label 'repo:shop'" in status.output and "issues: 2" in status.output
+
+            cleared = CliRunner().invoke(main, [*cli, "scope", "--clear"])
+            assert "scope: the whole project" in cleared.output and "4 issues: 2 new" in cleared.output
 
     def test_cli_status(self, state, fake, pushed) -> None:
         state.mark_story_status("DB-001", StoryStatus.in_progress)

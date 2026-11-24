@@ -484,6 +484,8 @@ def implement(ctx, story_id, phase1, review, compound, prompt, use_linear, reset
         click.echo(f"  global: on (domains: {', '.join(domains) or 'none detected'})")
     if tracker is not None:
         click.echo(f"  linear: {tracker.link.project_name} ({tracker.link.team_key}) {tracker.link.project_url}")
+        if tracker.link.scope:
+            click.echo(f"  linear scope: {tracker.scope_text()}")
     if state.spec_mode:
         click.echo(f"  spec-driven: {', '.join(sp.name for sp in spec_lib.list_specs(state)) or 'no specs yet'}")
     if story_id:
@@ -798,6 +800,19 @@ def _echo_pull(report: linear_sync.PullReport) -> None:
     click.echo(f"  {report.total} issues: {len(report.new)} new, {report.updated} updated, "
                f"{len(report.status_changes)} status changes, {report.pushed} pushed back"
                + (f", {report.relations_created} blocking relations created" if report.relations_created else ""))
+    if report.out_of_scope:
+        click.echo(click.style(f"  {report.out_of_scope} issues outside the scope left alone", dim=True))
+
+
+def _scope_options(fn):
+    """--milestone / --assignee / --label, shared by 'linear link' and 'linear scope'."""
+    for decorator in reversed([
+        click.option("--milestone", default=None, help="Only issues in this project milestone"),
+        click.option("--assignee", default=None, help="Only issues assigned to this user: 'me', a name or an email"),
+        click.option("--label", default=None, help="Only issues with this label"),
+    ]):
+        fn = decorator(fn)
+    return fn
 
 
 @main.group(cls=click.Group)
@@ -856,11 +871,16 @@ def linear_pull(ctx):
 @linear.command("link")
 @click.argument("project")
 @click.option("--team", default=None, help="Linear team key, if the project belongs to several teams")
+@_scope_options
 @click.pass_context
-def linear_link(ctx, project, team):
+def linear_link(ctx, project, team, milestone, assignee, label):
     """Attach this checkout to an existing Linear project (URL, ID or name).
 
     Use this on a fresh clone: the backlog is rebuilt from the tickets.
+
+    If the project is shared with other repositories or other people, scope
+    the link with --milestone, --assignee and/or --label: only matching issues
+    become work, and nothing outside the scope is written to.
     """
     state, sync = _linear_sync(ctx)
     if sync.linked:
@@ -871,6 +891,47 @@ def linear_link(ctx, project, team):
     try:
         sync.link_project(project, team_key=team)
         click.echo(f"  project: {sync.link.project_name} ({sync.link.team_key}) {sync.link.project_url}")
+        if milestone or assignee or label:
+            try:
+                sync.set_scope(milestone=milestone, assignee=assignee, label=label)
+            except LinearError:
+                # Don't leave an unscoped link behind: the next implement would take every issue.
+                state.linear_link_path.unlink(missing_ok=True)
+                raise
+            click.echo(f"  scope: {sync.scope_text()}")
+        report = sync.pull()
+    except LinearError as e:
+        raise click.ClickException(str(e))
+    _echo_pull(report)
+
+
+@linear.command("scope")
+@_scope_options
+@click.option("--clear", is_flag=True, help="Drop the current scope first (alone: back to the whole project)")
+@click.pass_context
+def linear_scope(ctx, milestone, assignee, label, clear):
+    """Show or change which issues of the linked project are this checkout's work.
+
+    An issue is in scope when it matches every criterion. Issues outside the
+    scope are never turned into stories and never written to. Criteria that
+    are not given stay as they are; --clear drops them.
+
+    \b
+      pralph linear scope --label pralph
+      pralph linear scope --milestone "Base work" --assignee me
+      pralph linear scope --clear
+    """
+    changing = bool(milestone or assignee or label or clear)
+    state, sync = _linear_sync(ctx, need_key=changing)
+    if not sync.linked:
+        raise click.ClickException("Not linked to a Linear project. Run 'pralph linear push' or 'pralph linear link'.")
+    if not changing:
+        click.echo(f"  scope: {sync.scope_text() or 'the whole project'}")
+        return
+    click.echo("pralph linear scope")
+    try:
+        sync.set_scope(milestone=milestone, assignee=assignee, label=label, clear=clear)
+        click.echo(f"  scope: {sync.scope_text() or 'the whole project'}")
         report = sync.pull()
     except LinearError as e:
         raise click.ClickException(str(e))
@@ -887,11 +948,13 @@ def linear_status(ctx):
         return
     click.echo(f"  project: {sync.link.project_name} {sync.link.project_url}")
     click.echo(f"  team: {sync.link.team_key}")
+    if sync.link.scope:
+        click.echo(f"  scope: {sync.scope_text()}")
     click.echo(f"  parent issues: {', '.join(sorted(sync.link.epics)) or 'none'}")
     by_state: dict[str, int] = {}
     for story in state.load_stories():
         link = linear_sync.story_link(story)
-        if link:
+        if link and not linear_sync.is_outside(story):
             name = link.get("state") or link.get("state_type") or "?"
             by_state[name] = by_state.get(name, 0) + 1
     click.echo(f"  issues: {sum(by_state.values())}"

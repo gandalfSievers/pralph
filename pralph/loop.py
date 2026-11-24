@@ -1107,6 +1107,9 @@ def run_implement_loop(
 
     # If specific story requested, just implement it
     if story_id:
+        if tracker is not None:
+            # After the sync, so a ticket this checkout hasn't seen yet can be named.
+            story_id = tracker.resolve_story_id(story_id)
         return _implement_single(state, story_id, model=model, system_prompt=system_prompt,
                                  tools=tools, user_prompt=user_prompt, review=review,
                                  compound=compound, save_global=save_global, verbose=verbose,

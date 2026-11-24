@@ -337,6 +337,29 @@ pralph implement --no-linear          # run without touching Linear
 pralph linear link https://linear.app/acme/project/shop-1a2b3c4d5e6f
 ```
 
+#### Sharing a project: scope
+
+A Linear project often holds more than one repository's work, and other people's tickets. Scope the link, and only matching issues become work:
+
+```bash
+pralph linear link https://linear.app/acme/project/platform-1a2b3c4d5e6f --label repo:shop
+pralph linear scope --milestone "Base work" --assignee me   # change it later; criteria combine
+pralph linear scope                                         # show it
+pralph linear scope --clear                                 # back to the whole project
+```
+
+| Option | In scope |
+|---|---|
+| `--milestone NAME` | Issues in this project milestone |
+| `--assignee me\|NAME\|EMAIL` | Issues assigned to this user |
+| `--label NAME` | Issues with this label (a label of the team or of the workspace) |
+
+An issue has to match every criterion that is set. Everything else in the project is left alone: it never becomes a story, and pralph never writes to it — no state change, no comment, no relation. That includes parent issues: a parent outside the scope is not moved, and a parent inside it is not closed while it has open sub-issues outside the scope.
+
+An issue that leaves the scope — reassigned, moved to another milestone, label removed — is dropped from the run (its story is skipped locally) and its ticket is not touched again; if it comes back, so does the story. Tickets pralph creates for new stories get the milestone, assignee and label of the scope, so they are part of it.
+
+`pralph implement --story-id ENG-123` works with a scope as well, and accepts a ticket this checkout has not seen yet.
+
 The link is stored in `.pralph/linear.json`. The API key is read from `LINEAR_API_KEY`, or from `linear_api_key` in `~/.pralph/config.json` — don't put it in a config file that gets committed.
 
 Linear mode and spec-driven mode combine: the project content is a snapshot of the spec, and each sub-issue names the requirements it implements.
@@ -505,7 +528,8 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 |---|---|
 | `linear push` | Create the Linear project, parent issues, sub-issues and blocking relations for everything not in Linear yet |
 | `linear pull` | Sync the backlog from the Linear project |
-| `linear link PROJECT` | Attach to an existing Linear project (URL, ID or name) and rebuild the backlog from it |
+| `linear link PROJECT` | Attach to an existing Linear project (URL, ID or name) and rebuild the backlog from it. Takes the scope options below |
+| `linear scope` | Show or change which issues of the project are this checkout's work |
 | `linear status` | Show the link and the ticket states as of the last sync |
 
 `linear push` options:
@@ -515,6 +539,16 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `--team` | config `linear_team`, or the only team | Linear team key (e.g. `ENG`) |
 | `--project` | title of the plan | Name of the Linear project |
 | `--dry-run` | off | Show what would be created without calling Linear |
+
+`linear link` and `linear scope` options:
+
+| Option | Default | Description |
+|---|---|---|
+| `--milestone` | — | Only issues in this project milestone |
+| `--assignee` | — | Only issues assigned to this user: `me`, a name or an email |
+| `--label` | — | Only issues with this label |
+| `--clear` | off | `linear scope` only: drop the current scope first |
+| `--team` | — | `linear link` only: team key, if the project belongs to several teams |
 
 #### `review`
 
@@ -586,7 +620,7 @@ specs/                  # Spec-driven mode: the specification (commit this)
   domains.txt           # Override auto-detected domains (optional)
   design-doc.md         # Design document (Phase 1)
   spec-baseline.json    # Spec-driven mode: requirement text the backlog was derived from
-  linear.json           # Linear mode: linked team, project and parent issues
+  linear.json           # Linear mode: linked team, project, scope and parent issues
   guardrails.md         # Coding standards and constraints
   stories.jsonl         # Story backlog
   status.jsonl          # Story status history

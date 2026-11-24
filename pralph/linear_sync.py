@@ -10,6 +10,11 @@ From then on the tickets are the source of truth for *what* to work on:
 * story status changes are pushed back as workflow transitions and comments
   (wired through ``StateManager.add_story_listener``).
 
+The link can be scoped to a milestone, an assignee and/or a label
+(``LinearLink.scope``). Then only matching issues become work, and nothing
+outside the scope is ever written to — the way to share a Linear project with
+other repositories and other people.
+
 State sync is three-way. Each story remembers the Linear state it last saw
 (``metadata.linear.state_type``). If Linear differs from that, somebody moved
 the ticket and Linear wins; if it doesn't, any local change (an update that
@@ -75,6 +80,7 @@ _STATUS_CLASS = {
 }
 # Stories that were dropped from the plan are not worth a ticket.
 _NOT_IN_PLAN = (StoryStatus.skipped, StoryStatus.duplicate)
+_SCOPE_KINDS = ("milestone", "assignee", "label")
 _ACTIONABLE = (StoryStatus.pending, StoryStatus.rework, StoryStatus.error, StoryStatus.in_progress)
 
 
@@ -92,6 +98,10 @@ class LinearLink:
     project_url: str = ""
     # category → {id, identifier, url, state_type} of the parent issue
     epics: dict[str, dict] = field(default_factory=dict)
+    # Which issues of the project are this checkout's work. Any of:
+    #   milestone {id, name} · assignee {id, name} · label {ids, name}
+    # Empty: every issue of the project.
+    scope: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> LinearLink | None:
@@ -107,6 +117,9 @@ class LinearLink:
         link = cls(**known)
         if not isinstance(link.epics, dict):
             link.epics = {}
+        if not isinstance(link.scope, dict):
+            link.scope = {}
+        link.scope = {k: v for k, v in link.scope.items() if k in _SCOPE_KINDS and isinstance(v, dict)}
         return link
 
     def save(self, path: Path) -> None:
@@ -134,6 +147,7 @@ class PullReport:
     pushed: int = 0
     relations_created: int = 0  # dependencies that had not made it to Linear yet
     total: int = 0
+    out_of_scope: int = 0  # issues of the project that the scope leaves out
 
 
 # ── pure helpers (story ↔ issue) ─────────────────────────────────────
@@ -156,11 +170,18 @@ def story_link(story: Story) -> dict | None:
 def desired_class(story: Story) -> str | None:
     """Workflow state class the story's status calls for; None = not pralph's ticket to move."""
     link = story_link(story)
-    if link and (link.get("claimed") or link.get("container")):
+    if link and (link.get("claimed") or link.get("container") or link.get("outside")):
         # Claimed: somebody else is working on it. Container: it was broken down
-        # into sub-issues in Linear. Either way people own the ticket's state.
+        # into sub-issues in Linear. Outside: it left the project or the scope.
+        # Either way people own the ticket's state.
         return None
     return _STATUS_CLASS[story.status]
+
+
+def is_outside(story: Story) -> bool:
+    """The story's ticket is not (or no longer) in the linked project and scope: hands off."""
+    link = story_link(story)
+    return bool(link and link.get("outside"))
 
 
 def issue_title(story: Story) -> str:
@@ -474,6 +495,115 @@ class LinearSync:
         if not self.linked:
             raise LinearError("Not linked to a Linear project — run 'pralph linear push' or 'pralph linear link'")
 
+    # -- scope --
+
+    def set_scope(
+        self,
+        *,
+        milestone: str | None = None,
+        assignee: str | None = None,
+        label: str | None = None,
+        clear: bool = False,
+    ) -> None:
+        """Restrict the link to a milestone, an assignee and/or a label of the project.
+
+        Criteria that are not given stay as they are, unless ``clear``. An
+        issue is in scope when it matches all of them.
+        """
+        self._require_link()
+        scope = {} if clear else dict(self.link.scope)
+        if milestone:
+            scope["milestone"] = self._resolve_milestone(milestone)
+        if assignee:
+            scope["assignee"] = self._resolve_assignee(assignee)
+        if label:
+            scope["label"] = self._resolve_label(label)
+        self.link.scope = scope
+        self._save_link()
+
+    def _resolve_milestone(self, name: str) -> dict:
+        milestones = self.client.project_milestones(self.link.project_id)
+        wanted = name.strip().lower()
+        match = [m for m in milestones if str(m.get("name", "")).strip().lower() == wanted]
+        if not match:
+            names = ", ".join(repr(m.get("name", "")) for m in milestones) or "none"
+            raise LinearError(f"Project {self.link.project_name!r} has no milestone {name!r} (available: {names})")
+        return {"id": match[0]["id"], "name": match[0].get("name", name)}
+
+    def _resolve_assignee(self, reference: str) -> dict:
+        reference = reference.strip()
+        if reference.lower() == "me":
+            viewer = self.client.viewer()
+            if not viewer.get("id"):
+                raise LinearError("Linear did not say who this API key belongs to")
+            return {"id": viewer["id"], "name": viewer.get("name") or "me"}
+        users = self.client.find_users(reference)
+        if not users:
+            raise LinearError(f"No Linear user with the name or email {reference!r}")
+        if len(users) > 1:
+            names = ", ".join(str(u.get("email") or u.get("name")) for u in users)
+            raise LinearError(f"Several Linear users match {reference!r} ({names}) — use the email address")
+        return {"id": users[0]["id"], "name": users[0].get("name") or reference}
+
+    def _resolve_label(self, name: str) -> dict:
+        # A label of this team, or a workspace label. A team label and a
+        # workspace label can share a name; an issue with either is in scope.
+        labels = [
+            lb for lb in self.client.find_labels(name.strip())
+            if lb["team_id"] in (None, self.link.team_id)
+        ]
+        if not labels:
+            raise LinearError(f"No label {name!r} in team {self.link.team_key} or the workspace")
+        return {"ids": [lb["id"] for lb in labels], "name": labels[0]["name"] or name}
+
+    def scope_text(self) -> str:
+        """The scope in words ('' when the whole project is in scope)."""
+        scope = self.link.scope
+        parts = []
+        if scope.get("milestone"):
+            parts.append(f"milestone {scope['milestone'].get('name', '?')!r}")
+        if scope.get("assignee"):
+            parts.append(f"assigned to {scope['assignee'].get('name', '?')}")
+        if scope.get("label"):
+            parts.append(f"label {scope['label'].get('name', '?')!r}")
+        return ", ".join(parts)
+
+    def _in_scope(self, issue: dict) -> bool:
+        scope = self.link.scope
+        if scope.get("milestone") and issue.get("milestone_id") != scope["milestone"].get("id"):
+            return False
+        if scope.get("assignee") and issue.get("assignee_id") != scope["assignee"].get("id"):
+            return False
+        if scope.get("label") and not set(issue.get("label_ids") or ()) & set(scope["label"].get("ids") or ()):
+            return False
+        return True
+
+    def _scope_fields(self) -> dict:
+        """What puts an issue pralph creates into the scope."""
+        scope = self.link.scope
+        return {
+            "milestone_id": (scope.get("milestone") or {}).get("id"),
+            "assignee_id": (scope.get("assignee") or {}).get("id"),
+            "label_ids": ((scope.get("label") or {}).get("ids") or [])[:1] or None,
+        }
+
+    def resolve_story_id(self, reference: str) -> str:
+        """Story ID for a story ID or Linear identifier (ENG-123), as of the last sync."""
+        stories = self.state.load_stories()
+        story = next((s for s in stories if s.id == reference), None)
+        if story is None:
+            story = next(
+                (s for s in stories
+                 if (link := story_link(s)) and str(link.get("identifier", "")).upper() == reference.upper()),
+                None,
+            )
+        if story is None:
+            return reference
+        if is_outside(story):
+            where = f"the scope ({self.scope_text()})" if self.link.scope else "the Linear project"
+            self._warn(f"{story.id} is outside {where} — its ticket will not be updated")
+        return story.id
+
     # -- creating issues --
 
     def _ensure_epic(self, category: str) -> dict:
@@ -488,10 +618,11 @@ class LinearSync:
                 "pralph works through the sub-issues and closes this one when they are done."
             ),
             project_id=self.link.project_id,
+            **self._scope_fields(),
         )
         epic = {
             "id": issue["id"], "identifier": issue["identifier"],
-            "url": issue["url"], "state_type": issue["state_type"],
+            "url": issue["url"], "state_type": issue["state_type"], "in_scope": True,
         }
         self.link.epics[category] = epic
         self._save_link()
@@ -529,6 +660,7 @@ class LinearSync:
             priority=priority_to_linear(story.priority),
             # Open stories take the team's default state for new issues.
             state_id=None if cls == "open" else self._state_for(cls, story.status)["id"],
+            **self._scope_fields(),
         )
         self._remember(story.id, issue)
         return issue
@@ -550,7 +682,8 @@ class LinearSync:
         (``metadata.linear.pending_deps``): until it exists there, the next
         pull must not read its absence as "removed in Linear", and tries again.
         """
-        links = {s.id: story_link(s) for s in stories}
+        # Not for tickets outside the project or scope: a relation writes to both ends.
+        links = {s.id: None if is_outside(s) else story_link(s) for s in stories}
         created = 0
         pending_changes: dict[str, list[str]] = {}
         for story in stories:
@@ -701,9 +834,16 @@ class LinearSync:
         parent_ids = {i["parent_id"] for i in issues if i["parent_id"]}
         epic_ids = {e.get("id") for e in self.link.epics.values()}
         containers = [i for i in issues if i["id"] in parent_ids or i["id"] in epic_ids]
-        work = [i for i in issues if i["id"] not in parent_ids and i["id"] not in epic_ids]
+        leaves = [i for i in issues if i["id"] not in parent_ids and i["id"] not in epic_ids]
+        # Only what is in scope is work. The rest belongs to other people or
+        # other repositories: no story, and never a write.
+        work = [i for i in leaves if self._in_scope(i)]
+        outside = {i["id"] for i in leaves} - {i["id"] for i in work}
         report.total = len(work)
-        container_category = self._refresh_epics(containers)
+        report.out_of_scope = len(outside)
+        if outside and not work:
+            self._warn(f"no issue of the project matches the scope ({self.scope_text()})")
+        container_category = self._refresh_epics(containers, [i for i in leaves if i["id"] in outside])
 
         stories = self.state.load_stories()
         by_issue = {story_link(s)["id"]: s for s in stories if story_link(s)}  # type: ignore[index]
@@ -770,12 +910,20 @@ class LinearSync:
             elif story.to_dict() != before:
                 report.updated += 1
 
-        # Linked stories whose issue is gone (deleted, archived, moved to another project).
-        remote_ids = {i["id"] for i in issues}
+        # Linked stories whose issue is gone (deleted, archived, moved to another
+        # project) or outside the scope (reassigned, other milestone, label removed).
+        # Not this checkout's work any more, and not pralph's ticket to write to.
+        ours = {i["id"] for i in work} | {i["id"] for i in containers}
         for story in stories:
             link = story_link(story)
-            if link and link["id"] not in remote_ids and story.status in _ACTIONABLE:
-                reason = "Issue is no longer in the Linear project"
+            if not link or link["id"] in ours:
+                continue
+            link["outside"] = True
+            if story.status in _ACTIONABLE:
+                reason = (
+                    f"Issue is outside the Linear scope ({self.scope_text()})" if link["id"] in outside
+                    else "Issue is no longer in the Linear project"
+                )
                 entries.append({
                     "story_id": story.id, "status": "skipped", "summary": reason, "source": "linear",
                 })
@@ -799,17 +947,24 @@ class LinearSync:
         # Linear didn't move these, but the local status did (failed push, viewer edit).
         for story in to_push:
             try:
-                self._push_state(story)
-                report.pushed += 1
+                report.pushed += self._push_state(story)
             except LinearError as e:
                 self._warn(f"could not update {story.id} in Linear: {e}")
 
         self._rollup_epics(self.state.load_stories())
         return report
 
-    def _refresh_epics(self, containers: list[dict]) -> dict[str, str]:
-        """Learn about parent issues; returns {issue id: category}."""
+    def _refresh_epics(self, containers: list[dict], outside: list[dict]) -> dict[str, str]:
+        """Learn about parent issues; returns {issue id: category}.
+
+        ``outside``: the issues the scope leaves out. A parent that still has
+        open sub-issues among them is not pralph's to close.
+        """
         by_epic_id = {e.get("id"): cat for cat, e in self.link.epics.items()}
+        open_outside: dict[str, int] = {}
+        for issue in outside:
+            if issue["parent_id"] and state_class(issue["state_type"]) in ("open", "started"):
+                open_outside[issue["parent_id"]] = open_outside.get(issue["parent_id"], 0) + 1
         mapping: dict[str, str] = {}
         changed = False
         for issue in containers:
@@ -823,9 +978,15 @@ class LinearSync:
                     }
                     changed = True
             epic = self.link.epics.get(category, {})
-            if epic.get("id") == issue["id"] and epic.get("state_type") != issue["state_type"]:
-                epic["state_type"] = issue["state_type"]
-                changed = True
+            if epic.get("id") == issue["id"]:
+                seen = {
+                    "state_type": issue["state_type"],
+                    "in_scope": self._in_scope(issue),
+                    "open_outside": open_outside.get(issue["id"], 0),
+                }
+                if any(epic.get(k) != v for k, v in seen.items()):
+                    epic.update(seen)
+                    changed = True
             mapping[issue["id"]] = category
         if changed:
             self._save_link()
@@ -954,6 +1115,8 @@ class LinearSync:
 
     def _sync_ticket(self, story: Story, info: dict) -> None:
         """Move the ticket to where the story's status puts it, and say why."""
+        if is_outside(story):
+            return  # left the project or the scope: not pralph's ticket any more
         self._push_state(story)
         body = _comment_for(self.state, story, info)
         if body:
@@ -965,13 +1128,22 @@ class LinearSync:
         for category, epic in list(self.link.epics.items()):
             if only is not None and category != only:
                 continue
+            if self.link.scope and not epic.get("in_scope"):
+                continue  # a parent outside the scope is somebody else's
             classes = [
                 state_class(story_link(s)["state_type"])  # type: ignore[index]
-                for s in stories if story_category(s) == category and story_link(s)
+                for s in stories if story_category(s) == category and story_link(s) and not is_outside(s)
             ]
             if not classes:
                 continue
-            if all(c in ("completed", "canceled") for c in classes) and "completed" in classes:
+            done = all(c in ("completed", "canceled") for c in classes) and "completed" in classes
+            if done and epic.get("open_outside"):
+                # Our part is done, but sub-issues outside the scope are still
+                # open: not ours to close — and if people closed it, not ours to reopen.
+                if state_class(epic.get("state_type")) != "open":
+                    continue
+                target = "started"
+            elif done:
                 target = "completed"
             elif any(c in ("started", "completed") for c in classes):
                 target = "started"

@@ -21,11 +21,12 @@ from pralph import __version__
 
 API_URL = "https://api.linear.app/graphql"
 
-# Issues per page / relations per issue. Linear rates queries by complexity
-# (nested connections multiply), so keep the product modest. An issue with
-# more relations than this is reported with ``relations_truncated``.
+# Issues per page / relations and labels per issue. Linear rates queries by
+# complexity (nested connections multiply), so keep the product modest. An
+# issue with more relations than this is reported with ``relations_truncated``.
 _PAGE_SIZE = 50
 _RELATIONS_PER_ISSUE = 25
+_LABELS_PER_ISSUE = 20
 
 Transport = Callable[[str, dict], dict]
 
@@ -65,9 +66,12 @@ fragment IssueFields on Issue {
   trashed
   state { id name type }
   parent { id }
+  assignee { id }
+  projectMilestone { id }
+  labels(first: %d) { nodes { id } }
   inverseRelations(first: %d) { nodes { type issue { id } } pageInfo { hasNextPage } }
 }
-""" % _RELATIONS_PER_ISSUE
+""" % (_LABELS_PER_ISSUE, _RELATIONS_PER_ISSUE)
 
 _ISSUE_RESULT = "success issue { id identifier url title state { id name type } }"
 
@@ -104,6 +108,24 @@ query($id: String!, $after: String) {
 }
 """ % _PAGE_SIZE
 
+Q_MILESTONES = """
+query($id: String!) {
+  project(id: $id) { projectMilestones(first: 100) { nodes { id name } } }
+}
+"""
+
+Q_LABELS = """
+query($filter: IssueLabelFilter) {
+  issueLabels(filter: $filter, first: 50) { nodes { id name team { id } } }
+}
+"""
+
+Q_USERS = """
+query($filter: UserFilter) {
+  users(filter: $filter, first: 20) { nodes { id name displayName email } }
+}
+"""
+
 M_PROJECT_CREATE = """
 mutation($input: ProjectCreateInput!) {
   projectCreate(input: $input) { success project { id name url slugId } }
@@ -133,6 +155,9 @@ DOCUMENTS = {
     "project": Q_PROJECT,
     "projects": Q_PROJECTS,
     "project_issues": Q_PROJECT_ISSUES,
+    "milestones": Q_MILESTONES,
+    "labels": Q_LABELS,
+    "users": Q_USERS,
     "project_create": M_PROJECT_CREATE,
     "issue_create": M_ISSUE_CREATE,
     "issue_update": M_ISSUE_UPDATE,
@@ -287,6 +312,23 @@ class LinearClient:
                 return issues
             after = page["endCursor"]
 
+    def project_milestones(self, project_id: str) -> list[dict]:
+        project = self.graphql(Q_MILESTONES, {"id": project_id}).get("project")
+        if project is None:
+            raise LinearError(f"Linear project {project_id} not found")
+        return _nodes(project.get("projectMilestones"))
+
+    def find_labels(self, name: str) -> list[dict]:
+        """Issue labels with this name; each has ``team_id`` (None for a workspace label)."""
+        nodes = _nodes(self.graphql(Q_LABELS, {"filter": {"name": {"eqIgnoreCase": name}}}).get("issueLabels"))
+        return [{"id": n["id"], "name": n.get("name", ""), "team_id": (n.get("team") or {}).get("id")} for n in nodes]
+
+    def find_users(self, reference: str) -> list[dict]:
+        """Users whose name, display name or email is ``reference``."""
+        match = {"eqIgnoreCase": reference}
+        flt = {"or": [{"name": match}, {"displayName": match}, {"email": match}]}
+        return _nodes(self.graphql(Q_USERS, {"filter": flt}).get("users"))
+
     # -- writes --
 
     def create_project(self, *, name: str, team_id: str, description: str = "", content: str = "") -> dict:
@@ -310,6 +352,9 @@ class LinearClient:
         parent_id: str | None = None,
         priority: int | None = None,
         state_id: str | None = None,
+        assignee_id: str | None = None,
+        milestone_id: str | None = None,
+        label_ids: list[str] | None = None,
     ) -> dict:
         payload: dict[str, Any] = {"teamId": team_id, "title": title}
         if description:
@@ -322,6 +367,12 @@ class LinearClient:
             payload["priority"] = priority
         if state_id:
             payload["stateId"] = state_id
+        if assignee_id:
+            payload["assigneeId"] = assignee_id
+        if milestone_id:
+            payload["projectMilestoneId"] = milestone_id
+        if label_ids:
+            payload["labelIds"] = label_ids
         result = self.graphql(M_ISSUE_CREATE, {"input": payload}).get("issueCreate") or {}
         if not result.get("success") or not result.get("issue"):
             raise LinearError(f"Linear did not create issue {title!r}")
@@ -377,6 +428,9 @@ def _flatten_issue(node: dict) -> dict:
         "state_name": state.get("name", ""),
         "state_type": state.get("type", ""),
         "parent_id": (node.get("parent") or {}).get("id"),
+        "assignee_id": (node.get("assignee") or {}).get("id"),
+        "milestone_id": (node.get("projectMilestone") or {}).get("id"),
+        "label_ids": [n["id"] for n in _nodes(node.get("labels")) if n.get("id")],
         "blocked_by": blocked_by,
         "relations_truncated": bool(relations_page.get("hasNextPage")),
     }
