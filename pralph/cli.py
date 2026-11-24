@@ -788,8 +788,8 @@ def _linear_sync(ctx: click.Context, *, need_key: bool = True) -> tuple[StateMan
     api_key, oauth = linear_oauth.credentials(state.get_config, state.home_dir)
     if need_key and not api_key and oauth is None:
         raise click.ClickException(
-            "LINEAR_API_KEY is not set. Create a personal API key in Linear "
-            "(Settings → Security & access) and export it, or log in with 'pralph linear oauth'."
+            "Not logged in to Linear. Run 'pralph linear oauth' "
+            "(or set LINEAR_API_KEY to a personal API key)."
         )
     link = linear_sync.LinearLink.load(state.linear_link_path)
     client = LinearClient("", oauth=oauth) if oauth is not None else LinearClient(api_key)
@@ -970,34 +970,26 @@ def linear_scope(ctx, milestone, assignee, label, clear, read_mostly):
 
 
 @linear.command("oauth")
-@click.option("--client-id", default=None,
-              help="Client ID of your Linear OAuth application [default: LINEAR_OAUTH_CLIENT_ID, config, or the last login]")
 @click.option("--port", default=linear_oauth.DEFAULT_PORT, show_default=True, type=int,
-              help="Local port for the callback (http://localhost:PORT/oauth/callback)")
-@click.option("--actor", type=click.Choice(["user", "app"]), default="user", show_default=True,
-              help="Act as yourself, or as the application (comments and changes show the app's name)")
-@click.option("--scope", "scopes", default=linear_oauth.DEFAULT_SCOPES, show_default=True,
-              help="Comma-separated OAuth scopes to ask for")
+              help="Local port the browser is sent back to after the approval")
 @click.option("--no-browser", is_flag=True, help="Print the URL instead of opening a browser")
 @click.option("--logout", is_flag=True, help="Revoke the stored login and delete it")
 @click.pass_context
-def linear_oauth_login(ctx, client_id, port, actor, scopes, no_browser, logout):
-    """Log in to Linear with OAuth instead of a personal API key.
+def linear_oauth_login(ctx, port, no_browser, logout):
+    """Log in to Linear through the browser. Nothing to set up in Linear first.
 
-    Needs an OAuth application in your Linear workspace (Settings → API) whose
-    callback URL is http://localhost:8765/oauth/callback.
-    Only its client ID is used — the login is done with PKCE, no secret.
+    pralph registers itself with Linear's MCP server, opens the browser for
+    your approval and receives the answer on a local port.
 
     The login is stored in ~/.pralph/linear-oauth.json and refreshed
     automatically. A LINEAR_API_KEY, if set, takes precedence over it.
     """
     state = _state(ctx)
     path = linear_oauth.token_path(state.home_dir)
-    get = state.get_config
     click.echo("pralph linear oauth")
 
     if logout:
-        session = linear_oauth.OAuthSession.load(path, client_secret=linear_oauth.client_secret(get))
+        session = linear_oauth.OAuthSession.load(path)
         if session is None:
             click.echo("  Not logged in.")
             return
@@ -1005,21 +997,9 @@ def linear_oauth_login(ctx, client_id, port, actor, scopes, no_browser, logout):
         click.echo("  Logged out" + ("" if revoked else " locally — Linear could not be reached to revoke the token"))
         return
 
-    client = client_id or linear_oauth.client_id(get, state.home_dir)
-    callback = linear_oauth.redirect_uri(port)
-    if not client:
-        raise click.ClickException(
-            "No OAuth client ID.\n"
-            f"  1. Create an OAuth application in Linear: {linear_oauth.NEW_APPLICATION_URL}\n"
-            f"     with the callback URL {callback}\n"
-            "  2. Run: pralph linear oauth --client-id <its client ID>\n"
-            "     (or set LINEAR_OAUTH_CLIENT_ID, or linear_oauth_client_id in ~/.pralph/config.json)"
-        )
-    click.echo(f"  callback URL: {callback} " + click.style("(must be registered in the OAuth application)", dim=True))
     try:
         session = linear_oauth.login(
-            client, path, port=port, scopes=scopes, actor=actor,
-            secret=linear_oauth.client_secret(get),
+            path, port=port,
             open_browser=None if no_browser else linear_oauth.webbrowser.open,
             echo=click.echo,
         )
@@ -1030,11 +1010,9 @@ def linear_oauth_login(ctx, client_id, port, actor, scopes, no_browser, logout):
         raise click.ClickException("Login canceled")
 
     workspace = (viewer.get("organization") or {}).get("name") or "?"
-    click.echo(click.style("  Logged in", fg='green') + f" as {viewer.get('name') or '?'} ({workspace})"
-               + (" — acting as the application" if actor == "app" else ""))
-    click.echo(f"  scopes: {session.scope or scopes}")
+    click.echo(click.style("  Logged in", fg='green') + f" as {viewer.get('name') or '?'} ({workspace})")
     click.echo(f"  stored in {path} — refreshed automatically")
-    if os.environ.get("LINEAR_API_KEY", "").strip() or get("linear_api_key", None):
+    if os.environ.get("LINEAR_API_KEY", "").strip() or state.get_config("linear_api_key", None):
         click.echo(click.style(
             "  A Linear API key is configured and takes precedence — unset LINEAR_API_KEY / linear_api_key to use this login",
             fg='yellow',
@@ -1046,11 +1024,11 @@ def _linear_auth_text(state: StateManager) -> str:
     if api_key:
         return "API key"
     if oauth is None:
-        return "none — set LINEAR_API_KEY or run 'pralph linear oauth'"
+        return "none — run 'pralph linear oauth' (or set LINEAR_API_KEY)"
     from datetime import datetime
 
-    until = f", access token valid until {datetime.fromtimestamp(oauth.expires_at):%Y-%m-%d %H:%M}" if oauth.expires_at else ""
-    return f"OAuth login ({oauth.actor} actor{until}, refreshed automatically)"
+    until = f"access token valid until {datetime.fromtimestamp(oauth.expires_at):%Y-%m-%d %H:%M}, " if oauth.expires_at else ""
+    return f"OAuth login ({until}refreshed automatically)"
 
 
 @linear.command("status")

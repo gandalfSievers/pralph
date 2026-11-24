@@ -1,11 +1,12 @@
 """Tests for the Linear mode: plan → Linear project, execution off the tickets.
 
 Linear itself is replaced by ``FakeLinear``, an in-memory workspace that
-answers the exact GraphQL documents ``pralph.linear`` sends.
+answers the MCP tool calls ``pralph.linear`` makes.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import urllib.error
@@ -32,27 +33,40 @@ from pralph.state import StateManager
 
 
 class FakeLinear:
-    """In-memory Linear: one workspace, teams, workflow states, projects, issues."""
+    """In-memory Linear behind the MCP tools pralph calls.
 
-    def __init__(self, *, teams: list[str] = ("ENG",), page_size: int = 50) -> None:
+    Answers in the shapes Linear's MCP server uses: issues are named by
+    identifier (``id``) and carry their UUID as ``uuid``, labels come as bare
+    names, parents as identifiers, and blocking relations only from get_issue.
+    """
+
+    OPERATIONS = {
+        "whoami": "viewer", "list_teams": "teams", "list_issue_statuses": "states",
+        "get_project": "project", "list_projects": "projects", "list_issues": "project_issues",
+        "get_issue": "issue", "list_milestones": "milestones", "list_issue_labels": "labels",
+        "list_users": "users", "save_project": "project_create", "save_comment": "comment_create",
+    }
+
+    def __init__(self, *, teams: list[str] = ("ENG",), page_size: int | None = None) -> None:
         self.teams = [{"id": f"team-{k.lower()}", "key": k, "name": f"{k} team"} for k in teams]
+        # Listed in no particular order, like the real tool does.
         self.states = [
-            {"id": "st-backlog", "name": "Backlog", "type": "backlog", "position": 0},
-            {"id": "st-todo", "name": "Todo", "type": "unstarted", "position": 1},
-            {"id": "st-progress", "name": "In Progress", "type": "started", "position": 2},
-            {"id": "st-review", "name": "In Review", "type": "started", "position": 3},
-            {"id": "st-done", "name": "Done", "type": "completed", "position": 4},
+            {"id": "st-done", "name": "Done", "type": "completed"},
             # Its own type in Linear, and only reachable through a duplicate-of relation.
-            {"id": "st-dup", "name": "Duplicate", "type": "duplicate", "position": 5},
-            {"id": "st-canceled", "name": "Canceled", "type": "canceled", "position": 6},
+            {"id": "st-dup", "name": "Duplicate", "type": "duplicate"},
+            {"id": "st-todo", "name": "Todo", "type": "unstarted"},
+            {"id": "st-review", "name": "In Review", "type": "started"},
+            {"id": "st-progress", "name": "In Progress", "type": "started"},
+            {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
+            {"id": "st-canceled", "name": "Canceled", "type": "canceled"},
         ]
         self.projects: dict[str, dict] = {}
         self.milestones = [{"id": "ms-base", "name": "Base work"}, {"id": "ms-launch", "name": "Launch"}]
         self.labels = [
             {"id": "lb-shop", "name": "repo:shop", "team": None},
-            {"id": "lb-shop-eng", "name": "repo:shop", "team": {"id": "team-eng"}},
-            {"id": "lb-shop-ops", "name": "repo:shop", "team": {"id": "team-ops"}},
-            {"id": "lb-app", "name": "repo:app", "team": None},
+            {"id": "lb-shop-old", "name": "repo:shop-legacy", "team": None},
+            {"id": "lb-ops", "name": "repo:ops", "team": "team-ops"},
+            {"id": "lb-app", "name": "repo:app", "team": "team-eng"},
         ]
         self.users = [
             {"id": "u1", "name": "Dev", "displayName": "dev", "email": "dev@example.com"},
@@ -65,155 +79,178 @@ class FakeLinear:
         self.page_size = page_size
         self.calls: list[str] = []
         self.mutation_log: list[tuple[str, dict]] = []
-        self.failures: list[dict | Exception] = []  # consumed one per call
-        self.truncated: set[str] = set()  # issue ids whose relation list is cut off
+        self.failures: list[Exception] = []  # consumed one per call
+        self.unreadable: set[str] = set()  # issue ids whose relations cannot be read
         self._counter = 0
 
     # -- transport --
 
-    def __call__(self, query: str, variables: dict) -> dict:
-        name = next(k for k, doc in L.DOCUMENTS.items() if doc == query)
+    def __call__(self, tool: str, args: dict) -> object:
+        unknown = set(args) - set(L.TOOLS[tool])
+        assert not unknown, f"{tool} is called with arguments the client does not declare: {unknown}"
+        if tool == "save_issue":
+            name = "issue_create" if "id" not in args else "relation_create" if "blockedBy" in args else "issue_update"
+        else:
+            name = self.OPERATIONS[tool]
         self.calls.append(name)
         if name.endswith(("_create", "_update")):
-            self.mutation_log.append((name, variables))
+            self.mutation_log.append((name, args))
         if self.failures:
-            failure = self.failures.pop(0)
-            if isinstance(failure, Exception):
-                raise failure
-            return failure
-        return {"data": getattr(self, f"_{name}")(variables)}
+            raise self.failures.pop(0)
+        return getattr(self, f"_{name}")(args)
 
     def mutations(self) -> list[str]:
         return [c for c in self.calls if c.endswith(("_create", "_update"))]
 
-    # -- queries --
+    def _lookup(self, reference: str) -> dict:
+        for issue in self.issues.values():
+            if reference in (issue["id"], issue["identifier"]):
+                return issue
+        raise LinearError(f'Linear: Error: Could not find issue "{reference}"')
 
-    def _viewer(self, v: dict) -> dict:
-        return {"viewer": {"id": "u1", "name": "Dev", "email": "dev@example.com"},
-                "organization": {"name": "Acme", "urlKey": "acme"}}
+    # -- reads --
 
-    def _teams(self, v: dict) -> dict:
-        return {"teams": {"nodes": self.teams}}
+    def _viewer(self, a: dict) -> dict:
+        return {"user": {"id": "u1", "name": "Dev", "email": "dev@example.com"},
+                "workspace": {"id": "w1", "name": "Acme", "url": "https://linear.app/acme"}}
 
-    def _states(self, v: dict) -> dict:
-        team = next(t for t in self.teams if t["id"] == v["teamId"])
-        return {"team": {**team, "states": {"nodes": list(reversed(self.states))}}}
+    def _teams(self, a: dict) -> dict:
+        return {"teams": self.teams, "hasNextPage": False}
+
+    def _states(self, a: dict) -> list:
+        assert any(t["id"] == a["team"] for t in self.teams)
+        return list(self.states)
 
     def _project_node(self, p: dict) -> dict:
-        return {**{k: p[k] for k in ("id", "name", "url", "slugId")},
-                "teams": {"nodes": [t for t in self.teams if t["id"] in p["teamIds"]]}}
+        return {"id": p["identifier"], "uuid": p["id"], "name": p["name"], "url": p["url"],
+                "summary": p["description"], "description": p["content"],
+                "teams": [t for t in self.teams if t["id"] in p["teamIds"]]}
 
-    def _project(self, v: dict) -> dict:
-        p = self.projects.get(v["id"])
-        return {"project": self._project_node(p) if p else None}
+    def _find_project(self, reference: str) -> dict:
+        for p in self.projects.values():
+            if reference in (p["id"], p["identifier"], p["slugId"], p["url"].rsplit("/", 1)[-1], p["name"]):
+                return p
+        raise LinearError(f'Linear: Error: Could not find project "{reference}"')
 
-    def _projects(self, v: dict) -> dict:
-        flt = v.get("filter") or {}
-        found = list(self.projects.values())
-        if "name" in flt:
-            found = [p for p in found if p["name"].lower() == flt["name"]["eqIgnoreCase"].lower()]
-        if "slugId" in flt:
-            found = [p for p in found if p["slugId"] == flt["slugId"]["eq"]]
-        return {"projects": {"nodes": [self._project_node(p) for p in found]}}
+    def _project(self, a: dict) -> dict:
+        return self._project_node(self._find_project(a["query"]))
+
+    def _projects(self, a: dict) -> dict:
+        found = [p for p in self.projects.values() if a["query"].lower() in p["name"].lower()]
+        return {"projects": [self._project_node(p) for p in found], "hasNextPage": False}
 
     def _issue_node(self, issue: dict) -> dict:
         state = next(s for s in self.states if s["id"] == issue["stateId"])
+        milestone = next((m for m in self.milestones if m["id"] == issue.get("projectMilestoneId")), None)
+        blockers = sorted(blocker for blocker, blocked in self.relations if blocked == issue["id"])
         return {
-            "id": issue["id"], "identifier": issue["identifier"], "title": issue["title"],
-            "description": issue["description"], "priority": issue["priority"], "url": issue["url"],
-            "trashed": issue.get("trashed"),
-            "state": {"id": state["id"], "name": state["name"], "type": state["type"]},
-            "parent": {"id": issue["parentId"]} if issue.get("parentId") else None,
-            "assignee": {"id": issue["assigneeId"]} if issue.get("assigneeId") else None,
-            "projectMilestone": {"id": issue["projectMilestoneId"]} if issue.get("projectMilestoneId") else None,
-            "labels": {"nodes": [{"id": lb} for lb in issue.get("labelIds") or []]},
-            "inverseRelations": {
-                "nodes": [] if issue["id"] in self.truncated else [
-                    {"type": "blocks", "issue": {"id": blocker}}
-                    for blocker, blocked in self.relations if blocked == issue["id"]
-                ],
-                "pageInfo": {"hasNextPage": issue["id"] in self.truncated},
-            },
+            "id": issue["identifier"], "uuid": issue["id"], "title": issue["title"],
+            "description": issue["description"] or None,
+            "priority": {"value": issue["priority"], "name": "?"}, "url": issue["url"],
+            "status": state["name"], "statusType": state["type"],
+            "labels": [lb["name"] for lb in self.labels if lb["id"] in (issue.get("labelIds") or [])],
+            "assigneeId": issue.get("assigneeId"),
+            "projectMilestone": dict(milestone) if milestone else None,
+            "parentId": self.issues[issue["parentId"]]["identifier"] if issue.get("parentId") else None,
+            "archivedAt": "2026-01-01T00:00:00.000Z" if issue.get("trashed") else None,
+            # Linear touches updatedAt on every change, relations included.
+            "updatedAt": hashlib.sha1(json.dumps([issue, blockers], sort_keys=True).encode()).hexdigest()[:12],
         }
 
-    def _project_issues(self, v: dict) -> dict:
-        if v["id"] not in self.projects:
-            return {"project": None}
-        issues = [i for i in self.issues.values() if i["projectId"] == v["id"] and not i.get("archived")]
-        start = int(v.get("after") or 0)
-        page = issues[start:start + self.page_size]
+    def _project_issues(self, a: dict) -> dict:
+        project = self._find_project(a["project"])
+        assert set(a["fields"]) == set(L.ISSUE_FIELDS)
+        issues = [i for i in self.issues.values() if i["projectId"] == project["id"] and not i.get("archived")]
+        size = self.page_size or a["limit"]
+        start = int(a.get("cursor") or 0)
+        page = issues[start:start + size]
         end = start + len(page)
-        return {"project": {"issues": {
-            "nodes": [self._issue_node(i) for i in page],
-            "pageInfo": {"hasNextPage": end < len(issues), "endCursor": str(end)},
-        }}}
+        answer = {"issues": [self._issue_node(i) for i in page], "hasNextPage": end < len(issues)}
+        if answer["hasNextPage"]:
+            answer["cursor"] = str(end)
+        return answer
 
-    def _milestones(self, v: dict) -> dict:
-        if v["id"] not in self.projects:
-            return {"project": None}
-        return {"project": {"projectMilestones": {"nodes": self.milestones}}}
+    def _issue(self, a: dict) -> dict:
+        issue = self._lookup(a["id"])
+        if issue["id"] in self.unreadable:
+            raise LinearError("Linear: relations are not available right now")
+        assert a["fields"] == ["id", "relations"]
+        blockers = [self.issues[blocker] for blocker, blocked in self.relations if blocked == issue["id"]]
+        return {"id": issue["identifier"], "relations": {
+            "blocks": [], "relatedTo": [], "duplicateOf": None,
+            "blockedBy": [{"id": b["identifier"], "title": b["title"]} for b in blockers],
+        }}
 
-    def _labels(self, v: dict) -> dict:
-        name = v["filter"]["name"]["eqIgnoreCase"].lower()
-        return {"issueLabels": {"nodes": [lb for lb in self.labels if lb["name"].lower() == name]}}
+    def _milestones(self, a: dict) -> dict:
+        self._find_project(a["project"])
+        return {"milestones": [dict(m, progress=0) for m in self.milestones]}
 
-    def _users(self, v: dict) -> dict:
+    def _labels(self, a: dict) -> dict:
         found = [
-            u for u in self.users
-            if any(str(u[field]).lower() == cond[field]["eqIgnoreCase"].lower()
-                   for cond in v["filter"]["or"] for field in cond)
+            {"id": lb["id"], "name": lb["name"], "archivedAt": None} for lb in self.labels
+            if a["name"].lower() in lb["name"].lower() and lb["team"] in (None, a.get("team"))
         ]
-        return {"users": {"nodes": found}}
+        return {"labels": found, "hasNextPage": False}
 
-    # -- mutations --
+    def _users(self, a: dict) -> dict:
+        query = a["query"].lower()
+        found = [u for u in self.users if any(query in str(u[k]).lower() for k in ("name", "displayName", "email"))]
+        return {"users": found, "hasNextPage": False}
 
-    def _project_create(self, v: dict) -> dict:
-        inp = v["input"]
+    # -- writes --
+
+    def _project_create(self, a: dict) -> dict:
         self._counter += 1
         pid = f"00000000-0000-4000-8000-{self._counter:012d}"
         slug = f"{self._counter:012x}"
         self.projects[pid] = {
-            "id": pid, "name": inp["name"], "slugId": slug, "teamIds": inp["teamIds"],
-            "description": inp.get("description", ""), "content": inp.get("content", ""),
-            "url": f"https://linear.app/acme/project/{inp['name'].lower().replace(' ', '-')}-{slug}",
+            "id": pid, "identifier": f"P-ENG-{self._counter}", "name": a["name"], "slugId": slug,
+            "teamIds": a["addTeams"], "description": a.get("summary", ""), "content": a.get("description", ""),
+            "url": f"https://linear.app/acme/project/{a['name'].lower().replace(' ', '-')}-{slug}",
         }
-        return {"projectCreate": {"success": True, "project": self._project_node(self.projects[pid])}}
+        return self._project_node(self.projects[pid])
 
-    def _issue_create(self, v: dict) -> dict:
-        inp = v["input"]
+    def _state_id(self, reference: str | None) -> str:
+        if not reference:
+            return "st-backlog"  # team default for new issues
+        return next(s["id"] for s in self.states if reference in (s["id"], s["name"]))
+
+    def _issue_create(self, a: dict) -> dict:
         self._counter += 1
-        team = next(t for t in self.teams if t["id"] == inp["teamId"])
+        team = next(t for t in self.teams if t["id"] == a["team"])
         identifier = f"{team['key']}-{self._counter}"
         issue = {
-            "id": f"issue-{self._counter}", "identifier": identifier, "title": inp["title"],
-            "description": inp.get("description", ""), "priority": inp.get("priority", 0),
-            "projectId": inp.get("projectId"), "parentId": inp.get("parentId"),
-            "assigneeId": inp.get("assigneeId"), "projectMilestoneId": inp.get("projectMilestoneId"),
-            "labelIds": list(inp.get("labelIds") or []),
-            "stateId": inp.get("stateId") or "st-backlog",  # team default for new issues
+            "id": f"issue-{self._counter}", "identifier": identifier, "title": a["title"],
+            "description": a.get("description", ""), "priority": a.get("priority", 0),
+            "projectId": self._find_project(a["project"])["id"] if a.get("project") else None,
+            "parentId": self._lookup(a["parentId"])["id"] if a.get("parentId") else None,
+            "assigneeId": a.get("assignee"), "projectMilestoneId": a.get("milestone"),
+            "labelIds": [next(lb["id"] for lb in self.labels if ref in (lb["id"], lb["name"]))
+                         for ref in a.get("labels") or []],
+            "stateId": self._state_id(a.get("state")),
             "url": f"https://linear.app/acme/issue/{identifier}",
         }
         self.issues[issue["id"]] = issue
-        return {"issueCreate": {"success": True, "issue": self._issue_node(issue)}}
+        return self._issue_node(issue)
 
-    def _issue_update(self, v: dict) -> dict:
-        issue = self.issues[v["id"]]
-        if v["input"].get("stateId") == "st-dup":
-            return_error = "Issues can only be moved to a duplicate state when a duplicate issue relation exists."
-            raise LinearError(f"Linear API error: {return_error}")
-        issue.update(v["input"])
-        return {"issueUpdate": {"success": True, "issue": self._issue_node(issue)}}
+    def _issue_update(self, a: dict) -> dict:
+        issue = self._lookup(a["id"])
+        if a.get("state") == "st-dup":
+            raise LinearError("Linear: Issues can only be moved to a duplicate state when a duplicate issue relation exists.")
+        issue["stateId"] = self._state_id(a["state"])
+        return self._issue_node(issue)
 
-    def _comment_create(self, v: dict) -> dict:
-        issue = self.issues[v["input"]["issueId"]]
-        self.comments.append((issue["identifier"], v["input"]["body"]))
-        return {"commentCreate": {"success": True}}
+    def _comment_create(self, a: dict) -> dict:
+        self.comments.append((self._lookup(a["issueId"])["identifier"], a["body"]))
+        return {"id": f"comment-{len(self.comments)}", "body": a["body"]}
 
-    def _relation_create(self, v: dict) -> dict:
-        inp = v["input"]
-        assert inp["type"] == "blocks"
-        self.relations.append((inp["issueId"], inp["relatedIssueId"]))
-        return {"issueRelationCreate": {"success": True}}
+    def _relation_create(self, a: dict) -> dict:
+        blocked = self._lookup(a["id"])
+        for reference in a["blockedBy"]:
+            pair = (self._lookup(reference)["id"], blocked["id"])
+            if pair not in self.relations:  # append-only, and saying it twice is fine
+                self.relations.append(pair)
+        return self._issue_node(blocked)
 
     # -- what people do in the Linear UI --
 
@@ -231,19 +268,18 @@ class FakeLinear:
     def add_issue(self, title: str, *, description: str = "", parent: str | None = None,
                   state: str = "Todo", priority: int = 0, assignee: str | None = None,
                   milestone: str | None = None, labels: tuple[str, ...] = ()) -> dict:
-        project_id = next(iter(self.projects))
-        self._issue_create({"input": {
-            "teamId": self.teams[0]["id"], "title": title, "description": description,
-            "projectId": project_id, "parentId": self.find(parent)["id"] if parent else None,
-            "stateId": next(s["id"] for s in self.states if s["name"] == state), "priority": priority,
-            "assigneeId": assignee, "projectMilestoneId": milestone, "labelIds": list(labels),
-        }})
+        self._issue_create({
+            "team": self.teams[0]["id"], "title": title, "description": description,
+            "project": next(iter(self.projects)), "parentId": self.find(parent)["id"] if parent else None,
+            "state": state, "priority": priority,
+            "assignee": assignee, "milestone": milestone, "labels": list(labels),
+        })
         return self.find(title)
 
     def writes_to(self, title_part: str) -> list[str]:
-        """Mutations that touched an issue (by ID in the variables), in order."""
+        """Writes that touched an issue (by ID in the arguments), in order."""
         issue_id = self.find(title_part)["id"]
-        return [name for name, variables in self.mutation_log if issue_id in json.dumps(variables)]
+        return [name for name, arguments in self.mutation_log if issue_id in json.dumps(arguments)]
 
     def comments_on(self, title_part: str) -> list[str]:
         identifier = self.find(title_part)["identifier"]
@@ -315,14 +351,152 @@ def stories_by_id(state: StateManager) -> dict[str, Story]:
 # ── client ────────────────────────────────────────────────────────────
 
 
-class TestClient:
-    def test_personal_keys_are_sent_raw_and_oauth_tokens_as_bearer(self) -> None:
-        assert LinearClient("lin_api_abc")._auth_header() == "lin_api_abc"
-        assert LinearClient("lin_oauth_abc")._auth_header() == "Bearer lin_oauth_abc"
-        assert LinearClient("Bearer xyz")._auth_header() == "Bearer xyz"
+class FakeMcpServer:
+    """Stands in for ``urllib.request.urlopen``: an MCP server speaking Streamable HTTP."""
 
-    def test_missing_key_fails_before_any_request(self, fake) -> None:
-        with pytest.raises(LinearError, match="LINEAR_API_KEY"):
+    def __init__(self, *, sse: bool = False, session: str | None = "sess-1") -> None:
+        self.sse = sse
+        self.session = session
+        self.requests: list[tuple[dict, dict]] = []  # (headers, JSON-RPC message)
+        self.status_for: list[int] = []               # HTTP statuses to answer with first
+        self.tool_result: dict = {"content": [{"type": "text", "text": '{"teams": [], "hasNextPage": false}'}]}
+
+    def methods(self) -> list[str]:
+        return [message["method"] for _, message in self.requests]
+
+    def __call__(self, request, timeout=None):
+        headers = {k.lower(): v for k, v in request.header_items()}
+        message = json.loads(request.data)
+        self.requests.append((headers, message))
+        if self.status_for:
+            status = self.status_for.pop(0)
+            if status >= 400:
+                raise urllib.error.HTTPError(request.full_url, status, "x", {}, io.BytesIO(b'{"error":"nope"}'))  # type: ignore[arg-type]
+        if "id" not in message:
+            return _Response(202, {}, b"")
+        if message["method"] == "initialize":
+            result: dict = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "linear"}}
+        elif message["method"] == "tools/list":
+            result = {"tools": [{"name": "whoami", "inputSchema": {"properties": {}}}]}
+        else:
+            result = self.tool_result
+        answer = {"jsonrpc": "2.0", "id": message["id"], "result": result}
+        response_headers = {"Mcp-Session-Id": self.session} if self.session and message["method"] == "initialize" else {}
+        if self.sse:
+            # A server may send other messages on the stream before the answer.
+            noise = {"jsonrpc": "2.0", "method": "notifications/message", "params": {"data": "working"}}
+            body = f"event: message\ndata: {json.dumps(noise)}\n\nevent: message\ndata: {json.dumps(answer)}\n\n"
+            return _Response(200, {**response_headers, "Content-Type": "text/event-stream"}, body.encode())
+        return _Response(200, {**response_headers, "Content-Type": "application/json"}, json.dumps(answer).encode())
+
+
+class _Response:
+    def __init__(self, status: int, headers: dict, body: bytes) -> None:
+        self.status, self.headers, self._body = status, headers, body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class TestMcpTransport:
+    def call(self, server: FakeMcpServer, client: LinearClient | None = None, **kwargs):
+        client = client or LinearClient("lin_api_abc", sleep=lambda s: None, **kwargs)
+        with patch("urllib.request.urlopen", side_effect=server):
+            return client, client.teams()
+
+    def test_session_is_initialized_once_and_tools_are_called(self) -> None:
+        server = FakeMcpServer()
+        client, teams = self.call(server)
+        assert teams == []
+        assert server.methods() == ["initialize", "notifications/initialized", "tools/call"]
+        headers, message = server.requests[-1]
+        assert message["params"] == {"name": "list_teams", "arguments": {"limit": 250}}
+        assert headers["authorization"] == "Bearer lin_api_abc"
+        assert headers["mcp-session-id"] == "sess-1" and headers["mcp-protocol-version"] == "2025-06-18"
+        assert "text/event-stream" in headers["accept"] and "application/json" in headers["accept"]
+        assert "mcp-session-id" not in server.requests[0][0]
+
+        self.call(server, client)
+        assert server.methods().count("initialize") == 1
+
+    def test_answer_as_an_event_stream(self) -> None:
+        server = FakeMcpServer(sse=True, session=None)
+        server.tool_result = {"content": [{"type": "text", "text": '{"teams": [{"id": "t", "key": "ENG"}]}'}]}
+        _, teams = self.call(server)
+        assert teams == [{"id": "t", "key": "ENG"}]
+        assert "mcp-session-id" not in server.requests[-1][0], "a server without sessions gets no session header"
+
+    def test_a_bearer_prefix_on_the_key_is_not_doubled(self) -> None:
+        server = FakeMcpServer()
+        self.call(server, LinearClient("Bearer xyz"))
+        assert server.requests[-1][0]["authorization"] == "Bearer xyz"
+
+    @pytest.mark.parametrize("text, message, retryable", [
+        ('{"error":"invalid_request","message":"Title is too long","status":400}', "Linear: Title is too long", False),
+        ('Error: Could not find project "x"', 'Could not find project "x"', False),
+        ('{"error":"ratelimited","message":"Slow down","status":429}', "Slow down", True),
+    ])
+    def test_tool_errors_carry_linears_message(self, text, message, retryable) -> None:
+        server = FakeMcpServer()
+        server.tool_result = {"isError": True, "content": [{"type": "text", "text": text}]}
+        with pytest.raises(LinearError, match=message) as caught:
+            self.call(server, max_retries=0)
+        assert caught.value.retryable is retryable
+
+    def test_dropped_session_is_started_again(self) -> None:
+        server = FakeMcpServer()
+        client, _ = self.call(server)
+        server.status_for = [404]  # the server forgot the session
+        _, teams = self.call(server, client)
+        assert teams == []
+        assert server.methods()[3:] == ["tools/call", "initialize", "notifications/initialized", "tools/call"]
+
+    def test_rejected_credentials(self) -> None:
+        server = FakeMcpServer()
+        server.status_for = [401]
+        with pytest.raises(LinearError, match="rejected the API key") as caught:
+            self.call(server)
+        assert caught.value.auth_failed and len(server.requests) == 1
+
+    def test_network_failures_are_retried(self) -> None:
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no route")) as urlopen:
+            with pytest.raises(LinearError, match="Could not reach Linear"):
+                LinearClient("k", sleep=lambda s: None, max_retries=1).teams()
+        assert urlopen.call_count == 2
+
+    def test_lost_write_is_not_sent_again(self) -> None:
+        server = FakeMcpServer()
+        client, _ = self.call(server)
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")) as urlopen:
+            with pytest.raises(LinearError) as caught:
+                client.create_comment("issue-1", "hello")
+        assert caught.value.outcome_unknown and urlopen.call_count == 1
+
+    def test_server_errors_on_a_write_are_not_retried(self) -> None:
+        server = FakeMcpServer()
+        client, _ = self.call(server)
+        server.status_for = [502]
+        with patch("urllib.request.urlopen", side_effect=server):
+            with pytest.raises(LinearError, match="HTTP 502") as caught:
+                client.create_comment("issue-1", "hello")
+        assert caught.value.outcome_unknown and server.methods().count("tools/call") == 2
+
+    def test_tools_can_be_listed(self) -> None:
+        server = FakeMcpServer()
+        client = LinearClient("k")
+        with patch("urllib.request.urlopen", side_effect=server):
+            assert [t["name"] for t in client._transport.list_tools()] == ["whoami"]
+
+
+class TestClient:
+    def test_missing_credentials_fail_before_any_request(self, fake) -> None:
+        with pytest.raises(LinearError, match="pralph linear oauth.*LINEAR_API_KEY"):
             LinearClient("", transport=fake).teams()
         assert fake.calls == []
 
@@ -333,7 +507,7 @@ class TestClient:
         assert L.resolve_api_key(config.get) == "from-env"
 
     def test_rate_limits_are_retried(self, fake) -> None:
-        fake.failures = [{"errors": [{"message": "slow down", "extensions": {"code": "RATELIMITED"}}]}] * 2
+        fake.failures = [LinearError("Linear rate limit reached", retryable=True)] * 2
         slept: list[float] = []
         client = LinearClient("k", transport=fake, sleep=slept.append)
         assert [t["key"] for t in client.teams()] == ["ENG"]
@@ -347,31 +521,17 @@ class TestClient:
         assert len(fake.calls) == 3
 
     def test_validation_errors_are_not_retried(self, fake) -> None:
-        fake.failures = [{"errors": [{"message": "Argument Validation Error",
-                                      "extensions": {"userPresentableMessage": "Title is too long"}}]}]
+        fake.failures = [LinearError("Linear: Title is too long")]
         with pytest.raises(LinearError, match="Title is too long"):
             LinearClient("k", transport=fake).teams()
         assert len(fake.calls) == 1
 
     def test_bad_key_gets_a_helpful_message(self, fake) -> None:
-        fake.failures = [{"errors": [{"message": "nope", "extensions": {"code": "AUTHENTICATION_ERROR"}}]}]
-        with pytest.raises(LinearError, match="rejected the API key"):
+        fake.failures = [LinearError("Linear rejected the credentials", auth_failed=True)]
+        with pytest.raises(LinearError, match="rejected the API key — check LINEAR_API_KEY"):
             LinearClient("k", transport=fake).teams()
 
-    def test_http_transport_surfaces_graphql_errors_sent_with_4xx(self) -> None:
-        body = json.dumps({"errors": [{"message": "bad", "extensions": {"code": "AUTHENTICATION_ERROR"}}]}).encode()
-        err = urllib.error.HTTPError(L.API_URL, 401, "Unauthorized", {}, io.BytesIO(body))  # type: ignore[arg-type]
-        with patch("urllib.request.urlopen", side_effect=err):
-            with pytest.raises(LinearError, match="rejected the API key"):
-                LinearClient("k").teams()
-
-    def test_http_transport_treats_network_failures_as_retryable(self) -> None:
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no route")) as urlopen:
-            with pytest.raises(LinearError, match="Could not reach Linear"):
-                LinearClient("k", sleep=lambda s: None, max_retries=1).teams()
-        assert urlopen.call_count == 2
-
-    def test_mutations_with_an_unknown_outcome_are_not_repeated(self, fake) -> None:
+    def test_writes_with_an_unknown_outcome_are_not_repeated(self, fake) -> None:
         """A create that timed out may have gone through — sending it again makes a twin."""
         lost = LinearError("Could not reach Linear: timed out", retryable=True, outcome_unknown=True)
         client = LinearClient("k", transport=fake, sleep=lambda s: None)
@@ -387,16 +547,14 @@ class TestClient:
         assert fake.calls == ["teams", "teams"]
 
         fake.calls.clear()
-        fake.failures = [{"errors": [{"message": "slow down", "extensions": {"code": "RATELIMITED"}}]}]
+        fake.failures = [LinearError("Linear rate limit reached", retryable=True)]
         client.create_issue(team_id="team-eng", title="Once")
-        assert fake.calls == ["issue_create", "issue_create"], "a rejected mutation was not applied"
+        assert fake.calls == ["issue_create", "issue_create"], "a rejected write was not applied"
         assert len(fake.issues) == 1
 
-    def test_http_transport_marks_lost_requests_as_outcome_unknown(self) -> None:
-        with patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")) as urlopen:
-            with pytest.raises(LinearError) as caught:
-                LinearClient("k", sleep=lambda s: None).create_comment("issue-1", "hello")
-        assert caught.value.outcome_unknown and urlopen.call_count == 1
+    def test_arguments_that_are_not_set_are_left_out(self, fake) -> None:
+        LinearClient("k", transport=fake).create_issue(team_id="team-eng", title="Bare")
+        assert fake.mutation_log == [("issue_create", {"team": "team-eng", "title": "Bare"})]
 
     def test_project_issues_follows_pagination(self, state) -> None:
         fake = FakeLinear(page_size=2)
@@ -406,6 +564,17 @@ class TestClient:
         issues = sync.client.project_issues(sync.link.project_id)
         assert len(issues) == 5  # 2 parents + 3 stories
         assert fake.calls.count("project_issues") >= 3
+        parents = {i["id"] for i in issues if not i["parent_id"]}
+        assert {i["parent_id"] for i in issues if i["parent_id"]} == parents, "parents are given by ID"
+
+    def test_project_lookup(self, state, fake, pushed) -> None:
+        project = next(iter(fake.projects.values()))
+        client = pushed.client
+        for reference in (project["id"], project["identifier"], project["slugId"]):
+            assert client.project(reference)["id"] == project["id"]
+        assert client.project("no-such-project") is None
+        assert [p["id"] for p in client.find_projects("SHOP")] == [project["id"]]
+        assert client.find_projects("Sho") == [], "part of a name is not the project"
 
 
 # ── description round trip ────────────────────────────────────────────
@@ -767,11 +936,29 @@ class TestStatusSync:
 
 class TestPull:
     def test_no_changes_is_a_no_op(self, state, fake, pushed) -> None:
+        report = pushed.pull()  # reads the tickets' relations once
+        assert (report.total, report.new, report.updated, report.status_changes, report.pushed) == (3, [], 0, [], 0)
+        assert fake.calls == ["project_issues", "issue", "issue", "issue"] and fake.mutations() == []
+
         before = state.stories_path.read_text()
+        fake.calls.clear()
         report = pushed.pull()
         assert state.stories_path.read_text() == before
         assert (report.total, report.new, report.updated, report.status_changes, report.pushed) == (3, [], 0, [], 0)
-        assert fake.mutations() == []
+        assert fake.calls == ["project_issues"], "one call: nothing changed, so no relations are read again"
+
+    def test_relations_are_read_only_for_tickets_that_changed(self, state, fake, pushed) -> None:
+        pushed.pull()
+        fake.calls.clear()
+        fake.find("API-001")["title"] = "API-001: List all products"  # any edit touches updatedAt
+        fake.move("DB-001", "Done")
+        pushed.pull()
+        assert fake.calls.count("issue") == 1, "API-001 changed and is open; DB-001 is closed: nothing waits on its blockers"
+
+        fake.calls.clear()
+        state.mark_story_status("API-002", StoryStatus.in_progress)  # pralph's own write touches it too
+        pushed.pull()
+        assert fake.calls.count("issue") == 1
 
     def test_ticket_edits_flow_into_the_story(self, state, fake, pushed) -> None:
         issue = fake.find("API-001")
@@ -841,15 +1028,27 @@ class TestPull:
         assert (fake.find("API-001")["id"], fake.find("API-003")["id"]) in fake.relations
         assert report.relations_created == 1 and "pending_deps" not in search.metadata["linear"]
 
+        pushed.pull()  # the new relation touched the ticket: its relations are read once more
         before = state.stories_path.read_text()
         pushed.pull()
         assert state.stories_path.read_text() == before and len(fake.relations) == 4
 
-    def test_incomplete_relation_list_does_not_drop_dependencies(self, state, fake, pushed) -> None:
-        fake.truncated.add(fake.find("API-002")["id"])
+    def test_unreadable_relations_do_not_drop_dependencies(self, state, fake, pushed) -> None:
+        fake.unreadable.add(fake.find("API-002")["id"])
+        fake.relations.remove((fake.find("API-001")["id"], fake.find("API-002")["id"]))
         pushed.pull()
         assert sorted(stories_by_id(state)["API-002"].dependencies) == ["API-001", "DB-001"]
-        assert len(fake.relations) == 3, "nothing is created on a guess"
+        assert len(fake.relations) == 2, "nothing is created on a guess"
+
+        fake.unreadable.clear()
+        pushed.pull()
+        assert stories_by_id(state)["API-002"].dependencies == ["DB-001"], "read as soon as it can be"
+
+    def test_blocker_in_another_project_is_ignored(self, state, fake, pushed) -> None:
+        other = fake._issue_create({"team": "team-eng", "title": "Elsewhere"})
+        fake.relations.append((fake._lookup(other["id"])["id"], fake.find("API-001")["id"]))
+        pushed.pull()
+        assert stories_by_id(state)["API-001"].dependencies == ["DB-001"]
 
     def test_marked_as_duplicate_in_linear(self, state, fake, pushed) -> None:
         """Linear's "Duplicate" state has its own type — it is closed, not open."""
@@ -1024,7 +1223,7 @@ def shared(state, fake) -> LinearSync:
     fake.add_issue("Cart API", parent="Checkout flow", labels=("lb-shop",), assignee="u1",
                    milestone="ms-base", description="Carts.\n\n## Done when\n- POST /cart works")
     fake.add_issue("Cart page", parent="Checkout flow", labels=("lb-app",), assignee="u2", milestone="ms-base")
-    fake.add_issue("Payment API", labels=("lb-shop-eng",), assignee="u2", milestone="ms-launch")
+    fake.add_issue("Payment API", labels=("lb-shop", "lb-app"), assignee="u2", milestone="ms-launch")
     fake.add_issue("Push notifications", labels=("lb-app",), assignee="u1", milestone="ms-launch")
     fake.calls.clear()
     fake.mutation_log.clear()
@@ -1041,11 +1240,12 @@ class TestScope:
         assert report.out_of_scope == 0
 
     def test_label_scope(self, state, fake, shared) -> None:
-        shared.set_scope(label="repo:shop")
-        assert shared.link.scope["label"] == {"ids": ["lb-shop", "lb-shop-eng"], "name": "repo:shop"}, \
-            "the workspace label and this team's label, not another team's"
+        shared.set_scope(label="REPO:shop")
+        assert shared.link.scope["label"] == {"name": "repo:shop"}, "as Linear spells it"
+        fake.add_issue("Legacy import", labels=("lb-shop-old",))  # "repo:shop-legacy" is another label
         report = shared.pull()
         assert self.titles(state) == {"Cart API", "Payment API"}
+        report.out_of_scope -= 1
         assert report.total == 2 and report.out_of_scope == 2
         assert stories_by_id(state)[fake.find("Cart API")["identifier"]].acceptance_criteria == ["POST /cart works"]
 
@@ -1073,6 +1273,10 @@ class TestScope:
             shared.set_scope(milestone="Beta")
         with pytest.raises(LinearError, match="No label 'nope'"):
             shared.set_scope(label="nope")
+        with pytest.raises(LinearError, match="No label 'repo:ops' in team ENG"):
+            shared.set_scope(label="repo:ops")  # another team's label
+        with pytest.raises(LinearError, match="No label 'repo'"):
+            shared.set_scope(label="repo")  # part of a name is not a label
         with pytest.raises(LinearError, match="No Linear user"):
             shared.set_scope(assignee="nobody")
         with pytest.raises(LinearError, match="Several Linear users match 'Sam Lee' .*use the email"):
@@ -1220,7 +1424,7 @@ class TestReadMostly:
         return fake.find("Cart API")["identifier"]
 
     def state_writes(self, fake) -> set[str]:
-        return {v["input"]["stateId"] for name, v in fake.mutation_log if name == "issue_update"}
+        return {v["state"] for name, v in fake.mutation_log if name == "issue_update"}
 
     def test_work_starts_the_ticket_and_never_closes_it(self, state, fake, guest) -> None:
         cart = self.cart(fake)
@@ -1458,7 +1662,7 @@ class TestWiring:
         other = StateManager(str(state.project_dir))
         messages: list[str] = []
         assert linear_sync.attach(other, echo=messages.append) is None
-        assert "LINEAR_API_KEY is not set" in messages[0]
+        assert "there is no Linear login — run 'pralph linear oauth'" in messages[0]
         with pytest.raises(LinearError, match="LINEAR_API_KEY"):
             linear_sync.attach(other, required=True)
 
@@ -1476,7 +1680,7 @@ class TestWiring:
     def test_cli_push_without_key_explains_what_to_do(self, state) -> None:
         state.append_stories(backlog())
         result = CliRunner().invoke(main, ["--project-dir", str(state.project_dir), "linear", "push"])
-        assert result.exit_code == 1 and "LINEAR_API_KEY is not set" in result.output
+        assert result.exit_code == 1 and "Not logged in to Linear. Run 'pralph linear oauth'" in result.output
 
     def test_cli_implement_refuses_to_bypass_a_linked_project_silently(self, state, fake, pushed) -> None:
         result = CliRunner().invoke(main, ["--project-dir", str(state.project_dir), "implement"])

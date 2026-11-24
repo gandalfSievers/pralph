@@ -1,16 +1,15 @@
 """OAuth login for Linear — ``pralph linear oauth`` (stdlib only).
 
-An alternative to a personal API key: authorization-code flow with PKCE. The
-browser takes the user to Linear, Linear redirects to a loopback port pralph
-listens on, and the code is exchanged for an access token (valid for 24 hours)
-plus a refresh token. The pair is kept in ``~/.pralph/linear-oauth.json`` and
-refreshed when it runs out; refresh tokens rotate, so every refresh is saved.
+pralph talks to Linear through Linear's MCP server, and logs in to it the way
+other MCP clients do: OAuth 2.1 with dynamic client registration and PKCE.
+Nothing has to be set up in Linear first — pralph registers itself, the
+browser takes the user to Linear to approve, Linear redirects to a loopback
+port pralph listens on, and the code is exchanged for an access token (valid
+for about a day) plus a refresh token. The login is kept in
+``~/.pralph/linear-oauth.json`` and refreshed when it runs out; refresh tokens
+rotate, so every refresh is saved.
 
-PKCE makes the client secret optional — nothing secret has to be configured,
-only the client ID of an OAuth application whose callback URL is
-``http://localhost:<port>/oauth/callback``.
-
-See https://linear.app/developers/oauth-2-0-authentication
+See https://linear.app/docs/mcp
 """
 
 from __future__ import annotations
@@ -31,52 +30,62 @@ from pathlib import Path
 from typing import Any, Callable
 
 from pralph import __version__
-from pralph.linear import LinearError, resolve_api_key
+from pralph.linear import MCP_URL, LinearError, resolve_api_key
 
-AUTHORIZE_URL = "https://linear.app/oauth/authorize"
-TOKEN_URL = "https://api.linear.app/oauth/token"
-REVOKE_URL = "https://api.linear.app/oauth/revoke"
-NEW_APPLICATION_URL = "https://linear.app/settings/api/applications/new"
+ISSUER = "https://mcp.linear.app"
+METADATA_URL = f"{ISSUER}/.well-known/oauth-authorization-server"
+# Used when the metadata document cannot be read.
+DEFAULT_ENDPOINTS = {
+    "authorization_endpoint": f"{ISSUER}/authorize",
+    "token_endpoint": f"{ISSUER}/token",
+    "registration_endpoint": f"{ISSUER}/register",
+    "revocation_endpoint": f"{ISSUER}/token",
+}
 
+CLIENT_NAME = "pralph"
 DEFAULT_PORT = 8765
 CALLBACK_PATH = "/oauth/callback"
-DEFAULT_SCOPES = "read,write"
+SCOPES = "read write"
 TOKEN_FILE = "linear-oauth.json"
 
 # Refresh this long before the access token runs out, so a request that is
 # about to be sent doesn't arrive with a token that has just expired.
 _EXPIRY_MARGIN = 120
 
-PostForm = Callable[[str, dict], dict]
+# request(url, form=None, json_body=None) -> parsed JSON answer. GET without a body.
+Request = Callable[..., dict]
 
 
 def redirect_uri(port: int = DEFAULT_PORT) -> str:
     return f"http://localhost:{port}{CALLBACK_PATH}"
 
 
-def post_form(url: str, fields: dict) -> dict:
-    """POST a form to one of Linear's OAuth endpoints and return the JSON answer."""
-    request = urllib.request.Request(
-        url,
-        data=urllib.parse.urlencode(fields).encode(),
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": f"pralph/{__version__}",
-        },
-        method="POST",
-    )
+def request(url: str, *, form: dict | None = None, json_body: dict | None = None) -> dict:
+    """Talk to one of the OAuth endpoints: GET, a form POST, or a JSON POST."""
+    headers = {"Accept": "application/json", "User-Agent": f"pralph/{__version__}"}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif json_body is not None:
+        data = json.dumps(json_body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method="GET" if data is None else "POST")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode()
     except urllib.error.HTTPError as e:
         raw = e.read().decode(errors="replace")
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
-            payload = {}
-        detail = payload.get("error_description") or payload.get("error") or raw[:200]
-        raise LinearError(f"Linear refused the OAuth request (HTTP {e.code}): {detail}") from e
+            payload = None
+        detail = raw[:200]
+        if isinstance(payload, dict):
+            detail = payload.get("error_description") or payload.get("error") or detail
+        raise LinearError(
+            f"Linear refused the OAuth request (HTTP {e.code}): {detail}", retryable=e.code >= 500,
+        ) from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise LinearError(f"Could not reach Linear: {e}", retryable=True) from e
     try:
@@ -84,6 +93,15 @@ def post_form(url: str, fields: dict) -> dict:
     except json.JSONDecodeError as e:
         raise LinearError(f"Invalid OAuth response from Linear: {e}") from e
     return payload if isinstance(payload, dict) else {}
+
+
+def endpoints(req: Request = request) -> dict:
+    """The authorization server's endpoints, from its metadata document."""
+    try:
+        metadata = req(METADATA_URL)
+    except LinearError:
+        metadata = {}
+    return {key: str(metadata.get(key) or default) for key, default in DEFAULT_ENDPOINTS.items()}
 
 
 # ── stored login ─────────────────────────────────────────────────────
@@ -97,14 +115,12 @@ class OAuthSession:
         path: Path,
         data: dict,
         *,
-        client_secret: str = "",
-        post: PostForm = post_form,
+        req: Request | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.path = path
         self.data = data
-        self._client_secret = client_secret
-        self._post = post
+        self._req = req or request
         self._clock = clock
 
     @classmethod
@@ -113,10 +129,6 @@ class OAuthSession:
         return cls(path, data, **kwargs) if data else None
 
     # -- what the login is --
-
-    @property
-    def actor(self) -> str:
-        return str(self.data.get("actor") or "user")
 
     @property
     def scope(self) -> str:
@@ -129,6 +141,9 @@ class OAuthSession:
     def _expired(self) -> bool:
         # 0: Linear gave no lifetime — use the token until it is rejected.
         return bool(self.expires_at) and self.expires_at - _EXPIRY_MARGIN <= self._clock()
+
+    def _endpoint(self, name: str) -> str:
+        return str(self.data.get(name) or DEFAULT_ENDPOINTS[name])
 
     # -- tokens --
 
@@ -149,15 +164,14 @@ class OAuthSession:
 
         if not self.data.get("refresh_token"):
             raise LinearError("The Linear login has no refresh token — run 'pralph linear oauth' again")
-        fields = {
+        form = {
             "grant_type": "refresh_token",
             "refresh_token": self.data["refresh_token"],
             "client_id": self.data.get("client_id", ""),
+            "resource": self.data.get("resource") or MCP_URL,
         }
-        if self._client_secret:
-            fields["client_secret"] = self._client_secret
         try:
-            answer = self._post(TOKEN_URL, fields)
+            answer = self._req(self._endpoint("token_endpoint"), form=form)
         except LinearError as e:
             if e.retryable:
                 raise
@@ -178,13 +192,17 @@ class OAuthSession:
     def revoke(self) -> bool:
         """Revoke the login at Linear and delete it locally. False if Linear could not be told."""
         revoked = True
-        token = self.data.get("refresh_token") or self.data.get("access_token")
-        if token:
+        for hint in ("refresh_token", "access_token"):
+            if not self.data.get(hint):
+                continue
             try:
-                self._post(REVOKE_URL, {"token": token})
+                self._req(self._endpoint("revocation_endpoint"), form={
+                    "token": self.data[hint], "token_type_hint": hint,
+                    "client_id": self.data.get("client_id", ""),
+                })
             except LinearError as e:
                 # Refused means there is nothing left to revoke (expired, revoked in Linear).
-                revoked = not e.retryable
+                revoked = revoked and not e.retryable
         self.path.unlink(missing_ok=True)
         return revoked
 
@@ -222,24 +240,6 @@ def token_path(home_dir: Path) -> Path:
     return home_dir / TOKEN_FILE
 
 
-def client_secret(config_get: Callable[[str, Any], Any] | None = None) -> str:
-    """Optional with PKCE. ``LINEAR_OAUTH_CLIENT_SECRET``, else config ``linear_oauth_client_secret``."""
-    secret = os.environ.get("LINEAR_OAUTH_CLIENT_SECRET", "").strip()
-    if not secret and config_get is not None:
-        secret = str(config_get("linear_oauth_client_secret", "") or "").strip()
-    return secret
-
-
-def client_id(config_get: Callable[[str, Any], Any] | None = None, home_dir: Path | None = None) -> str:
-    """``LINEAR_OAUTH_CLIENT_ID``, else config ``linear_oauth_client_id``, else the last login's."""
-    value = os.environ.get("LINEAR_OAUTH_CLIENT_ID", "").strip()
-    if not value and config_get is not None:
-        value = str(config_get("linear_oauth_client_id", "") or "").strip()
-    if not value and home_dir is not None:
-        value = str((_read_token_file(token_path(home_dir)) or {}).get("client_id") or "")
-    return value
-
-
 def credentials(
     config_get: Callable[[str, Any], Any], home_dir: Path,
 ) -> tuple[str, OAuthSession | None]:
@@ -247,7 +247,7 @@ def credentials(
     api_key = resolve_api_key(config_get)
     if api_key:
         return api_key, None
-    return "", OAuthSession.load(token_path(home_dir), client_secret=client_secret(config_get))
+    return "", OAuthSession.load(token_path(home_dir))
 
 
 # ── login ────────────────────────────────────────────────────────────
@@ -260,22 +260,35 @@ def pkce_pair() -> tuple[str, str]:
     return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
+def register_client(registration_endpoint: str, redirect: str, req: Request = request) -> str:
+    """Register pralph as a public OAuth client (RFC 7591) and return its client ID."""
+    answer = req(registration_endpoint, json_body={
+        "client_name": CLIENT_NAME,
+        "redirect_uris": [redirect],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    })
+    if not answer.get("client_id"):
+        raise LinearError("Linear did not register pralph as an OAuth client")
+    return str(answer["client_id"])
+
+
 def authorize_url(
-    client: str, *, redirect: str, state: str, challenge: str,
-    scopes: str = DEFAULT_SCOPES, actor: str = "user",
+    authorization_endpoint: str, client: str, *, redirect: str, state: str, challenge: str,
+    scopes: str = SCOPES, resource: str = MCP_URL,
 ) -> str:
     params = {
         "client_id": client,
         "redirect_uri": redirect,
         "response_type": "code",
-        "scope": ",".join(part for part in scopes.replace(" ", ",").split(",") if part),
+        "scope": scopes,
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "resource": resource,
     }
-    if actor != "user":
-        params["actor"] = actor
-    return f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+    return f"{authorization_endpoint}?{urllib.parse.urlencode(params)}"
 
 
 _PAGE = """<!doctype html>
@@ -330,8 +343,7 @@ def wait_for_code(port: int, state: str, *, timeout: float = 300, ready: Callabl
         server = _LoopbackServer(("127.0.0.1", port), Handler)
     except OSError as e:
         raise LinearError(
-            f"Cannot listen on port {port} ({e.strerror or e}) — choose another with --port "
-            "and register that callback URL in the OAuth application"
+            f"Cannot listen on port {port} ({e.strerror or e}) — choose another with --port"
         ) from e
     try:
         if ready is not None:
@@ -351,16 +363,12 @@ def wait_for_code(port: int, state: str, *, timeout: float = 300, ready: Callabl
 
 
 def login(
-    client: str,
     path: Path,
     *,
     port: int = DEFAULT_PORT,
-    scopes: str = DEFAULT_SCOPES,
-    actor: str = "user",
-    secret: str = "",
     open_browser: Callable[[str], Any] | None = webbrowser.open,
     echo: Callable[[str], None] = print,
-    post: PostForm = post_form,
+    req: Request | None = None,
     timeout: float = 300,
 ) -> OAuthSession:
     """Run the browser login and store the result at ``path``.
@@ -368,10 +376,21 @@ def login(
     ``open_browser=None`` only prints the URL (a machine without a browser:
     open it elsewhere, as long as the redirect reaches this port).
     """
+    req = req or request
+    found = endpoints(req)
+    redirect = redirect_uri(port)
+
+    # A registration is tied to its redirect URI: keep using ours while the
+    # port stays the same, register again otherwise.
+    previous = _read_token_file(path) or {}
+    if previous.get("client_id") and previous.get("redirect_uri") == redirect:
+        client = str(previous["client_id"])
+    else:
+        client = register_client(found["registration_endpoint"], redirect, req)
+
     verifier, challenge = pkce_pair()
     state = secrets.token_urlsafe(24)
-    redirect = redirect_uri(port)
-    url = authorize_url(client, redirect=redirect, state=state, challenge=challenge, scopes=scopes, actor=actor)
+    url = authorize_url(found["authorization_endpoint"], client, redirect=redirect, state=state, challenge=challenge)
 
     def ready() -> None:
         echo(f"  Open this URL to approve the access:\n  {url}")
@@ -380,21 +399,22 @@ def login(
         echo("  Waiting for the approval in the browser (Ctrl-C to cancel) ...")
 
     code = wait_for_code(port, state, timeout=timeout, ready=ready)
-
-    fields = {
+    answer = req(found["token_endpoint"], form={
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": redirect,
         "client_id": client,
         "code_verifier": verifier,
-    }
-    if secret:
-        fields["client_secret"] = secret
-    answer = post(TOKEN_URL, fields)
+        "resource": MCP_URL,
+    })
     session = OAuthSession(
         path,
-        {"client_id": client, "actor": actor, **_token_fields(answer, time.time())},
-        client_secret=secret, post=post,
+        {
+            "client_id": client, "redirect_uri": redirect, "resource": MCP_URL,
+            "token_endpoint": found["token_endpoint"], "revocation_endpoint": found["revocation_endpoint"],
+            **_token_fields(answer, time.time()),
+        },
+        req=req,
     )
     session.save()
     return session

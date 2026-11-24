@@ -65,6 +65,7 @@ _HR_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
 # A markdown heading, or a line that is nothing but bold text ("**Notes**").
 _ANY_HEADING_RE = re.compile(r"^(?:#{1,6}\s+\S|\s*\*\*[^*]+\*\*:?\s*$)")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(.*\S)\s*$")
+_PROJECT_IDENTIFIER_RE = re.compile(r"^P-[A-Z][A-Z0-9]*-\d+$", re.IGNORECASE)
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 # The slug ID closes the project segment of a project URL, whatever follows:
 # .../project/shop-1a2b3c4d5e6f, .../project/shop-1a2b3c4d5e6f/overview?x=1
@@ -86,6 +87,11 @@ _STATUS_CLASS = {
 # Stories that were dropped from the plan are not worth a ticket.
 _NOT_IN_PLAN = (StoryStatus.skipped, StoryStatus.duplicate)
 _SCOPE_KINDS = ("milestone", "assignee", "label")
+# Linear's default name for the workflow state of each type.
+_STANDARD_STATE = {
+    "backlog": "backlog", "unstarted": "todo", "started": "in progress",
+    "completed": "done", "canceled": "canceled",
+}
 _ACTIONABLE = (StoryStatus.pending, StoryStatus.rework, StoryStatus.error, StoryStatus.in_progress)
 
 
@@ -104,7 +110,7 @@ class LinearLink:
     # category → {id, identifier, url, state_type} of the parent issue
     epics: dict[str, dict] = field(default_factory=dict)
     # Which issues of the project are this checkout's work. Any of:
-    #   milestone {id, name} · assignee {id, name} · label {ids, name}
+    #   milestone {id, name} · assignee {id, name} · label {name}
     # Empty: every issue of the project.
     scope: dict[str, dict] = field(default_factory=dict)
     # Read-mostly: comment and move to In Progress, nothing else. Tickets are
@@ -374,7 +380,15 @@ class LinearSync:
         states = self._workflow_states()
 
         def of_type(*types: str) -> list[dict]:
-            return [st for t in types for st in states if st.get("type") == t]
+            # A team can have several states of a type (In Progress, In Review):
+            # take the one with Linear's standard name if there is one.
+            return [
+                st for t in types
+                for st in sorted(
+                    (st for st in states if st.get("type") == t),
+                    key=lambda st: str(st.get("name", "")).strip().lower() != _STANDARD_STATE.get(t),
+                )
+            ]
 
         if cls == "open":
             candidates = of_type("unstarted", "backlog")
@@ -467,20 +481,21 @@ class LinearSync:
         """Attach this backlog to an existing Linear project (URL, ID or exact name)."""
         reference = reference.strip()
         projects: list[dict]
-        if _UUID_RE.match(reference):
+        if "linear.app" in reference and _SLUG_ID_RE.search(reference):
+            found = self.client.project(_SLUG_ID_RE.search(reference).group(1))  # type: ignore[union-attr]
+            projects = [found] if found else []
+        elif _UUID_RE.match(reference) or _PROJECT_IDENTIFIER_RE.match(reference):
             found = self.client.project(reference)
             projects = [found] if found else []
-        elif "linear.app" in reference and _SLUG_ID_RE.search(reference):
-            projects = self.client.find_projects(slug_id=_SLUG_ID_RE.search(reference).group(1))  # type: ignore[union-attr]
         else:
-            projects = self.client.find_projects(name=reference)
+            projects = self.client.find_projects(reference)
         if not projects:
             raise LinearError(f"No Linear project found for {reference!r}")
         if len(projects) > 1:
             raise LinearError(f"{len(projects)} Linear projects match {reference!r} — pass the project URL instead")
         project = projects[0]
 
-        teams = [t for t in (project.get("teams") or {}).get("nodes") or [] if isinstance(t, dict)]
+        teams = list(project.get("teams") or [])
         wanted = team_key or self.state.get_config("linear_team", None)
         if wanted:
             teams = [t for t in teams if str(t.get("key", "")).upper() == str(wanted).upper()]
@@ -560,15 +575,12 @@ class LinearSync:
         return {"id": users[0]["id"], "name": users[0].get("name") or reference}
 
     def _resolve_label(self, name: str) -> dict:
-        # A label of this team, or a workspace label. A team label and a
-        # workspace label can share a name; an issue with either is in scope.
-        labels = [
-            lb for lb in self.client.find_labels(name.strip())
-            if lb["team_id"] in (None, self.link.team_id)
-        ]
+        # A label of this team, or a workspace label. Issues list their labels
+        # by name, so the name is what the scope goes by.
+        labels = self.client.find_labels(name.strip(), self.link.team_id)
         if not labels:
             raise LinearError(f"No label {name!r} in team {self.link.team_key} or the workspace")
-        return {"ids": [lb["id"] for lb in labels], "name": labels[0]["name"] or name}
+        return {"name": labels[0]["name"] or name.strip()}
 
     def scope_text(self) -> str:
         """The scope in words ('' when the whole project is in scope)."""
@@ -588,8 +600,10 @@ class LinearSync:
             return False
         if scope.get("assignee") and issue.get("assignee_id") != scope["assignee"].get("id"):
             return False
-        if scope.get("label") and not set(issue.get("label_ids") or ()) & set(scope["label"].get("ids") or ()):
-            return False
+        if scope.get("label"):
+            wanted = str(scope["label"].get("name", "")).strip().lower()
+            if wanted not in {str(name).strip().lower() for name in issue.get("labels") or ()}:
+                return False
         return True
 
     def _scope_fields(self) -> dict:
@@ -598,7 +612,7 @@ class LinearSync:
         return {
             "milestone_id": (scope.get("milestone") or {}).get("id"),
             "assignee_id": (scope.get("assignee") or {}).get("id"),
-            "label_ids": ((scope.get("label") or {}).get("ids") or [])[:1] or None,
+            "labels": [scope["label"]["name"]] if (scope.get("label") or {}).get("name") else None,
         }
 
     def resolve_story_id(self, reference: str) -> str:
@@ -791,9 +805,13 @@ class LinearSync:
         adopted: set[str] = set()
         if not report.project_created:
             remote = self.client.project_issues(self.link.project_id)
-            existing = {i["id"]: set(i["blocked_by"]) for i in remote}
             adopted = self._adopt_existing(todo, remote)
             report.already_linked += len(adopted)
+            # Relations are only drawn towards stories that have dependencies.
+            now = self.state.load_stories()
+            blocked = {link["id"] for s in now if s.dependencies and (link := story_link(s))}
+            self._load_blockers(remote, [i for i in remote if i["id"] in blocked])
+            existing = self._existing_relations(remote, {link["id"] for s in now if (link := story_link(s))})
 
         epics_before = set(self.link.epics)
         for story in todo:
@@ -809,6 +827,35 @@ class LinearSync:
         )
         self._rollup_epics(stories)
         return report
+
+    def _load_blockers(self, issues: list[dict], wanted: list[dict]) -> None:
+        """Read the blocking relations of ``wanted`` (a listing does not include them).
+
+        One call per issue, so callers ask only for the ones they need.
+        Blockers outside ``issues`` (another project) are left out. An issue
+        whose relations could not be read keeps ``relations_truncated``, which
+        makes the sync leave its dependencies as they are.
+        """
+        by_identifier = {i["identifier"]: i["id"] for i in issues}
+        for issue in wanted:
+            try:
+                blockers = self.client.issue_blockers(issue["id"])
+            except LinearError as e:
+                self._warn(f"could not read the relations of {issue['identifier']}: {e}")
+                continue
+            issue["blocked_by"] = [by_identifier[b] for b in blockers if b in by_identifier]
+            issue["relations_truncated"] = False
+
+    @staticmethod
+    def _existing_relations(issues: list[dict], linked_ids: set[str]) -> dict[str, set[str]]:
+        """Issue ID → IDs of the issues known to block it, for ``_create_relations``.
+
+        Where the relations are not known, every relation counts as existing:
+        better to miss creating one (it is retried) than to draw it twice.
+        """
+        return {
+            i["id"]: (set(linked_ids) if i["relations_truncated"] else set(i["blocked_by"])) for i in issues
+        }
 
     def _adopt_existing(self, todo: list[Story], remote: list[dict]) -> set[str]:
         """Link stories and categories to tickets that already exist for them.
@@ -891,6 +938,8 @@ class LinearSync:
                     is_new = True
             resolved.append((issue, story, is_new))
 
+        self._load_blockers(issues, [issue for issue, story, _ in resolved if _relations_stale(issue, story)])
+
         entries: list[dict] = []
 
         # A story ticket that somebody broke down into sub-issues is now a
@@ -917,7 +966,7 @@ class LinearSync:
 
         to_push: list[Story] = []
         for issue, story, is_new in resolved:
-            before = story.to_dict()
+            before = _content(story)
             old_status = story.status
             reason = self._apply_issue(
                 issue, story, is_new, story_for_issue, container_category, local_only, to_push,
@@ -930,7 +979,7 @@ class LinearSync:
                 report.status_changes.append((story.id, old_status.value, story.status.value, reason))
             if is_new:
                 report.new.append(story)
-            elif story.to_dict() != before:
+            elif _content(story) != before:
                 report.updated += 1
 
         # Linked stories whose issue is gone (deleted, archived, moved to another
@@ -958,13 +1007,10 @@ class LinearSync:
         self.state.replace_stories(stories, entries)
 
         # Dependencies whose relation never made it to Linear (see _create_relations).
-        # Where the relation list was cut off we can't tell what exists — leave those be.
+        # Where the relations were not read we can't tell what exists — leave those be.
         linked_ids = {link["id"] for s in stories if (link := story_link(s))}
-        existing = {
-            i["id"]: (linked_ids if i["relations_truncated"] else set(i["blocked_by"])) for i in issues
-        }
         report.relations_created = self._create_relations(
-            [s for s in stories if s.status not in _NOT_IN_PLAN], existing,
+            [s for s in stories if s.status not in _NOT_IN_PLAN], self._existing_relations(issues, linked_ids),
         )
 
         # Linear didn't move these, but the local status did (failed push, viewer edit).
@@ -1081,6 +1127,10 @@ class LinearSync:
             new_link["claimed"] = True
         if pending_deps:
             new_link["pending_deps"] = pending_deps
+        # Which version of the ticket the dependencies were read from (see _relations_stale).
+        relations_at = link.get("relations_at") if issue["relations_truncated"] else issue["updated_at"]
+        if relations_at:
+            new_link["relations_at"] = relations_at
         story.metadata["linear"] = new_link
         return reason
 
@@ -1099,7 +1149,7 @@ class LinearSync:
             # Done, Canceled and back to Todo are for people (or the merge).
             return False
         target = self._state_for(cls, story.status)
-        issue = self.client.update_issue(link["id"], stateId=target["id"])
+        issue = self.client.update_issue(link["id"], state_id=target["id"])
         self._remember(story.id, issue)
         return True
 
@@ -1185,11 +1235,37 @@ class LinearSync:
             if state_class(epic.get("state_type")) == target:
                 continue
             try:
-                issue = self.client.update_issue(epic["id"], stateId=self._state_for(target)["id"])
+                issue = self.client.update_issue(epic["id"], state_id=self._state_for(target)["id"])
                 epic["state_type"] = issue["state_type"]
                 self._save_link()
             except LinearError as e:
                 self._warn(f"could not update parent issue {epic.get('identifier', category)}: {e}")
+
+
+def _content(story: Story) -> dict:
+    """The story without sync bookkeeping — for telling whether a pull changed it."""
+    data = story.to_dict()
+    link = (data.get("metadata") or {}).get("linear")
+    if isinstance(link, dict):
+        data["metadata"] = {**data["metadata"], "linear": {k: v for k, v in link.items() if k != "relations_at"}}
+    return data
+
+
+def _relations_stale(issue: dict, story: Story) -> bool:
+    """Do this ticket's blocking relations have to be read (again)?
+
+    Reading them costs a call per ticket, so it is done only when they can
+    have changed: Linear touches a ticket's ``updatedAt`` when a blocker is
+    added or removed, and the story remembers the ``updatedAt`` its
+    dependencies were read at. A dependency that still has to be created in
+    Linear always needs the current list; a closed ticket's are not read.
+    """
+    link = story_link(story) or {}
+    if link.get("pending_deps"):
+        return True
+    if state_class(issue["state_type"]) in ("completed", "canceled"):
+        return False  # nothing waits on the blockers of a closed ticket
+    return not issue["updated_at"] or link.get("relations_at") != issue["updated_at"]
 
 
 def _status_from_linear(
@@ -1301,12 +1377,12 @@ def attach(
     if not api_key and oauth is None:
         if required:
             raise LinearError(
-                "LINEAR_API_KEY is not set and there is no OAuth login ('pralph linear oauth') — "
-                "one of them is needed to work off the linked Linear project"
+                "Not logged in to Linear — run 'pralph linear oauth' (or set LINEAR_API_KEY) "
+                "to work off the linked Linear project"
             )
         echo(click.style(
-            "  [linear] project is linked to Linear but LINEAR_API_KEY is not set "
-            "(and there is no 'pralph linear oauth' login) — changes will not be synced",
+            "  [linear] project is linked to Linear but there is no Linear login — "
+            "run 'pralph linear oauth' (or set LINEAR_API_KEY); changes will not be synced",
             fg="yellow",
         ))
         return None

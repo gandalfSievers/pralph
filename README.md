@@ -282,8 +282,7 @@ To use a different directory, set `spec_dir` in the [configuration](#configurati
 Turn the whole plan into a Linear project and run the implementation off the tickets.
 
 ```bash
-export LINEAR_API_KEY=lin_api_...     # Linear → Settings → Security & access → Personal API keys
-                                      # (or log in with OAuth: pralph linear oauth, see below)
+pralph linear oauth                   # log in through the browser, once (see below)
 
 pralph linear push --dry-run          # show what would be created
 pralph linear push --team ENG         # create the project, parent issues and sub-issues
@@ -384,30 +383,27 @@ pralph linear scope --read-write       # back to the full sync
 
 Everything in the first table still applies: what people change in Linear is respected. A ticket moved to Done counts as implemented, one moved back to Todo is implemented again.
 
-#### Logging in with OAuth
-
-Instead of a personal API key, pralph can log in through the browser:
+#### Logging in
 
 ```bash
-pralph linear oauth --client-id <client ID>   # opens Linear in the browser, waits for the approval
-pralph linear status                          # "auth: OAuth login (...)"
-pralph linear oauth --logout                  # revoke the login and delete it
+pralph linear oauth                   # opens Linear in the browser, waits for the approval
+pralph linear status                  # "auth: OAuth login (...)"
+pralph linear oauth --logout          # revoke the login and delete it
 ```
 
-This needs an OAuth application in your workspace — create one at <https://linear.app/settings/api/applications/new> with the callback URL `http://localhost:8765/oauth/callback` (another port: `--port`, and register that URL). Only its client ID is used: the login runs the authorization-code flow with PKCE, so no client secret has to be configured. If your application insists on one, set `LINEAR_OAUTH_CLIENT_SECRET`.
+There is nothing to set up in Linear first — no API key, no OAuth application. pralph talks to Linear through [Linear's MCP server](https://linear.app/docs/mcp), the interface AI clients use, and logs in the way they do: it registers itself as a client, you approve the access in the browser, and Linear sends the answer to a local port.
 
 | Option | Default | Description |
 |---|---|---|
-| `--client-id` | `LINEAR_OAUTH_CLIENT_ID`, config `linear_oauth_client_id`, or the last login | Client ID of the OAuth application |
-| `--port` | `8765` | Local port the callback is received on |
-| `--actor` | `user` | `app`: comments and state changes appear under the application's name instead of yours |
-| `--scope` | `read,write` | OAuth scopes to ask for |
+| `--port` | `8765` | Local port the browser is sent back to after the approval |
 | `--no-browser` | off | Print the URL instead of opening a browser |
 | `--logout` | off | Revoke the stored login and delete it |
 
-The login is stored in `~/.pralph/linear-oauth.json` (readable by you only). Linear's access tokens last 24 hours; pralph refreshes them on its own, also in the middle of a long run. The refresh token is good for 30 days — after a longer break, log in again. A `LINEAR_API_KEY`, if set, takes precedence over the login.
+The login is stored in `~/.pralph/linear-oauth.json` (readable by you only) and is yours: what pralph does in Linear appears under your name, and it can see and change what you can. Access tokens last about a day; pralph refreshes them on its own, also in the middle of a long run. If Linear stops accepting the login — after a long break, or when you revoke the access in Linear — log in again.
 
-The link is stored in `.pralph/linear.json`. The API key is read from `LINEAR_API_KEY`, or from `linear_api_key` in `~/.pralph/config.json` — don't put it in a config file that gets committed.
+A personal API key works too (Linear → Settings → Security & access → Personal API keys): set `LINEAR_API_KEY`, or `linear_api_key` in `~/.pralph/config.json` — don't put it in a config file that gets committed. A key, if set, takes precedence over the login.
+
+The link is stored in `.pralph/linear.json`.
 
 Linear mode and spec-driven mode combine: the project content is a snapshot of the spec, and each sub-issue names the requirements it implements.
 
@@ -578,7 +574,7 @@ Accepts an optional positional instruction (e.g. `pralph refine -s AUTH-001 "spl
 | `linear link PROJECT` | Attach to an existing Linear project (URL, ID or name) and rebuild the backlog from it. Takes the scope options below |
 | `linear scope` | Show or change which issues of the project are this checkout's work, and whether the link is read-mostly |
 | `linear status` | Show the link, how pralph authenticates, and the ticket states as of the last sync |
-| `linear oauth` | Log in to Linear through the browser instead of using an API key |
+| `linear oauth` | Log in to Linear through the browser (`--logout` to log out) |
 
 `linear push` options:
 
@@ -689,7 +685,7 @@ Global state lives in `~/.pralph/`:
 ```
 ~/.pralph/
   config.json           # User-wide config defaults
-  linear-oauth.json     # Linear OAuth login (pralph linear oauth) — tokens, keep private
+  linear-oauth.json     # Linear login (pralph linear oauth) — tokens, keep private
   prompts/              # User-wide prompt template overrides
   solutions/            # Global compound learning (domain-scoped)
     swift-ios/          # One directory per detected domain
@@ -739,8 +735,7 @@ pralph uses JSON config files for persistent settings. Config is resolved in ord
 | `spec_driven` | `bool` | auto | Force spec-driven mode on or off. By default it is on when `<spec_dir>/<name>/spec.md` exists |
 | `linear_team` | `string` | — | Default Linear team key for `pralph linear push` |
 | `linear_ac_heading` | `string` or list | — | Heading(s) that introduce the acceptance criteria in a Linear issue, in addition to `Acceptance criteria`, `Done when` and `Definition of done` |
-| `linear_oauth_client_id` | `string` | — | Client ID of your Linear OAuth application, for `pralph linear oauth` |
-| `linear_api_key` | `string` | — | Linear API key, if not set via `LINEAR_API_KEY`. Keep it in `~/.pralph/config.json`, not in the project |
+| `linear_api_key` | `string` | — | Linear API key, used instead of the `pralph linear oauth` login (also `LINEAR_API_KEY`). Keep it in `~/.pralph/config.json`, not in the project |
 
 Set user-wide defaults in `~/.pralph/config.json`. Override per-project in `.pralph/config.json` (e.g. disable global saving for a throwaway project).
 
