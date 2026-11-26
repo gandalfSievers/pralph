@@ -10,8 +10,55 @@ from pathlib import Path
 
 from urllib.parse import unquote
 
-from pralph.models import StoryStatus
+from pralph.models import Story, StoryStatus
 from pralph.state import StateManager
+
+
+def story_problem(story: Story) -> dict | None:
+    """What keeps a story from being completed, for the viewer to show — None if nothing does.
+
+    ``kind`` is ``error`` (the implementation failed), ``ship`` (implemented,
+    but the ship step did not open a pull request) or ``needs_human``.
+    """
+    meta = story.metadata
+    if story.status == StoryStatus.error:
+        return {
+            "kind": "error",
+            "title": "Error",
+            "reason": str(meta.get("error_reason") or "").strip() or "No reason was recorded.",
+            "at": str(meta.get("error_at") or ""),
+            "output": str(meta.get("error_output") or "").strip(),
+            # A failed story is not picked up again by itself.
+            "hint": "To retry: 'pralph reset-errors'"
+                    + (" (or move the Linear issue back to Todo)" if meta.get("linear") else "")
+                    + ", then 'pralph implement'.",
+        }
+    if story.status == StoryStatus.needs_human:
+        paused = meta.get("needs_human") if isinstance(meta.get("needs_human"), dict) else {}
+        return {
+            "kind": "needs_human",
+            "title": "Needs a person",
+            "reason": str(paused.get("reason") or "").strip() or "The implementation did not say what is left.",
+            "at": str(paused.get("at") or ""),
+            "output": "",
+            "hint": f"When it is done: pralph unblock {story.id}",
+        }
+    git = meta.get("git") if isinstance(meta.get("git"), dict) else {}
+    if story.status == StoryStatus.implemented and git.get("ship_error"):
+        return {
+            "kind": "ship",
+            "title": "Not shipped",
+            "reason": str(git["ship_error"]).strip(),
+            "at": str(git.get("ship_error_at") or ""),
+            "output": "",
+            "hint": f"The work is on branch {git.get('branch')}. Try again with: pralph ship -s {story.id}",
+        }
+    return None
+
+
+def story_payload(story: Story) -> dict:
+    """A story as the viewer gets it: its fields plus ``problem`` (see story_problem)."""
+    return {**story.to_dict(), "problem": story_problem(story)}
 
 VIEWER_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -54,6 +101,9 @@ VIEWER_HTML = r"""<!DOCTYPE html>
     border-left: 3px solid var(--accent); padding-left: 11px; }
   .story-item .sid { font-size: 12px; font-weight: 600; color: var(--accent); }
   .story-item .stitle { font-size: 14px; margin-top: 2px; }
+  .story-item .sproblem { font-size: 12px; color: var(--red); margin-top: 3px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .story-item .sproblem[data-kind="needs_human"] { color: var(--yellow); }
   .story-item .smeta { font-size: 11px; color: var(--muted); margin-top: 4px;
     display: flex; gap: 10px; flex-wrap: wrap; }
 
@@ -83,6 +133,23 @@ VIEWER_HTML = r"""<!DOCTYPE html>
   .section { margin-bottom: 20px; }
   .section h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;
     color: var(--muted); margin-bottom: 8px; }
+  .problem { border: 1px solid var(--red); border-left-width: 3px; border-radius: 8px;
+    background: #2d0f0f; padding: 12px 16px; margin: 16px 0; }
+  .problem[data-kind="needs_human"] { border-color: var(--yellow); background: #2d2300; }
+  .problem h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--red); margin-bottom: 6px; }
+  .problem[data-kind="needs_human"] h3 { color: var(--yellow); }
+  .problem h3 .when { color: var(--muted); text-transform: none; letter-spacing: 0; margin-left: 8px; }
+  .problem .reason { font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+  .problem .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .problem details { margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .problem summary { cursor: pointer; }
+  .problem pre { margin-top: 6px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); white-space: pre-wrap; word-break: break-word;
+    max-height: 320px; overflow: auto; }
+  .tl-card .card-problem { font-size: 11px; color: var(--red); margin-top: 4px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .tl-card .card-problem[data-kind="needs_human"] { color: var(--yellow); }
   .section .content { background: var(--bg); border: 1px solid var(--border);
     border-radius: 8px; padding: 14px 16px; font-size: 14px; white-space: pre-wrap;
     word-break: break-word; }
@@ -258,6 +325,7 @@ function render() {
     <div class="story-item ${selected === s.id ? 'active' : ''}" data-id="${s.id}">
       <div class="sid">${esc(s.id)}</div>
       <div class="stitle">${esc(s.title)}</div>
+      ${s.problem ? `<div class="sproblem" data-kind="${s.problem.kind}" title="${escAttr(s.problem.reason)}">${esc(s.problem.title)}: ${esc(s.problem.reason)}</div>` : ''}
       <div class="smeta">
         <span class="badge badge-status" data-v="${s.status}">${s.status}</span>
         ${s.category ? '<span>' + esc(s.category) + '</span>' : ''}
@@ -299,6 +367,7 @@ function selectStory(id) {
       <span class="badge badge-cx">${s.complexity}</span>
       <span class="badge" style="background:var(--border);color:var(--muted)">${esc(s.id)}</span>
     </div>
+    ${renderProblem(s)}
     <div class="section">
       <h3>Content</h3>
       <div class="content">${esc(s.content || '(empty)')}</div>
@@ -321,6 +390,21 @@ function selectStory(id) {
   d.querySelectorAll('.dep-link').forEach(el => {
     el.addEventListener('click', () => selectStory(el.dataset.dep));
   });
+}
+
+// Why a story is not getting done: an error, a failed ship step, or a person it waits for.
+function renderProblem(s) {
+  const p = s.problem;
+  if (!p) return '';
+  const when = p.at ? new Date(p.at) : null;
+  const whenText = when && !isNaN(when) ? when.toLocaleString() : '';
+  return `
+    <div class="problem" data-kind="${p.kind}">
+      <h3>${esc(p.title)}${whenText ? `<span class="when">${esc(whenText)}</span>` : ''}</h3>
+      <div class="reason">${esc(p.reason)}</div>
+      ${p.output ? `<details><summary>Last output</summary><pre>${esc(p.output)}</pre></details>` : ''}
+      ${p.hint ? `<div class="hint">${esc(p.hint)}</div>` : ''}
+    </div>`;
 }
 
 function fmtTokens(n) {
@@ -381,6 +465,11 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = String(s);
   return d.innerHTML;
+}
+
+// For text inside a double-quoted attribute.
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;');
 }
 
 document.getElementById('search').addEventListener('input', render);
@@ -498,6 +587,7 @@ function buildTimeline() {
           <span class="card-pri" data-pri="${s.priority}">P${s.priority}</span>
         </div>
         <div class="card-title">${esc(s.title)}</div>
+        ${s.problem ? `<div class="card-problem" data-kind="${s.problem.kind}" title="${escAttr(s.problem.reason)}">${esc(s.problem.reason)}</div>` : ''}
         <div class="card-status">
           <span class="badge badge-status" data-v="${s.status}" style="font-size:11px;padding:1px 8px;">${s.status}</span>
         </div>
@@ -694,7 +784,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
 
     def _serve_stories(self):
         stories = self.state.load_stories()
-        data = [s.to_dict() for s in stories]
+        data = [story_payload(s) for s in stories]
         body = json.dumps(data).encode()
         self.send_response(HTTPStatus.OK)
         self.send_header('Content-Type', 'application/json')
@@ -762,7 +852,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         # tasks.md is regenerated, and Linear picks the change up on its next sync.
         self.state.replace_stories(stories)
 
-        resp = json.dumps(story.to_dict()).encode()
+        resp = json.dumps(story_payload(story)).encode()
         self.send_response(HTTPStatus.OK)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(resp)))

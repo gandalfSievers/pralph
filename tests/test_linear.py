@@ -869,6 +869,19 @@ class TestStatusSync:
         state.reset_error_stories()
         assert fake.state_of("API-001") == "Todo"
 
+    def test_failure_reported_by_the_implementation_is_in_the_comment(self, state, fake, pushed) -> None:
+        """As the implement loop records it: the reason comes with the implementation's answer."""
+        state.mark_story_status("API-001", StoryStatus.in_progress)
+        state.mark_story_status("API-001", StoryStatus.error, summary="Stopped",
+                                extra={"status": "error", "summary": "Stopped", "reason": "The products table does not exist."})
+        (comment,) = fake.comments_on("API-001")
+        assert comment.startswith("**pralph** could not implement this story.")
+        assert "The products table does not exist." in comment
+
+    def test_failure_without_a_word_says_so(self, state, fake, pushed) -> None:
+        state.mark_story_status("API-001", StoryStatus.error)
+        assert "No reason was recorded." in fake.comments_on("API-001")[0]
+
     def test_interrupted_story_goes_back_to_todo(self, state, fake, pushed) -> None:
         state.mark_story_status("API-001", StoryStatus.in_progress)
         state.mark_story_status("API-001", StoryStatus.pending, summary="User interrupted")
@@ -1727,6 +1740,17 @@ class TestBranchStates:
         fake.move("DB-001", "Todo")  # the person's way of saying: go on
         pushed.pull()
         assert stories_by_id(state)["DB-001"].status == StoryStatus.pending
+
+    def test_failed_ship_step_is_a_comment(self, state, fake, pushed) -> None:
+        self.on_branch(state)
+        state.mark_story_status("DB-001", StoryStatus.in_progress)
+        state.mark_story_status("DB-001", StoryStatus.implemented, summary="Built it")
+        fake.calls.clear()
+        state.notify_story_problem("DB-001", "ship", "git push: permission denied")
+        comment = fake.comments_on("DB-001")[-1]
+        assert "could not open a pull request" in comment and "git push: permission denied" in comment
+        assert "pralph ship -s DB-001" in comment and "`dev/" in comment
+        assert fake.state_of("DB-001") == "In Progress", "the ticket itself does not move"
 
     def test_read_mostly_leaves_done_to_the_merge(self, state, fake, guest) -> None:
         cart = fake.find("Cart API")["identifier"]

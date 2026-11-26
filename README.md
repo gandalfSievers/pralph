@@ -66,6 +66,8 @@ Manage stories on the fly:
 
 Autonomously implements stories one at a time from the backlog. Optionally runs a review loop after each implementation. Includes crash recovery — orphaned in-progress stories reset to pending on restart.
 
+A story that cannot be implemented ends in `error` and keeps the reason: pralph prints it, the [viewer](#story-viewer) shows it on the story, and with a [Linear](#linear-mode) link it is a comment on the issue. `pralph reset-errors` puts failed stories back in the queue.
+
 `pralph review --story-id AUTH-001` runs the reviewer by itself on a story that is already implemented — after changing `.pralph/review-prompt.md`, or after fixing something by hand. A rejection puts the story into rework, and `pralph implement --story-id AUTH-001` continues from the feedback.
 
 By default all of this happens on whatever branch is checked out. pralph can also give every story its own branch and worktree, hand the reviewed branch to a ship step of yours that opens the pull request, and hold dependent stories back until that pull request is merged. See [A branch per story](#a-branch-per-story-worktrees-pull-requests-merges).
@@ -323,6 +325,7 @@ And pralph reports back on the ticket:
 | Implements it but the reviewer itself fails | As above, and the comment says the story was **not reviewed** and why |
 | Review rejects it | Stays In Progress, comment with the review feedback |
 | Fails | Stays In Progress, comment with the error. Move it to Todo (or run `pralph reset-errors`) to retry |
+| Ship step fails | Stays In Progress, comment with the reason. `pralph ship -s ID` tries again |
 | Skips it / finds a duplicate | Issue → Canceled, comment with the reason (and what it duplicates) |
 
 Acceptance criteria are read from the list under an `Acceptance criteria`, `Done when` or `Definition of done` heading in the issue description — a markdown heading, a bold line or a plain `Done when:` line. If your tickets use another heading, name it in the [configuration](#configuration): `"linear_ac_heading": "Fertig wenn"` (or a list of headings). The first configured heading is also the one pralph writes into the tickets it creates.
@@ -781,6 +784,7 @@ pralph viewer --port 9000 --no-open
 A dark-themed web UI for browsing and managing your story backlog. Features:
 
 - **Sidebar + detail panel** — click any story to see its full content, acceptance criteria, dependencies, and metadata.
+- **Why a story is stuck** — a story that failed shows the reason, when it happened and the end of the implementation's output; a story that waits for a person, or that could not be shipped, shows what is missing. The reason is also on the story in the list and on its card in the timeline.
 - **Filtering** — filter by status, category, priority, or search by text.
 - **In-place editing** — edit story fields (title, content, priority, status, etc.) directly in the browser and save back to disk.
 - **Timeline view** — a Gantt-style visualization that lays out stories by dependency depth, with arrows showing dependency relationships.

@@ -1363,12 +1363,14 @@ def _run_implement_loop(
         _note_pause(state, story, new_status, parsed)
         state.mark_story_status(
             story.id, new_status, summary=summary, extra=parsed,
-            error_reason=parsed.get("reason", "") if new_status == StoryStatus.error else "",
+            error_reason=_failure_reason(parsed, result.result) if new_status == StoryStatus.error else "",
             error_output=result.result if new_status == StoryStatus.error else "",
             review_pending=review and new_status == StoryStatus.implemented,
         )
         status_color = 'green' if new_status == StoryStatus.implemented else 'yellow'
         click.echo(f"  → {story.id}: {click.style(new_status.value, fg=status_color)} — {summary[:120]}")
+        if new_status == StoryStatus.error:
+            _report_failure(state, story.id)
 
         total_cost = result.cost_usd
         total_input = result.input_tokens
@@ -1446,7 +1448,7 @@ def _run_implement_loop(
         return IterationResult(
             iteration=i, phase="implement", mode="implement",
             success=new_status != StoryStatus.error, impl_status=new_status.value,
-            error=parsed.get("reason", "") if new_status == StoryStatus.error else "",
+            error=_failure_reason(parsed, result.result) if new_status == StoryStatus.error else "",
             cost_usd=total_cost, story_id=story.id,
             input_tokens=total_input,
             output_tokens=total_output,
@@ -1493,12 +1495,14 @@ def _run_implement_loop(
         _note_pause(state, story, new_status, parsed)
         state.mark_story_status(
             story.id, new_status, summary=summary, extra=parsed,
-            error_reason=parsed.get("reason", "") if new_status == StoryStatus.error else "",
+            error_reason=_failure_reason(parsed, result.result) if new_status == StoryStatus.error else "",
             error_output=result.result if new_status == StoryStatus.error else "",
             review_pending=review and new_status == StoryStatus.implemented,
         )
         status_color = 'green' if new_status == StoryStatus.implemented else 'yellow'
         click.echo(f"  \u2192 {story.id}: {click.style(new_status.value, fg=status_color)} \u2014 {summary[:120]}")
+        if new_status == StoryStatus.error:
+            _report_failure(state, story.id)
 
         total_cost = result.cost_usd
         total_input = result.input_tokens
@@ -1542,7 +1546,7 @@ def _run_implement_loop(
         return IterationResult(
             iteration=ps.current_iteration, phase="implement", mode="resume",
             success=new_status != StoryStatus.error, impl_status=new_status.value,
-            error=parsed.get("reason", "") if new_status == StoryStatus.error else "",
+            error=_failure_reason(parsed, result.result) if new_status == StoryStatus.error else "",
             cost_usd=total_cost, story_id=story.id,
             input_tokens=total_input,
             output_tokens=total_output,
@@ -1591,6 +1595,37 @@ def _sync_tracker(tracker, *, push_missing: bool = False) -> None:
                    + (f" ({reason})" if reason else ""))
     if report.updated:
         click.echo(click.style("  [linear] ", fg='blue') + f"{report.updated} stories updated from their tickets")
+
+
+_UNPARSED = "Could not parse implementation output"  # parse_implement_output's answer to anything else
+
+
+def _failure_reason(parsed: dict, output: str) -> str:
+    """Why an implementation that ended in ``error`` failed, for a person to read.
+
+    The implementation's own reason if it gave one. If its answer could not
+    be read at all, the end of that answer — "could not parse" explains nothing.
+    """
+    reason = str(parsed.get("reason") or "").strip()
+    if reason and reason != _UNPARSED:
+        return reason
+    summary = str(parsed.get("summary") or "").strip()
+    if summary:
+        return summary
+    tail = (output or "").strip()[-800:]
+    if tail:
+        return "The implementation ended without reporting a result. Its answer ended with:\n\n" + tail
+    return "The implementation ended without an answer."
+
+
+def _report_failure(state: StateManager, story_id: str) -> None:
+    """Say why a story failed, and where to read it again."""
+    story = next((s for s in state.load_stories() if s.id == story_id), None)
+    reason = str(story.metadata.get("error_reason") or "") if story is not None else ""
+    first = reason.strip().splitlines()[0] if reason.strip() else "no reason recorded"
+    click.echo(click.style(f"    ✗ {first[:300]}", fg='red'))
+    where = "its Linear issue and 'pralph viewer'" if story is not None and story.metadata.get("linear") else "'pralph viewer'"
+    click.echo(click.style(f"      The full reason is in {where}.", dim=True))
 
 
 def _reported_status(status_str: str, *, default: StoryStatus) -> StoryStatus:
@@ -1990,9 +2025,13 @@ def _implement_single(
         _note_pause(state, story, new_status, parsed)
         state.mark_story_status(
             story.id, new_status, summary=summary, extra=parsed,
+            error_reason=_failure_reason(parsed, result.result) if new_status == StoryStatus.error else "",
+            error_output=result.result if new_status == StoryStatus.error else "",
             review_pending=review and new_status == StoryStatus.implemented,
         )
         click.echo(f"  → {story.id}: {new_status.value} — {summary[:120]}")
+        if new_status == StoryStatus.error:
+            _report_failure(state, story.id)
 
         if new_status != StoryStatus.implemented or not review:
             break

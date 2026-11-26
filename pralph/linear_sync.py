@@ -1187,6 +1187,8 @@ class LinearSync:
                     self._create_ticket(story)
             elif event == "status":
                 self._on_status(story, info)
+            elif event == "problem":
+                self._on_problem(story, info)
             elif event == "reviewed":
                 held = self._awaiting_review.pop(story.id, None)
                 if held is not None and story.status == StoryStatus.implemented:
@@ -1213,6 +1215,15 @@ class LinearSync:
             return
         self._awaiting_review.pop(story.id, None)
         self._sync_ticket(story, info)
+
+    def _on_problem(self, story: Story, info: dict) -> None:
+        """A story is held up by something its status does not show: say so on the ticket."""
+        link = story_link(story)
+        if not link or is_outside(story):
+            return
+        body = _problem_comment(story, info)
+        if body:
+            self.client.create_comment(link["id"], body)
 
     def _sync_ticket(self, story: Story, info: dict) -> None:
         """Move the ticket to where the story's status puts it, and say why."""
@@ -1324,6 +1335,20 @@ def _status_from_linear(
     return StoryStatus.pending, "" if current == StoryStatus.pending else "Reopened in Linear", False
 
 
+def _problem_comment(story: Story, info: dict) -> str:
+    """Comment for a ``problem`` event ('' for kinds this integration has nothing to say about)."""
+    if info.get("kind") != "ship":
+        return ""
+    git = story.metadata.get("git") if isinstance(story.metadata.get("git"), dict) else {}
+    reason = str(info.get("reason") or "").strip() or "No reason captured."
+    where = f"The work is on the branch `{git['branch']}`. " if git.get("branch") else ""
+    return (
+        "**pralph** implemented this story but could not open a pull request for it.\n\n"
+        f"{reason[:1500]}\n\n"
+        f"{where}Run `pralph ship -s {story.id}` to try again."
+    )
+
+
 def _comment_for(state: StateManager, story: Story, info: dict, *, closed: bool = True) -> str:
     """Comment to leave on the ticket for a status change ('' for none).
 
@@ -1334,6 +1359,8 @@ def _comment_for(state: StateManager, story: Story, info: dict, *, closed: bool 
     extra = info.get("extra") or {}
     reason = (info.get("error_reason") or extra.get("reason") or summary or "").strip()
     status = story.status
+    if status == StoryStatus.error and not reason:
+        reason = str(story.metadata.get("error_reason") or "").strip()
 
     git = story.metadata.get("git") if isinstance(story.metadata.get("git"), dict) else {}
     if status == StoryStatus.shipped:

@@ -1061,6 +1061,8 @@ class StateManager:
           - ``reviewed`` — an implemented story passed review; info has ``feedback``,
                           and ``error`` if the reviewer failed and it was accepted unreviewed
           - ``updated`` — story fields/metadata were changed via update_story()
+          - ``problem`` — something other than its status keeps a story from getting
+                          done (the ship step failed); info has ``kind`` and ``reason``
           - ``synced``  — the backlog was replaced wholesale (story is None)
 
         Integrations (tasks.md in spec mode, Linear) hang off this. Listener
@@ -1239,6 +1241,12 @@ class StateManager:
         ``review_pending`` tells listeners that an ``implemented`` status is
         still subject to review — see notify_review_passed().
         """
+        if status == StoryStatus.error:
+            # A failed story always says why — this is what the viewer and the tracker show.
+            error_reason = (
+                error_reason.strip() or str((extra or {}).get("reason") or "").strip()
+                or summary.strip() or "No reason was recorded."
+            )
         entry = {
             "story_id": story_id,
             "status": status.value,
@@ -1259,7 +1267,7 @@ class StateManager:
                 previous = s.status
                 s.status = status
                 if status == StoryStatus.error:
-                    s.metadata["error_reason"] = error_reason or summary
+                    s.metadata["error_reason"] = error_reason
                     if error_output:
                         # Keep last 2000 chars of output for context
                         s.metadata["error_output"] = error_output[-2000:]
@@ -1275,6 +1283,16 @@ class StateManager:
                 "error_reason": error_reason,
                 "review_pending": review_pending,
             })
+
+    def notify_story_problem(self, story_id: str, kind: str, reason: str) -> None:
+        """Tell listeners that a story is held up by something its status does not show.
+
+        ``kind`` is ``ship``: the story is implemented, but the ship step failed.
+        (A failed implementation is a status — ``error`` — and needs no call here.)
+        """
+        story = next((s for s in self.load_stories() if s.id == story_id), None)
+        if story is not None:
+            self._notify("problem", story, {"kind": kind, "reason": reason})
 
     def notify_review_passed(self, story_id: str, feedback: str = "", error: str = "") -> None:
         """Tell listeners a story passed review, i.e. its ``implemented`` status is final.

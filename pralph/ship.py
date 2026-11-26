@@ -17,8 +17,9 @@ pull request (``gh``) for that, turns requested changes into rework on the
 same branch, and gives up on a pull request that was closed.
 
 What a story's ``metadata["git"]`` holds: ``branch``, ``base``, ``start`` (the
-commit a new branch started from), ``worktree`` (if it has one), ``pr_url``
-and ``pr_feedback_at`` (the newest review comment already turned into rework).
+commit a new branch started from), ``worktree`` (if it has one), ``pr_url``,
+``pr_feedback_at`` (the newest review comment already turned into rework) and
+``ship_error`` / ``ship_error_at`` (why the last ship step opened no pull request).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -455,6 +457,7 @@ class Flow:
         again = bool(info.get("pr_url"))
         info["pr_url"] = pr_url
         info.pop("ship_error", None)
+        info.pop("ship_error_at", None)
         self._save_info(story, info)
         self.state.mark_story_status(
             story.id, StoryStatus.shipped, summary=f"Pull request: {pr_url}",
@@ -463,8 +466,10 @@ class Flow:
 
     def record_ship_failure(self, story: Story, error: str) -> None:
         info = dict(git_info(story))
-        info["ship_error"] = error[:500]
+        info["ship_error"] = error[:2000]
+        info["ship_error_at"] = datetime.now().isoformat()
         self._save_info(story, info)
+        self.state.notify_story_problem(story.id, "ship", info["ship_error"])
 
     # -- watching pull requests --
 

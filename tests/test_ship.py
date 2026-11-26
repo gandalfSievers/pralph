@@ -405,6 +405,7 @@ def test_ship_step_that_opens_nothing_leaves_the_story_implemented(repo, github)
     ps = run(state, claude)
     assert status(state, "DB-001") == StoryStatus.implemented
     assert "did not report a pull request" in story(state, "DB-001").metadata["git"]["ship_error"]
+    assert story(state, "DB-001").metadata["git"]["ship_error_at"]
     assert ("implement", "API-001") not in claude.calls and ps.completion_reason == "waiting"
 
     # `pralph ship` tries again.
@@ -412,7 +413,8 @@ def test_ship_step_that_opens_nothing_leaves_the_story_implemented(repo, github)
     with patch("pralph.loop.run_with_retry", side_effect=claude):
         assert run_ship(state, story_id="DB-001").completion_reason == "shipped"
     info = story(state, "DB-001").metadata["git"]
-    assert info["pr_url"] == "https://github.com/acme/shop/pull/7" and "ship_error" not in info
+    assert info["pr_url"] == "https://github.com/acme/shop/pull/7"
+    assert "ship_error" not in info and "ship_error_at" not in info
 
 
 def test_pull_request_found_by_branch_when_the_step_does_not_print_it(repo, github) -> None:
